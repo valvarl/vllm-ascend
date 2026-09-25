@@ -1,3 +1,5 @@
+import functools
+import os
 import threading
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
@@ -56,6 +58,41 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
+
+HOLEMISS_BENCH_ROOT_ENV = "HOLEMISS_BENCH_ROOT"
+_HOLEMISS_LEGACY_BENCH_ROOT = "/vllm-workspace"
+_HOLEMISS_HOOK_TRIO = ("hole_recovery_hook.py", "hole_recovery_config.py", "timer.py")
+
+
+@functools.lru_cache(maxsize=8)
+def _holemiss_missing_hook_trio(root: str) -> tuple[str, ...]:
+    hook_dir = os.path.join(root, "benchmarks", "hole_recovery")
+    return tuple(name for name in _HOLEMISS_HOOK_TRIO if not os.path.isfile(os.path.join(hook_dir, name)))
+
+
+def holemiss_verify_bench_root() -> str:
+    """Fail-fast HOLEMISS_BENCH_ROOT resolution check for the HR hook trio.
+
+    The vllm-side HR mixin imports benchmarks.hole_recovery.{hole_recovery_hook,
+    hole_recovery_config,timer} via sys.path.insert(0, HOLEMISS_BENCH_ROOT). An
+    unset/incorrect root would surface as a bare ModuleNotFoundError deep inside
+    arming; this guard runs as soon as HR regions are about to flow to the mixin
+    and raises a documented error instead. Returns the resolved root.
+    """
+    root = os.environ.get(HOLEMISS_BENCH_ROOT_ENV, "")
+    if not root:
+        raise RuntimeError(
+            f"{HOLEMISS_BENCH_ROOT_ENV} is not set but hole-recovery regions were recorded. "
+            "Set it to the bench repo root containing benchmarks/hole_recovery/ "
+            f"(the mixin's legacy default {_HOLEMISS_LEGACY_BENCH_ROOT!r} does not contain that tree)."
+        )
+    missing = _holemiss_missing_hook_trio(root)
+    if missing:
+        raise RuntimeError(
+            f"{HOLEMISS_BENCH_ROOT_ENV}={root!r} does not resolve the hole-recovery hook trio: missing "
+            f"{list(missing)} under {os.path.join(root, 'benchmarks', 'hole_recovery')!r}."
+        )
+    return root
 
 
 class AscendStoreKVEvents(KVConnectorKVEvents):
@@ -278,7 +315,10 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if not self.use_layerwise:
             return
         assert self.connector_worker is not None
-        self.connector_worker.wait_for_layer_load()
+        if not getattr(self, "_hr_hook_active", False):
+            # An armed HR repair forward must not block on native layerwise load
+            # events; the mamba state copy below still runs (the #17287 contract).
+            self.connector_worker.wait_for_layer_load()
         if self._mamba_copy_bufs is not None:
             mamba_utils.do_mamba_copy_block_for_layer(
                 self._mamba_copy_bufs,
@@ -327,6 +367,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if not is_kv_save_role(self.kv_role, self.consumer_is_to_put):
             # A load-only consumer does not publish KV.
             return
+        if getattr(self, "_hr_hook_active", False):
+            return
         assert self.connector_worker is not None
         self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
@@ -357,6 +399,24 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         """Return KV block IDs that failed to load on the worker."""
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()
+
+    def get_hole_recovery_regions(self) -> list:
+        """Holemiss HR payload passthrough; the worker store is canonical.
+
+        Called by the vllm-side HR mixin before forward (hasattr-gated); a
+        non-empty return with result<0 arms the HR hook, so fail fast here when
+        the hook trio cannot resolve from HOLEMISS_BENCH_ROOT - a documented
+        error instead of a bare ModuleNotFoundError inside the mixin arming site.
+        """
+        worker = getattr(self, "connector_worker", None)
+        if worker is None or not hasattr(worker, "get_hole_recovery_regions"):
+            return []
+        regions = worker.get_hole_recovery_regions()
+        if regions:
+            holemiss_verify_bench_root()
+            if os.getenv("HOLEMISS_RUNTIME_PROFILE", "perf") == "evidence":
+                logger.info("HOLEMISS get_hole_recovery_regions: %d regions", len(regions))
+        return regions
 
     def get_kv_connector_kv_cache_events(self) -> AscendStoreKVEvents | None:
         """

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import os
 import threading
 import time
 from collections.abc import Callable, Generator, Sequence
@@ -111,6 +112,89 @@ MEMCACHE_UNMATCHED_STATE = -3101
 PARTIAL_LEASE_RETRY_COUNT = 10
 PARTIAL_LEASE_RETRY_INTERVAL_S = 0.001
 SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
+
+# Holemiss fault-injection / hole-recovery (HR) env contract. The same names
+# are read by the Mooncake C++ EIO gate, the vllm HR mixin and the bench, and
+# every read is a live os.getenv (P0.2: Python and C++ must never diverge).
+HOLEMISS_SYNTHETIC_FAULT_RC = -800  # simulated rc; real disk-EIO surfaces -800/-1102
+HOLEMISS_EIO_TARGET_ENV = "EIO_TARGET_KEY"  # empty/unset == injector off
+
+
+def _hm_profile() -> str:
+    return os.getenv("HOLEMISS_RUNTIME_PROFILE", "perf")
+
+
+def _hm_is_debug() -> bool:
+    return _hm_profile() == "debug"
+
+
+def _hm_is_evidence() -> bool:
+    return _hm_profile() in ("evidence", "debug")
+
+
+def _hm_diag_enabled() -> bool:
+    return os.getenv("HOLEMISS_DIAG", "0") == "1"
+
+
+def _hm_sync_layerwise_load() -> bool:
+    return os.getenv("HOLEMISS_SYNC_LAYERWISE_LOAD", "0") == "1"
+
+
+def _hm_kv_load_timing_enabled() -> bool:
+    # Dedicated live gate (NOT profile-gated) so the perf runtime profile
+    # keeps the duration line; byte-stable format, offline parser depends on it.
+    return os.getenv("HOLEMISS_KV_LOAD_TIMING", "0") == "1"
+
+
+def _hm_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _holemiss_device_synchronize() -> None:
+    """Device-wide sync that is a no-op outside an initialized NPU context.
+
+    Keeps the serialized load path CPU-only-testable (unit tests must not
+    instantiate a real store backend nor touch an ACL context).
+    """
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        return
+    if npu.is_initialized():
+        npu.synchronize()
+
+
+def hybrid_group0_fa_physical_layers(
+    kv_cache_config: Any, num_layers: int, base_layers: int
+) -> list[int] | None:
+    """Ordered physical layers of kv-cache group 0 - the FA store group.
+
+    SINGLE layout-truth derivation for hybrid FA-group enumeration, shared by
+    the worker arming/region mapping and the scheduler store lookup (B7):
+    group-0 ``layer_names`` -> physical indices via
+    ``get_layerwise_physical_layer_index`` (the same primitive the worker's
+    ``physical_layer_to_group_layers`` build uses), sorted-unique, bounded by
+    ``num_layers``.  Store-local layer id k == position in this list (the store
+    enumerates group-0 layers in physical order; qwen3.6 GDN: k -> 3+4k).
+    ``None`` when the layout is unavailable or group 0 yields no in-range
+    layer - callers must then refuse loudly rather than guess a layer space.
+    """
+    groups = getattr(kv_cache_config, "kv_cache_groups", None)
+    if not groups:
+        return None
+    physical: set[int] = set()
+    for layer_name in groups[0].layer_names:
+        idx = get_layerwise_physical_layer_index(layer_name, base_layers)
+        if 0 <= idx < num_layers:
+            physical.add(idx)
+    if not physical:
+        return None
+    return sorted(physical)
 
 
 class KVPoolWorker:
@@ -455,6 +539,10 @@ class KVPoolWorker:
         self._layerwise_session_tracker = LayerwiseSessionTracker()
         self._current_layerwise_request_ids: set[str] = set()
         self._current_layerwise_last_chunk_req_ids: set[str] = set()
+        self._hole_recovery_regions: list[dict] = []
+        self._hole_recovery_lock = threading.Lock()
+        self._holemiss_armed_fault: dict | None = None
+        self._holemiss_fa_layer_map: list[int] | None = None
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -767,6 +855,7 @@ class KVPoolWorker:
                     invalid_block_ids=self._invalid_block_ids,
                     invalid_block_ids_lock=self._invalid_block_ids_lock,
                     load_abort_event=self._layer_load_aborted,
+                    worker=self,
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
@@ -782,6 +871,7 @@ class KVPoolWorker:
                     self.layer_save_finished_events,
                     self.num_layers,
                     layer_offset=getattr(self, "layerwise_key_layer_offset", 0),
+                    worker=self,
                 )
             self.kv_recv_thread.start()
             ready_event.wait()
@@ -1125,10 +1215,26 @@ class KVPoolWorker:
             reset_attention_compute_start_gate()
             self._attention_saved_layers = set()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
+        holemiss_load_requests = [
+            request for request in metadata.requests if request.load_spec is not None and request.load_spec.can_load
+        ]
+        if len(holemiss_load_requests) > 1 and self._holemiss_fault_env_active():
+            logger.warning(
+                "HOLEMISS_MULTI_LOAD_FAULT_WARN tp=%d load_requests=%d: the single EIO_TARGET_KEY "
+                "window can only arm the last request's fault",
+                self.tp_rank,
+                len(holemiss_load_requests),
+            )
+        for request in holemiss_load_requests:
+            self._holemiss_configure_fault(request)
+        if not holemiss_load_requests:
+            self._holemiss_configure_fault(None)
         if len(metadata.requests) == 0:
             return
         if self.use_layerwise:
             self.process_layer_data(metadata.requests)
+            if holemiss_load_requests and _hm_sync_layerwise_load():
+                self._holemiss_sync_layerwise_drain(holemiss_load_requests)
             return
         for request in metadata.requests:
             load_spec = request.load_spec
@@ -2617,6 +2723,449 @@ class KVPoolWorker:
             self._invalid_block_ids.clear()
         return invalid_blocks
 
+    # Holemiss fault-arming / hole-recovery (HR) seams.
+
+    def record_hole_recovery_region(self, region: dict) -> None:
+        with self._hole_recovery_lock:
+            self._hole_recovery_regions.append(region)
+
+    def get_hole_recovery_regions(self) -> list[dict]:
+        with self._hole_recovery_lock:
+            return list(self._hole_recovery_regions)
+
+    def clear_hole_recovery_regions(self) -> None:
+        with self._hole_recovery_lock:
+            self._hole_recovery_regions.clear()
+
+    def _holemiss_purge_regions(self, req_id: str) -> None:
+        with self._hole_recovery_lock:
+            self._hole_recovery_regions = [
+                region for region in self._hole_recovery_regions if region.get("request_id") != req_id
+            ]
+
+    @staticmethod
+    def _holemiss_fault_env_active() -> bool:
+        return (
+            os.getenv("HOLEMISS_DISK_EIO_ENABLED", "0") == "1"
+            or os.getenv("HOLEMISS_FAIL_LAYER", "-1").isdigit()
+        )
+
+    def _holemiss_emit_state_readback(self, reason: str) -> None:
+        if not (_hm_is_evidence() or _hm_diag_enabled()):
+            return
+        armed = self._holemiss_armed_fault
+        pre_clear_key = os.environ.get(HOLEMISS_EIO_TARGET_ENV, "")
+        with self._hole_recovery_lock:
+            region_count = len(self._hole_recovery_regions)
+        if armed is None and not pre_clear_key and region_count == 0:
+            return
+        logger.info(
+            "HOLEMISS_STATE_READBACK scope=worker reason=%s mode=%s armed_kind=%s armed_layer=%s "
+            "armed_logical=%s armed_key=%s regions=%d eio_target_key_pre_clear=%s disk_eio_enabled=%s tp=%d",
+            reason,
+            os.getenv("HOLEMISS_RECOVERY_MODE", "hr_sequential"),
+            None if armed is None else armed.get("kind"),
+            None if armed is None else armed.get("layer_id"),
+            None if armed is None else armed.get("logical_block_index"),
+            None if armed is None else armed.get("key"),
+            region_count,
+            pre_clear_key or None,
+            os.getenv("HOLEMISS_DISK_EIO_ENABLED", "0"),
+            self.tp_rank,
+        )
+
+    def _holemiss_load_span(self, request: ReqMeta) -> tuple[int, int] | None:
+        """Truncated (load_start_block, end_block) span, mirroring the GET session.
+
+        Derived from the load_spec cached-token counts, NEVER from
+        token_len_chunk, so an armed target lies inside the span the block-key
+        session will actually GET (P0.5).
+        """
+        load_spec = request.load_spec
+        if load_spec is None or not load_spec.can_load:
+            return None
+        block_size = self.grouped_block_size[0]
+        cached_tokens = load_spec.kvpool_cached_tokens
+        if not getattr(self, "use_eagle", False) and load_spec.kvpool_store_skip_tokens is not None:
+            cached_tokens = load_spec.kvpool_store_skip_tokens
+        group_block_hashes = get_block_hashes(request.block_hashes, block_size, self.hash_block_size)
+        load_start_block = load_spec.vllm_cached_tokens // block_size
+        end_block = min(cached_tokens // block_size, len(group_block_hashes))
+        return load_start_block, end_block
+
+    def _holemiss_derive_block_key(self, request: ReqMeta, logical_block: int) -> str | None:
+        """BLOCK-KEY arming target (D7), byte-identical to the getting rank's key.
+
+        The mainline block-key store owns ONE object per (group, block); the
+        armed key must be the same object key the phase-2 range GET reads, i.e.
+        the backend-bound ``make_full_key`` for group 0. The 0.26 per-layer
+        ``split_layers`` literal is deliberately NOT reused (I-MAIN.7).
+        """
+        if logical_block < 0 or logical_block >= len(request.block_hashes):
+            return None
+        block_hash = request.block_hashes[logical_block]
+        block_hash_str = block_hash if isinstance(block_hash, str) else block_hash.hex()
+        return self._make_mooncake_layerwise_key(block_hash_str)
+
+    def _holemiss_hybrid_fa_layers(self) -> list[int] | None:
+        if not self.use_hybrid:
+            return None
+        cached = getattr(self, "_holemiss_fa_layer_map", None)
+        if cached is not None:
+            return cached
+        base_layers = getattr(getattr(self, "hf_config", None), "num_hidden_layers", self.num_layers)
+        fa_layers = hybrid_group0_fa_physical_layers(
+            getattr(self, "kv_cache_config", None), self.num_layers, base_layers
+        )
+        if fa_layers is None:
+            return None
+        self._holemiss_fa_layer_map = fa_layers
+        return fa_layers
+
+    def _holemiss_armable_layer_count(self) -> int:
+        fa_layers = self._holemiss_hybrid_fa_layers()
+        return len(fa_layers) if fa_layers else self.num_layers
+
+    def _holemiss_hybrid_physical_layer(self, store_layer_id: int) -> int:
+        fa_layers = self._holemiss_hybrid_fa_layers()
+        if fa_layers is None or not (0 <= store_layer_id < len(fa_layers)):
+            raise RuntimeError(
+                "HOLEMISS hybrid FA layer map cannot translate store "
+                f"layer_id={store_layer_id} (map={fa_layers}); refusing to emit "
+                "a region with a store-local layer id (mixin/hook consume "
+                "PHYSICAL layers)"
+            )
+        return fa_layers[store_layer_id]
+
+    def _holemiss_configure_fault(self, request: ReqMeta | None) -> None:
+        """Per-load-request fault-config call - the single arming authority.
+
+        P0.2: EIO_TARGET_KEY is cleared UNCONDITIONALLY on every call, before
+        any conditional re-arm, so a stale target can never leak into a later
+        GET window (the Mooncake C++ gate additionally treats an empty key as
+        off and re-reads both envs live per call). Synthetic (HOLEMISS_FAIL_LAYER
+        isdigit) takes precedence over real disk-EIO.
+        """
+        self._holemiss_emit_state_readback("configure")
+        os.environ[HOLEMISS_EIO_TARGET_ENV] = ""
+        self._holemiss_armed_fault = None
+        if request is None:
+            return
+        self._holemiss_purge_regions(request.req_id)
+        if not self.use_layerwise or not getattr(self, "use_block_key_layerwise", False):
+            return
+        if self.layerwise_offload or (self.num_kv_cache_groups > 1 and not self.use_hybrid):
+            if _hm_diag_enabled():
+                logger.info(
+                    "HOLEMISS_ARM_SKIP tp=%d req=%s reason=multi_group_or_offload groups=%d hybrid=%s offload=%s",
+                    self.tp_rank,
+                    request.req_id,
+                    self.num_kv_cache_groups,
+                    self.use_hybrid,
+                    self.layerwise_offload,
+                )
+            return
+        if self.use_hybrid and self._holemiss_hybrid_fa_layers() is None:
+            logger.info(
+                "HOLEMISS_ARM_SKIP tp=%d req=%s reason=hybrid_fa_layer_map_unavailable groups=%d",
+                self.tp_rank,
+                request.req_id,
+                self.num_kv_cache_groups,
+            )
+            return
+        span = self._holemiss_load_span(request)
+        if span is None:
+            return
+        load_start_block, end_block = span
+        if os.getenv("HOLEMISS_FAIL_LAYER", "-1").isdigit():
+            self._holemiss_arm_synthetic(request, load_start_block, end_block)
+            return
+        if os.getenv("HOLEMISS_DISK_EIO_ENABLED", "0") != "1":
+            return
+        eio_layer = _hm_env_int("HOLEMISS_EIO_LAYER", -1)
+        eio_logical = _hm_env_int("HOLEMISS_EIO_LOGICAL_BLOCK", 2)
+        armable_layers = self._holemiss_armable_layer_count()
+        if not (0 <= eio_layer < armable_layers):
+            logger.info(
+                "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=layer_out_of_range layer=%d armable=%d",
+                self.tp_rank,
+                request.req_id,
+                eio_layer,
+                armable_layers,
+            )
+            return
+        if not (load_start_block <= eio_logical < end_block) or eio_logical >= len(request.block_hashes):
+            logger.info(
+                "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=logical_out_of_span logical=%d span=[%d,%d)",
+                self.tp_rank,
+                request.req_id,
+                eio_logical,
+                load_start_block,
+                end_block,
+            )
+            return
+        self._holemiss_arm_disk_eio(request, eio_layer, eio_logical)
+
+    def _holemiss_arm_disk_eio(self, request: ReqMeta, eio_layer: int, eio_logical: int) -> None:
+        target_key = self._holemiss_derive_block_key(request, eio_logical)
+        if target_key is None:
+            return
+        if hasattr(self.m_store, "put_end_disk"):
+            try:
+                disk_ret = self.m_store.put_end_disk(target_key)
+            except Exception as exc:  # noqa: BLE001
+                disk_ret = f"error:{exc}"
+            logger.info("HOLEMISS_EIO_ARM tp=%d ret=%s", self.tp_rank, disk_ret)
+        else:
+            logger.info(
+                "HOLEMISS_EIO_ARM tp=%d error=method_not_found type=%s",
+                self.tp_rank,
+                type(self.m_store).__name__,
+            )
+        os.environ[HOLEMISS_EIO_TARGET_ENV] = target_key
+        self._holemiss_armed_fault = self._holemiss_make_armed_record(
+            "disk_eio", request, target_key, eio_layer, eio_logical
+        )
+        logger.info("HOLEMISS_EIO_TARGET_SET tp=%d layer=%d target=%s", self.tp_rank, eio_layer, target_key)
+
+    def _holemiss_arm_synthetic(self, request: ReqMeta, load_start_block: int, end_block: int) -> None:
+        fail_layer = _hm_env_int("HOLEMISS_FAIL_LAYER", -1)
+        fail_logical = _hm_env_int("HOLEMISS_FAIL_LOGICAL_BLOCK", -1)
+        if fail_logical < 0 or not (0 <= fail_layer < self._holemiss_armable_layer_count()):
+            return
+        if not (load_start_block <= fail_logical < end_block) or fail_logical >= len(request.block_hashes):
+            logger.info(
+                "HOLEMISS_SYNTHETIC_ARM_SKIP tp=%d req=%s reason=logical_out_of_span logical=%d span=[%d,%d)",
+                self.tp_rank,
+                request.req_id,
+                fail_logical,
+                load_start_block,
+                end_block,
+            )
+            return
+        target_key = self._holemiss_derive_block_key(request, fail_logical)
+        if target_key is None:
+            return
+        self._holemiss_armed_fault = self._holemiss_make_armed_record(
+            "synthetic", request, target_key, fail_layer, fail_logical
+        )
+        if _hm_is_evidence() or _hm_diag_enabled():
+            logger.info(
+                "HOLEMISS_SYNTHETIC_ARM tp=%d req=%s layer=%d logical=%d key=%s",
+                self.tp_rank,
+                request.req_id,
+                fail_layer,
+                fail_logical,
+                target_key,
+            )
+
+    def _holemiss_make_armed_record(
+        self, kind: str, request: ReqMeta, target_key: str, layer_id: int, logical_block: int
+    ) -> dict:
+        block_size = self.grouped_block_size[0]
+        block_ids = request.block_ids_by_group[0] if request.block_ids_by_group else []
+        physical_block_id = int(block_ids[logical_block]) if logical_block < len(block_ids) else -1
+        return {
+            "kind": kind,
+            "request_id": request.req_id,
+            "key": target_key,
+            "layer_id": layer_id,
+            "logical_block_index": logical_block,
+            "token_start": logical_block * block_size,
+            "token_end": (logical_block + 1) * block_size,
+            "physical_block_id": physical_block_id,
+            "tp_rank": self.tp_rank,
+            "pool_page_row": [int(x) for x in block_ids],
+            "manager_block_size": int(block_size),
+        }
+
+    def _holemiss_make_region(self, armed: dict, result: int, result_index: int) -> dict:
+        layer_id = int(armed["layer_id"])
+        if self.use_hybrid:
+            layer_id = self._holemiss_hybrid_physical_layer(layer_id)
+        return {
+            "request_id": armed["request_id"],
+            "key": armed["key"],
+            "result": int(result),
+            "result_index": result_index,
+            "logical_block_index": int(armed["logical_block_index"]),
+            "token_start": int(armed["token_start"]),
+            "token_end": int(armed["token_end"]),
+            "physical_block_id": int(armed["physical_block_id"]),
+            "layer_id": layer_id,
+            "layer_start": layer_id,
+            "layer_end": layer_id,
+            "tp_rank": self.tp_rank,
+            "pool_page_row": list(armed.get("pool_page_row", [])),
+            "manager_block_size": int(armed.get("manager_block_size", 0)),
+        }
+
+    def holemiss_range_target_position(self, keys: list[str], physical_layer_id: int) -> int | None:
+        """Index of the armed key in a range GET batch, or None if not targeted.
+
+        The armed key is a globally unique block object; the store-layer
+        selector is mapped to its physical layer so exactly ONE physical
+        layer's range GET is isolated (the object spans the group's layers).
+        """
+        armed = self._holemiss_armed_fault
+        if armed is None or armed.get("key") not in keys:
+            return None
+        if self.use_hybrid:
+            if self._holemiss_hybrid_physical_layer(int(armed["layer_id"])) != physical_layer_id:
+                return None
+        elif int(armed["layer_id"]) != physical_layer_id:
+            return None
+        return keys.index(armed["key"])
+
+    def execute_holemiss_range_target(
+        self,
+        keys: list[str],
+        buffers: list[list[int]],
+        sizes: list[list[int]],
+        offsets: list[list[int]],
+        target_pos: int,
+    ) -> list[int]:
+        """Issue one armed range GET, isolating the target for exactly one region."""
+        armed = self._holemiss_armed_fault
+        assert armed is not None
+        healthy = [pos for pos in range(len(keys)) if pos != target_pos]
+        results: list[int] = [0] * len(keys)
+        if healthy:
+            healthy_keys = [keys[pos] for pos in healthy]
+            healthy_results = self.m_store.batch_copy_get(
+                healthy_keys,
+                [buffers[pos] for pos in healthy],
+                [sizes[pos] for pos in healthy],
+                [offsets[pos] for pos in healthy],
+            )
+            healthy_results = require_aligned_batch_results("batch_copy_get", healthy_keys, healthy_results)
+            for pos, result in zip(healthy, healthy_results, strict=True):
+                results[pos] = int(result)
+        if armed["kind"] == "synthetic":
+            target_rc: int = HOLEMISS_SYNTHETIC_FAULT_RC
+            logger.info(
+                "HOLEMISS_INJECT layer=%d logical=%d key=%s -> %d",
+                armed["layer_id"],
+                armed["logical_block_index"],
+                keys[target_pos],
+                HOLEMISS_SYNTHETIC_FAULT_RC,
+            )
+        else:
+            target_result = self.m_store.batch_copy_get(
+                [keys[target_pos]], [buffers[target_pos]], [sizes[target_pos]], [offsets[target_pos]]
+            )
+            if target_result is None:
+                target_rc = -1
+            else:
+                target_rc = int(require_aligned_batch_results("batch_copy_get", [keys[target_pos]], target_result)[0])
+        results[target_pos] = target_rc
+        if target_rc < 0:
+            region = self._holemiss_make_region(armed, target_rc, target_pos)
+            self.record_hole_recovery_region(region)
+            logger.info(
+                "HOLEMISS_GET_COMPLETE req=%s key=%s token=%d-%d block=%d layer=%d logical=%d tp=%d result=%d",
+                region["request_id"],
+                region["key"],
+                region["token_start"],
+                region["token_end"],
+                region["physical_block_id"],
+                region["layer_id"],
+                region["logical_block_index"],
+                region["tp_rank"],
+                region["result"],
+            )
+        else:
+            logger.warning(
+                "HOLEMISS_FAULT_NOT_OBSERVED tp=%d req=%s layer=%d logical=%d key=%s rc=%d",
+                self.tp_rank,
+                armed["request_id"],
+                armed["layer_id"],
+                armed["logical_block_index"],
+                keys[target_pos],
+                target_rc,
+            )
+        return results
+
+    def _holemiss_sync_layerwise_drain(self, load_requests: list[ReqMeta]) -> None:
+        """Serialized pre-forward completion of the block-key session load.
+
+        Native layerwise loads interleave with forward; the HR hook scope
+        semantics were proven under all-KV-resident-before-forward (B12). With
+        HOLEMISS_SYNC_LAYERWISE_LOAD=1 this submits every prepared per-layer
+        load task and waits its finished event before start_load_kv returns
+        (attention gate omitted: the drain must not depend on a forward that has
+        not run), then suppresses the native pipeline (empty tasks +
+        next_layer_to_submit=num_layers). layerwise_transfer (GVA) and
+        multi-group non-hybrid fall back to the native pipeline untouched.
+        """
+        if getattr(self, "use_layerwise_transfer", False) or (self.num_kv_cache_groups > 1 and not self.use_hybrid):
+            logger.info(
+                "HOLEMISS_SYNC_DRAIN_FALLBACK tp=%d reason=multi_group_or_gva groups=%d hybrid=%s",
+                self.tp_rank,
+                self.num_kv_cache_groups,
+                self.use_hybrid,
+            )
+            return
+        if self.use_hybrid and self._holemiss_hybrid_fa_layers() is None:
+            logger.info("HOLEMISS_SYNC_DRAIN_FALLBACK tp=%d reason=hybrid_fa_layer_map_unavailable", self.tp_rank)
+            return
+        recv_thread = self.kv_recv_thread
+        if recv_thread is None:
+            return
+        holemiss_t0 = time.perf_counter()
+        for layer_id in range(self.num_layers):
+            tasks = self.layer_load_tasks[layer_id]
+            if not tasks:
+                continue
+            recv_thread.add_request(  # type: ignore[union-attr]
+                LayerLoadTask(
+                    wait_for_save_layer=None,
+                    transfer_tasks=tasks,
+                    layer_id=layer_id,
+                    attention_start_gate=None,
+                )
+            )
+            event = self.layer_load_finished_events[layer_id]
+            while not event.wait(timeout=10):
+                recv_thread.raise_if_failed()  # type: ignore[union-attr]
+                logger.info("Layerwise %d load not done, keep waiting", layer_id)
+            event.clear()
+        self.layer_load_tasks = [[] for _ in range(self.num_layers)]
+        self.next_layer_to_submit = self.num_layers
+        _holemiss_device_synchronize()
+        for request in load_requests:
+            self._holemiss_emit_load_duration(request.req_id, self.num_layers, holemiss_t0)
+            if _hm_is_evidence():
+                logger.info("HOLEMISS_ALL_LAYER_GETS_COMPLETE tp=%d req=%s", self.tp_rank, request.req_id)
+
+    def _holemiss_emit_load_duration(self, req_id: str, layers: int, t0: float) -> None:
+        if not _hm_kv_load_timing_enabled():
+            return
+        logger.info(
+            "HOLEMISS_KV_LOAD_DURATION req_id=%s tp_rank=%d layers=%d ms=%.3f",
+            req_id,
+            self.tp_rank,
+            layers,
+            (time.perf_counter() - t0) * 1000.0,
+        )
+
+    def _holemiss_teardown_finished(self, finished_req_ids: set[str]) -> None:
+        """B12b: purge HR regions for EVERY finished/failed request.
+
+        A request failed by the scheduler never re-enters configure_fault, and
+        the mixin clears only when the hook armed this step, so without this
+        purge a late region would re-arm the mixin against a req_id no longer
+        in the batch.
+        """
+        for req_id in finished_req_ids:
+            self._holemiss_purge_regions(req_id)
+        armed = self._holemiss_armed_fault
+        if armed is None or armed.get("request_id") not in finished_req_ids:
+            return
+        self._holemiss_emit_state_readback("finished")
+        os.environ[HOLEMISS_EIO_TARGET_ENV] = ""
+        self._holemiss_armed_fault = None
+
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         # Match process_layer_data(), including stage-local draft layers.
         if not self.use_block_key_layerwise and getattr(self, "pp_size", 1) > 1:
@@ -3046,6 +3595,7 @@ class KVPoolWorker:
             send_thread.dec_stored_request(req_id)  # type: ignore[attr-defined]
 
     def get_finished(self, finished_req_ids: set[str], meta: AscendConnectorMetadata) -> tuple[set[str], set[str]]:
+        self._holemiss_teardown_finished(finished_req_ids | meta.preempted_req_ids)
         if self.use_block_key_layerwise:
             self._release_layerwise_requests_terminal(finished_req_ids | meta.preempted_req_ids)
         if self.kv_send_thread is not None:

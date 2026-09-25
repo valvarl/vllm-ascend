@@ -510,6 +510,18 @@ class MooncakeBackend(Backend):
             logger.debug("Failed to get key details. keys=%s", keys)
             return None
 
+    def put_end_disk(self, key: str) -> bool:
+        """Transition an object's disk replica to COMPLETE state (holemiss).
+
+        Thin passthrough to the Mooncake pybind (Client::PutEnd with
+        ReplicaType::DISK), used by the KV pool worker's disk-EIO arming window.
+        The arming site is hasattr-guarded, so backends or test mocks without
+        this method keep the method_not_found log path.
+        """
+        self.ensure_initialized()
+        assert self.store is not None
+        return self.store.put_end_disk(key)
+
 
 @dataclass
 class MooncakeStoreConfig:

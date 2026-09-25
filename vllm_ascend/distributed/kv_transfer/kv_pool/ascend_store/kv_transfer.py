@@ -533,6 +533,35 @@ class KVTransferThread(threading.Thread):
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
         self._fatal_error: BaseException | None = None
+        # HR region store fallback for worker-less constructions (unit tests,
+        # mock backends); the worker's store is canonical when wired.
+        self.worker: Any = None
+        self._hr_local_regions: list[dict] = []
+        self._hr_local_lock = threading.Lock()
+
+    def record_hole_recovery_region(self, region: dict) -> None:
+        """Holemiss HR seam: the mixin's clear path calls this on the recv thread."""
+        worker = self.worker
+        if worker is not None and hasattr(worker, "record_hole_recovery_region"):
+            worker.record_hole_recovery_region(region)
+            return
+        with self._hr_local_lock:
+            self._hr_local_regions.append(region)
+
+    def get_hole_recovery_regions(self) -> list[dict]:
+        worker = self.worker
+        if worker is not None and hasattr(worker, "get_hole_recovery_regions"):
+            return worker.get_hole_recovery_regions()
+        with self._hr_local_lock:
+            return list(self._hr_local_regions)
+
+    def clear_hole_recovery_regions(self) -> None:
+        worker = self.worker
+        if worker is not None and hasattr(worker, "clear_hole_recovery_regions"):
+            worker.clear_hole_recovery_regions()
+            return
+        with self._hr_local_lock:
+            self._hr_local_regions.clear()
 
     def _get_block_size(self, kv_cache_group_id: int = 0) -> int:
         if isinstance(self.block_size, list):
@@ -1511,6 +1540,7 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
         layer_save_finished_events: list[threading.Event],
         num_layers: int,
         layer_offset: int = 0,
+        worker: Any = None,
     ):
         super().__init__(
             m_store,
@@ -1522,6 +1552,7 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
             ready_event,
             name="KVCacheStoreKeyLayerRecvingThread",
         )
+        self.worker = worker
         self.get_event = get_event
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
@@ -1895,6 +1926,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         invalid_block_ids: set[int] | None = None,
         invalid_block_ids_lock: threading.Lock | None = None,
         load_abort_event: threading.Event | None = None,
+        worker: Any = None,
     ):
         super().__init__(
             m_store,
@@ -1906,6 +1938,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             ready_event,
             name="KVCacheStoreLayerRecvingThread",
         )
+        self.worker = worker
         self.get_event = get_event
         self.layer_load_finished_events = layer_load_finished_events
         self.layer_save_finished_events = layer_save_finished_events
@@ -1962,6 +1995,40 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         with self._invalid_block_ids_lock:
             self._invalid_block_ids.update(req_meta.block_ids[index] for index in indices)
 
+    def _issue_range_get(
+        self,
+        active_keys: list[str],
+        active_buffers: list[list[int]],
+        active_sizes: list[list[int]],
+        active_offsets: list[list[int]],
+        layer_id: int,
+    ) -> list[int]:
+        worker = self.worker
+        if worker is not None and hasattr(worker, "holemiss_range_target_position"):
+            if getattr(worker, "_holemiss_armed_fault", None) is not None:
+                target = worker.holemiss_range_target_position(active_keys, layer_id)
+                if target is not None:
+                    return worker.execute_holemiss_range_target(
+                        active_keys, active_buffers, active_sizes, active_offsets, target
+                    )
+        results: list[int] = []
+        for keys, buffers, sizes, offsets in self._range_transfer_batches(
+            active_keys,
+            active_buffers,
+            active_sizes,
+            active_offsets,
+            self.max_transfer_blocks,
+            self.max_transfer_bytes,
+        ):
+            results.extend(
+                require_aligned_batch_results(
+                    "batch_copy_get",
+                    keys,
+                    self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
+                )
+            )
+        return results
+
     def _handle_range_request(self, req_meta: LayerRangeReqMeta, shared: SharedBlockData) -> None:
         layer_id = req_meta.layer_id
         if self._active_load_indices is None or layer_id == 0:
@@ -1979,22 +2046,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             active_buffers = [req_meta.all_buffers[index] for index in active_indices]
             active_sizes = [req_meta.all_sizes[index] for index in active_indices]
             active_offsets = [req_meta.all_offsets[index] for index in active_indices]
-            results: list[int] = []
-            for keys, buffers, sizes, offsets in self._range_transfer_batches(
-                active_keys,
-                active_buffers,
-                active_sizes,
-                active_offsets,
-                self.max_transfer_blocks,
-                self.max_transfer_bytes,
-            ):
-                results.extend(
-                    require_aligned_batch_results(
-                        "batch_copy_get",
-                        keys,
-                        self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
-                    )
-                )
+            results = self._issue_range_get(active_keys, active_buffers, active_sizes, active_offsets, layer_id)
             _emit_range_debug_event("load", layer_id, active_sizes, active_offsets, results)
             failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
             if failed_indices:

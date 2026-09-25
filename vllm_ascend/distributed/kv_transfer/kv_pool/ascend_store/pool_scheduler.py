@@ -267,6 +267,13 @@ class KVPoolScheduler:
         include_layers: bool = False,
         kv_cache_group_id: int = 0,
     ) -> list[list[str]]:
+        if include_layers and bool(self.use_hybrid):
+            raise RuntimeError(
+                "B7: the legacy per-layer store lookup enumerates "
+                "split_layers(num_layers) physical layer keys, which can never match a "
+                "block-key hybrid store - refusing a silent zero-hit. Use the block-key "
+                "layerless hit check (use_block_key_layerwise)."
+            )
         head_or_tp_ranks = self.tp_size // self.put_step
         cache_family = get_group_cache_family(self.kv_cache_group_families, kv_cache_group_id)
         keys_by_block = []
