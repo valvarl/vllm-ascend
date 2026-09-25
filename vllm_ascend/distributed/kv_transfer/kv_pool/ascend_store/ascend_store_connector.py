@@ -31,7 +31,11 @@ from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder
@@ -129,6 +133,31 @@ class AscendStoreKVEvents(KVConnectorKVEvents):
         return f"<AscendStoreKVEvents events={self.get_all_events()}>"
 
 
+def gdn_boundary_state_persistence_default(kv_cache_config: KVCacheConfig | None) -> bool:
+    """Whether align-mode GDN boundary-state persistence applies to this layout.
+
+    Upstream #17287 saves the conv/ssm boundary state of align-mode Mamba
+    (GDN) cache groups through the mooncake layerwise sessions (per-group put
+    sessions + post-compute ``save_kv_layer`` payload ranges). The stack
+    contract makes that save the DEFAULT for the geometries it applies to --
+    hybrid cache layouts carrying at least one align-mode ``MambaSpec`` group
+    -- so no explicit ``use_layerwise`` opt-in is required for them. Layouts
+    without hybrid GDN groups keep the historical default (off), including
+    single-group text and plain-mamba models.
+    """
+    if kv_cache_config is None:
+        return False
+    groups = getattr(kv_cache_config, "kv_cache_groups", None) or []
+    if len(groups) < 2:
+        return False
+    for group in groups:
+        spec = group.kv_cache_spec
+        specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
+        if any(isinstance(sub, MambaSpec) and getattr(sub, "mamba_cache_mode", None) == "align" for sub in specs):
+            return True
+    return False
+
+
 class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
@@ -143,9 +172,30 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.kv_role = vllm_config.kv_transfer_config.kv_role
 
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-        self.use_layerwise = extra_config.get("use_layerwise", False)
-        self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
         self.backend_name = extra_config.get("backend", "mooncake").lower()
+        explicit_use_layerwise = extra_config.get("use_layerwise", None)
+        if explicit_use_layerwise is None:
+            # Stack contract: align-mode GDN boundary-state persistence is
+            # DEFAULT-ON for hybrid mooncake layouts (upstream #17287 saves
+            # the conv/ssm boundary state through the layerwise sessions), so
+            # no opt-in flag is required. An explicit True/False always wins.
+            self.use_layerwise = self.backend_name == "mooncake" and gdn_boundary_state_persistence_default(
+                kv_cache_config
+            )
+            if self.use_layerwise and vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs():
+                # requires_piecewise_for_cudagraph cannot see the cache
+                # layout, so the default-on path can arrive here under full
+                # CUDA graphs; layerwise ops cannot be captured in them.
+                raise ValueError(
+                    "AscendStoreConnector defaults use_layerwise=True for hybrid "
+                    "align-mode (GDN) cache layouts, but layerwise operations cannot "
+                    "run under full CUDA graphs. Use piecewise cudagraphs or "
+                    "--enforce-eager, or set kv_connector_extra_config "
+                    "{'use_layerwise': False} to keep the legacy bulk path."
+                )
+        else:
+            self.use_layerwise = bool(explicit_use_layerwise)
+        self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
         self.layerwise_protocol = get_layerwise_protocol(self.backend_name)
         self.layerwise_data_plane = get_layerwise_data_plane(self.layerwise_protocol)
         self.use_block_key_layerwise = self.use_layerwise and self.layerwise_data_plane == "block_key"
