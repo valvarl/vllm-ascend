@@ -652,6 +652,12 @@ class BalanceScheduler(Scheduler):
                         )
 
                 request = request_queue.pop_request()
+                self._skip_zeroing_for_connector_load(
+                    request,
+                    num_new_local_computed_tokens,
+                    num_computed_tokens,
+                    num_external_computed_tokens,
+                )
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -786,9 +792,7 @@ class BalanceScheduler(Scheduler):
                 boundary_state_offloads=boundary_state_offloads,
             )
 
-        new_block_ids_to_zero = (
-            (self.kv_cache_manager.take_new_block_ids() or None) if self.needs_kv_cache_zeroing else None
-        )
+        new_block_ids_to_zero = self._get_new_block_ids_to_zero()
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens

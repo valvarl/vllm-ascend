@@ -2513,6 +2513,7 @@ class NPUModelRunner(GPUModelRunner):
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
+                model_runner=self,
                 **(
                     {"defer_finalize": defer_kv_connector_finalize}
                 ),

@@ -655,6 +655,12 @@ class ProfilingChunkScheduler(Scheduler):
                         )
 
                 request = request_queue.pop_request()
+                self._skip_zeroing_for_connector_load(
+                    request,
+                    num_new_local_computed_tokens,
+                    num_computed_tokens,
+                    num_external_computed_tokens,
+                )
                 if load_kv_async:
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     step_skipped_waiting.prepend_request(request)
@@ -762,9 +768,7 @@ class ProfilingChunkScheduler(Scheduler):
                 boundary_state_offloads=boundary_state_offloads,
             )
 
-        new_block_ids_to_zero = (
-            (self.kv_cache_manager.take_new_block_ids() or None) if self.needs_kv_cache_zeroing else None
-        )
+        new_block_ids_to_zero = self._get_new_block_ids_to_zero()
 
         scheduler_output_kwargs = dict(
             scheduled_new_reqs=new_reqs_data,

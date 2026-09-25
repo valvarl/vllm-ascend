@@ -87,6 +87,49 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # ------------------------------------------------------------------
+    # Holemiss hole-recovery / fault-injection contract.
+    #
+    # These names are shared verbatim with the Mooncake C++ disk-EIO gate and
+    # the vLLM HR mixin, so every read stays a live os.getenv: a value changed
+    # between two GET windows must be observed immediately. They are declared
+    # here as the single registry; the HP test
+    # tests/ut/distributed/ascend_store/test_holemiss_scheduler_copies.py pins
+    # that every HOLEMISS_* literal used in vllm_ascend has an entry below.
+    # ------------------------------------------------------------------
+    # Holemiss runtime diagnostics profile. Valid values: "perf", "evidence",
+    # "debug". Default: "perf" (minimal diagnostics).
+    "HOLEMISS_RUNTIME_PROFILE": lambda: os.getenv("HOLEMISS_RUNTIME_PROFILE", "perf"),
+    # Emit the per-layer HOLEMISS diagnostic traces. Default: 0 (disabled).
+    "HOLEMISS_DIAG": lambda: os.getenv("HOLEMISS_DIAG", "0") == "1",
+    # Force a serialized pre-forward drain of the block-key session load.
+    # Default: 0 (native interleaved pipeline).
+    "HOLEMISS_SYNC_LAYERWISE_LOAD": lambda: os.getenv("HOLEMISS_SYNC_LAYERWISE_LOAD", "0") == "1",
+    # Emit the HOLEMISS_KV_LOAD_DURATION timing channel. Default: 0 (disabled).
+    "HOLEMISS_KV_LOAD_TIMING": lambda: os.getenv("HOLEMISS_KV_LOAD_TIMING", "0") == "1",
+    # Master switch for the real disk-EIO injection family. Default: 0 (off).
+    "HOLEMISS_DISK_EIO_ENABLED": lambda: os.getenv("HOLEMISS_DISK_EIO_ENABLED", "0") == "1",
+    # Synthetic fault-injector layer id. A non-negative digit string enables
+    # the synthetic family and takes priority over the disk-EIO family.
+    # Raw string: the arming priority test is `.isdigit()` on the value.
+    # Default: "-1" (disabled).
+    "HOLEMISS_FAIL_LAYER": lambda: os.getenv("HOLEMISS_FAIL_LAYER", "-1"),
+    # Synthetic fault-injector logical block id. Default: "-1".
+    "HOLEMISS_FAIL_LOGICAL_BLOCK": lambda: os.getenv("HOLEMISS_FAIL_LOGICAL_BLOCK", "-1"),
+    # Disk-EIO target store-local (FA-group) layer id. Default: -1.
+    "HOLEMISS_EIO_LAYER": lambda: int(os.getenv("HOLEMISS_EIO_LAYER", "-1")),
+    # Disk-EIO target logical block id. Default: 2.
+    "HOLEMISS_EIO_LOGICAL_BLOCK": lambda: int(os.getenv("HOLEMISS_EIO_LOGICAL_BLOCK", "2")),
+    # HR execution mode. Valid values: "hr_sequential", "hr_gap".
+    # Default: "hr_sequential".
+    "HOLEMISS_RECOVERY_MODE": lambda: os.getenv("HOLEMISS_RECOVERY_MODE", "hr_sequential"),
+    # Bench tree root that resolves the hole-recovery hook trio
+    # (hole_recovery_hook, hole_recovery_config, hole_recovery_timer).
+    # Default: "" (unset; a fault-mode run fails fast without it).
+    "HOLEMISS_BENCH_ROOT": lambda: os.getenv("HOLEMISS_BENCH_ROOT", ""),
+    # Full Mooncake block-object key armed for disk-EIO injection. An empty
+    # value means the injector is off (re-read live per call). Default: "".
+    "EIO_TARGET_KEY": lambda: os.getenv("EIO_TARGET_KEY", ""),
 }
 
 # end-env-vars-definition
