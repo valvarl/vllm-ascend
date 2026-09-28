@@ -15,6 +15,7 @@ import json
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,7 +36,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 import vllm_ascend.attention.utils as attention_utils
 from tests.ut.kv_offload.utils import create_model_runner_output, create_vllm_config
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import pool_worker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import pool_scheduler, pool_worker
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreConnector
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     attention_transfer_window,
@@ -43,7 +44,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_layerwise import make_block_key
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import get_layerwise_kv_cache_specs
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import block_hash_to_str
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata, block_hash_to_str
 
 NUM_LAYERS = 4
 FULL_BLOCK = 16
@@ -264,12 +265,14 @@ def _expected_keys(config, request, pool):
     }
 
 
-def _drive_request(worker, scheduler, req_id, tokens, max_tokens, specs, caches, *, named_layers):
+def _drive_request(worker, scheduler, req_id, tokens, max_tokens, specs, caches, *, named_layers, flags_out=None):
     """Run one request the way attention_v1 does: per layer, scatter the KV
     bytes, notify ``on_kv_cache_written`` through the real dispatch helper,
     and run the attention op inside the transfer window. ``named_layers``
     additionally drives the mla_v1/sfa_v1/dsa_v1 layer-end save call, which
-    the connector must deduplicate against the notification."""
+    the connector must deduplicate against the notification. ``flags_out``
+    records ``(scheduled_tokens, has_sync_kv_loads)`` for every step,
+    including the terminal empty schedule."""
     request = Request(
         request_id=req_id,
         prompt_token_ids=tokens,
@@ -287,6 +290,8 @@ def _drive_request(worker, scheduler, req_id, tokens, max_tokens, specs, caches,
         worker.handle_preemptions(meta)
         worker.bind_connector_metadata(meta)
         scheduled = output.num_scheduled_tokens.get(req_id, 0)
+        if flags_out is not None:
+            flags_out.append((scheduled, output.has_sync_kv_loads))
         worker.start_load_kv(SimpleNamespace() if scheduled else None)
         if scheduled:
             end = request.num_computed_tokens
@@ -325,6 +330,8 @@ def _drive_request(worker, scheduler, req_id, tokens, max_tokens, specs, caches,
         worker.clear_connector_metadata()
         if req_id not in scheduler.requests:
             terminal = scheduler.schedule()
+            if flags_out is not None:
+                flags_out.append((0, terminal.has_sync_kv_loads))
             worker.bind_connector_metadata(terminal.kv_connector_metadata)
             worker.get_finished(terminal.finished_req_ids)
             worker.clear_connector_metadata()
@@ -475,6 +482,85 @@ def test_second_request_saves_fresh_prefix(text_engine, memory_store):
     _assert_block_key_save(memory_store, config, request, pool, caches, prefill_blocks, expected_keys)
     _assert_commit_at_final_layer(memory_store, pool, expected_keys, events_before)
     assert memory_store.open_puts == set() and memory_store.open_reads == set()
+
+
+def test_save_bearing_step_forces_sync_loads_flag(text_engine, memory_store):
+    """B19 ordering: a save-bearing step with no connector loads must raise
+    has_sync_kv_loads so the model-runner mixin runs start_load_kv PRE-forward
+    (the scheduler itself only raises the flag for external computed tokens,
+    i.e. sync loads; a save-only populate step has none)."""
+    config, plan, worker, specs, caches, scheduler, pool = text_engine
+    request = Request(
+        request_id="sync-flag",
+        prompt_token_ids=list(range(NUM_TOKENS)),
+        sampling_params=SamplingParams(max_tokens=2),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(FULL_BLOCK, sha256),
+    )
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    meta = output.kv_connector_metadata
+
+    # Attribution: the step is save-bearing and carries no load spec, so the
+    # scheduler's own external-token condition cannot be the flag's source.
+    assert any(item.can_save for item in meta.requests)
+    assert not any(item.load_spec is not None and item.load_spec.can_load for item in meta.requests)
+    assert output.has_sync_kv_loads is True
+
+
+def test_no_save_work_step_keeps_deferred_flag(text_engine, memory_store):
+    """Steps without connector save work keep the deferred start: decode steps
+    carry no save spec (D-T12.6) and the terminal empty schedule has no
+    metadata requests at all — none of them may force the sync path."""
+    config, plan, worker, specs, caches, scheduler, pool = text_engine
+    flags = []
+    _drive_request(
+        worker,
+        scheduler,
+        "deferred-flag",
+        list(range(NUM_TOKENS)),
+        max_tokens=2,
+        specs=specs,
+        caches=caches,
+        named_layers=False,
+        flags_out=flags,
+    )
+    scheduled_flags = [flag for scheduled, flag in flags if scheduled]
+    assert scheduled_flags[0] is True, "the populate step is save-bearing and must force the sync start"
+    assert all(flag is False for flag in scheduled_flags[1:]), "decode steps must stay deferred"
+    assert flags[-1] == (0, False), "the terminal empty schedule must stay deferred"
+
+
+def test_start_load_kv_gives_each_step_fresh_task_lists(text_engine):
+    """The worker swaps in fresh per-layer task lists on every start_load_kv,
+    so a during-forward save driver can never observe a previous step's tasks
+    once the step ordering is pre-forward (the b19 cross-step hazard)."""
+    config, plan, worker, specs, caches, scheduler, pool = text_engine
+    empty_meta = AscendConnectorMetadata(set(), set())
+    first = pool.layer_save_tasks
+    pool.start_load_kv(empty_meta)
+    second = pool.layer_save_tasks
+    assert second is not first
+    pool.start_load_kv(empty_meta)
+    assert pool.layer_save_tasks is not second
+    assert pool.layer_save_tasks == [[] for _ in range(pool.num_layers)]
+
+
+def test_sync_loads_forcing_pinned_in_build_connector_meta():
+    """Composition pin: the flag write stays inside build_connector_meta and
+    stays guarded by the save-bearing predicate (no relocation/removal drift,
+    no unconditional forcing)."""
+    source = Path(pool_scheduler.__file__).read_text()
+    fn_start = source.index("    def build_connector_meta(self, scheduler_output: SchedulerOutput)")
+    fn_end = source.index("    def get_sending_event_id(", fn_start)
+    body = source[fn_start:fn_end]
+    guard = body.index("if self._step_carries_layerwise_save(meta):")
+    forcing = body.index("scheduler_output.has_sync_kv_loads = True")
+    assert 0 < guard < forcing < body.rindex("return meta")
+    helper_start = source.index("    def _step_carries_layerwise_save(")
+    helper = source[helper_start : source.index("\n    def ", helper_start + len("    def _step"))]
+    assert "self.use_layerwise" in helper, "the predicate must stay scoped to the layerwise path"
+    assert "can_save" in helper.strip().splitlines()[-1], "the predicate must mirror the worker's save gating"
 
 
 class _StubWorker:

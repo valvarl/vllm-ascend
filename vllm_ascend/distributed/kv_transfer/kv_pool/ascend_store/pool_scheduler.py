@@ -943,11 +943,23 @@ class KVPoolScheduler:
             hash_block_size=self.hash_block_size,
         )
 
+    def _step_carries_layerwise_save(self, meta: AscendConnectorMetadata) -> bool:
+        """Whether the worker's layerwise save path will act on this step.
+
+        Mirrors the worker's save gating: per-layer save tasks are built for
+        every metadata request whose ``can_save`` is set. A load-only role
+        never qualifies (its save specs are nullified via ``force_skip_save``
+        before reaching the metadata) and decode steps carry no save spec.
+        """
+        return self.use_layerwise and any(request.can_save for request in meta.requests)
+
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         """Attach the connector metadata to the request object.
 
         This function should NOT modify other fields in the scheduler_output
-        except the `kv_connector_metadata` field.
+        except the `kv_connector_metadata` and `has_sync_kv_loads` fields (the
+        latter is raised on save-bearing steps; see
+        `_step_carries_layerwise_save`).
         Also, calling this function will reset the state of the connector.
         """
         force_skip_save = self.kv_role == "kv_consumer" and not self.consumer_is_to_put
@@ -1018,6 +1030,17 @@ class KVPoolScheduler:
                     self.touch_sending_mamba_blocks(req_meta)
                     meta.add_request(req_meta)
 
+        if self._step_carries_layerwise_save(meta):
+            # The layerwise save drivers fire DURING the forward (attention_v1's
+            # on_kv_cache_written notify and the hybrid attention-entry gate),
+            # but every per-step save prerequisite — cursor reset, fresh layer
+            # task lists, PutStart registration and task building — lives in
+            # the worker's start_load_kv. The model-runner mixin defers that
+            # call to post-forward on steps without sync loads, leaving the
+            # drivers to fire into empty task state (B19); force the
+            # pre-forward start the same way the upstream hisparse connector
+            # forces its per-step rebind.
+            scheduler_output.has_sync_kv_loads = True
         return meta
 
     def get_sending_event_id(self):
