@@ -212,6 +212,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
         self._current_step_has_real_forward = False
         self._mamba_copy_bufs = None
+        # Local layer index whose per-layer save was last driven by
+        # on_kv_cache_written. Backends that notify at scatter time
+        # (mla_v1/sfa_v1/dsa_v1) also call save_kv_layer at layer end;
+        # the trailing call must not drive the next layer's submission.
+        self._on_written_saved_through: int | None = None
         # Handle to the (V2) mamba hybrid model state while its per-layer
         # align pre-copy is deferred behind this connector's layerwise loads.
         self._mamba_state: Any = None
@@ -344,6 +349,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         self._mamba_copy_bufs = None
+        self._on_written_saved_through = None
         metadata = self._get_connector_metadata()
         self._current_step_has_real_forward = forward_context is not None
         logger.debug(
@@ -408,6 +414,44 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 self._mamba_copy_bufs = None
         self._mamba_state = None
 
+    def on_kv_cache_written(self, layer_name: str = "") -> None:
+        """Drive the per-layer layerwise save from the cache-write notification.
+
+        Plain-GQA attention (attention_v1) notifies only this hook after
+        ``reshape_and_cache`` and never calls ``save_kv_layer``, so without
+        this driver the block-key put sessions only register their metadata
+        (PutStart) while no payload range or session commit is ever issued
+        and replicas never complete. The notification maps onto the same
+        per-layer submission ``save_kv_layer`` drives (upstream #17287):
+        the layer's KV is already scattered when the hook fires, so the
+        submission can start at once.
+
+        Backends that ALSO call ``save_kv_layer`` at layer end
+        (mla_v1/sfa_v1/dsa_v1) are deduplicated through
+        ``_on_written_saved_through``. Hybrid layouts keep their
+        attention-entry gate driver and are skipped here.
+        """
+        if not self.use_layerwise or self.connector_worker is None:
+            return
+        if getattr(self.connector_worker, "block_key_hybrid", False):
+            # Hybrid saves are driven by the attention compute gate
+            # (pool_worker wait_for_layer_load -> _submit_attention_save)
+            # plus the recurrent-layer post-compute path; a second driver
+            # here would double-submit every full-attention layer.
+            return
+        if not is_kv_save_role(self.kv_role, self.consumer_is_to_put):
+            # A load-only consumer does not publish KV.
+            return
+        if getattr(self, "_hr_hook_active", False):
+            return
+        if not self.has_connector_metadata():
+            return
+        worker = self.connector_worker
+        if layer_name:
+            worker.validate_notified_save_layer(layer_name)
+        worker.save_kv_layer(self._get_connector_metadata())
+        self._on_written_saved_through = worker.current_layer
+
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:
@@ -420,6 +464,14 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if getattr(self, "_hr_hook_active", False):
             return
         assert self.connector_worker is not None
+        driven_through = getattr(self, "_on_written_saved_through", None)
+        if driven_through is not None and self.connector_worker.current_layer == driven_through:
+            # The scatter-time notification already drove this layer's
+            # submission (on_kv_cache_written); consuming the marker keeps
+            # the layer-end call from submitting the next layer early.
+            self._on_written_saved_through = None
+            return
+        self._on_written_saved_through = None
         self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
     def wait_for_save(self):

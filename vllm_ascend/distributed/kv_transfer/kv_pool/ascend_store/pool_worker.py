@@ -3166,6 +3166,26 @@ class KVPoolWorker:
         os.environ[HOLEMISS_EIO_TARGET_ENV] = ""
         self._holemiss_armed_fault = None
 
+    def validate_notified_save_layer(self, layer_name: str) -> None:
+        """Refuse a cache-write notification that maps to the wrong layer.
+
+        Backends that pass their layer name to the connector's
+        ``on_kv_cache_written`` (mla_v1/sfa_v1/dsa_v1) must notify the layer
+        the per-layer save progression is about to submit; a mismatch would
+        silently write one layer's ranges under another layer's object
+        offset. Refuse loudly instead of guessing.
+        """
+        if self.current_layer >= self.num_layers:
+            return
+        physical = self._extract_physical_layer_index(layer_name)
+        local = self._global_to_local_layer.get(physical, physical)
+        if local != self.current_layer:
+            raise RuntimeError(
+                f"KV cache-written hook {layer_name!r} maps to layer {local} while the "
+                f"layerwise save progression is at layer {self.current_layer}; refusing "
+                "to save another layer's ranges under this notification."
+            )
+
     def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
         # Match process_layer_data(), including stage-local draft layers.
         if not self.use_block_key_layerwise and getattr(self, "pp_size", 1) > 1:
