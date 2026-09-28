@@ -293,6 +293,32 @@ class MooncakeBackend(Backend):
                 self.config.metadata_server,
             )
             raise RuntimeError(msg)
+        # Placement affinity (preferred_segment) must name the store's
+        # REGISTERED segment: the client auto-binds an rpc port (12300-14300)
+        # when setup receives a name without one, so the client-side guess on
+        # the store-independent-TE path (the bare IP) matches no registered
+        # segment and the master silently ignores the pin, scattering
+        # replicas across both workers' segments (B21). When the pin is on,
+        # learn the true name from the store itself and fail loud if it
+        # cannot be learned — never silently keep the bare IP. On the
+        # global-TE path the constructed name already carries the port, so
+        # the learned name is an identity re-assignment. With the pin off
+        # the name is inert and the legacy construction stands unchanged.
+        if getattr(self.config, "preferred_segment", False):
+            get_store_hostname = getattr(store, "get_hostname", None)
+            if not callable(get_store_hostname):
+                raise RuntimeError(
+                    "The installed mooncake store client does not expose get_hostname(); "
+                    "the preferred_segment pin cannot name the registered segment (B21)."
+                )
+            registered_name = get_store_hostname()
+            if not registered_name:
+                raise RuntimeError(
+                    "Mooncake store setup succeeded but reported an empty segment name; "
+                    "refusing to guess preferred_segment (B21)."
+                )
+            self.local_seg = registered_name
+            logger.info("Mooncake store registered segment: %s", self.local_seg)
         if ssd_kwargs:
             logger.info(
                 "Mooncake SSD offload enabled (Mode A): path=%s",

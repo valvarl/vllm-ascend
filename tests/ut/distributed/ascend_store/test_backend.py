@@ -491,6 +491,95 @@ class TestMooncakeBackendSetup(unittest.TestCase):
 
         self.assertIs(context.exception, setup_error)
 
+    def test_setup_learns_registered_segment_name(self):
+        """B21: the store client auto-binds an rpc port when setup receives a
+        portless name, so the bare-IP local_seg on the store-independent path
+        matches no registered segment and the preferred_segment pin is
+        silently dead. The registered name is learned from the store on every
+        setup path (identity on the global-TE path, whose constructed name
+        already carries the port)."""
+        cases = (
+            (False, "10.0.0.7:50052"),
+            (True, "10.0.0.7:12824"),
+        )
+        for use_fabric_mem, registered in cases:
+            with self.subTest(use_fabric_mem=use_fabric_mem):
+                backend = self._make_backend(
+                    config=_make_mooncake_store_config(
+                        preferred_segment=True,
+                        prefer_alloc_in_same_node=False,
+                    ),
+                    use_fabric_mem=use_fabric_mem,
+                )
+                store = MagicMock()
+                store.setup.return_value = 0
+                store.get_hostname.return_value = registered
+
+                self._setup_store(backend, store)
+
+                self.assertEqual(backend.local_seg, registered)
+                replicate_config = MagicMock()
+                with patch(
+                    f"{self._MODULE_PATH}.ReplicateConfig",
+                    return_value=replicate_config,
+                ):
+                    backend._build_replicate_config()
+                self.assertEqual(replicate_config.preferred_segment, registered)
+                self.assertFalse(replicate_config.prefer_alloc_in_same_node)
+
+    def test_setup_preserves_legacy_segment_name_with_pin_disabled(self):
+        """Off-switch semantics unchanged: with the pin off the name is inert,
+        no learning happens (the store is not even asked), and the legacy
+        construction stands; preferred_segment is never sent."""
+        cases = (
+            (False, "10.0.0.7:50052"),
+            (True, "10.0.0.7"),
+        )
+        for use_fabric_mem, legacy in cases:
+            with self.subTest(use_fabric_mem=use_fabric_mem):
+                backend = self._make_backend(
+                    config=_make_mooncake_store_config(preferred_segment=False),
+                    use_fabric_mem=use_fabric_mem,
+                )
+                store = MagicMock()
+                store.setup.return_value = 0
+                store.get_hostname.return_value = "10.0.0.7:12824"
+
+                self._setup_store(backend, store)
+
+                self.assertEqual(backend.local_seg, legacy)
+                store.get_hostname.assert_not_called()
+                replicate_config = SimpleNamespace(preferred_segment="", prefer_alloc_in_same_node=True)
+                with patch(
+                    f"{self._MODULE_PATH}.ReplicateConfig",
+                    return_value=replicate_config,
+                ):
+                    backend._build_replicate_config()
+                self.assertEqual(replicate_config.preferred_segment, "")
+
+    def test_setup_fails_loud_without_get_hostname(self):
+        backend = self._make_backend(
+            config=_make_mooncake_store_config(preferred_segment=True),
+            use_fabric_mem=True,
+        )
+        store = MagicMock(spec=["setup"])
+        store.setup.return_value = 0
+
+        with self.assertRaisesRegex(RuntimeError, "get_hostname"):
+            self._setup_store(backend, store)
+
+    def test_setup_fails_loud_on_empty_segment_name(self):
+        backend = self._make_backend(
+            config=_make_mooncake_store_config(preferred_segment=True),
+            use_fabric_mem=True,
+        )
+        store = MagicMock()
+        store.setup.return_value = 0
+        store.get_hostname.return_value = ""
+
+        with self.assertRaisesRegex(RuntimeError, "empty segment name"):
+            self._setup_store(backend, store)
+
 
 class TestMooncakeBackendMethods(unittest.TestCase):
     def _make_backend(self):
