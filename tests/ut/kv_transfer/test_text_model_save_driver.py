@@ -36,6 +36,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 
 import vllm_ascend.attention.utils as attention_utils
 from tests.ut.kv_offload.utils import create_model_runner_output, create_vllm_config
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import kv_transfer as kv_transfer_module
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import pool_scheduler, pool_worker
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreConnector
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
@@ -133,6 +134,53 @@ class MemoryStore:
         return [sum(row) for row in sizes]
 
 
+class FlakySaveStore(MemoryStore):
+    """MemoryStore with a programmable save-path range-write failure model.
+
+    ``fail_first_writes_per_key``: every key's first N batch_copy_put rows
+    return TRANSFER_FAIL (-800) without copying bytes (the B20 first-write
+    transient shape — the key recovers on its next write).
+    ``permanent_fail_first_keys``: the first N distinct keys ever put fail
+    every write (the permanent class). Every batch_copy_put call's key
+    tuple is recorded in ``put_calls``.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.fail_first_writes_per_key = 0
+        self.permanent_fail_first_keys = 0
+        self._writes_seen: dict[str, int] = {}
+        self._first_keys: list[str] = []
+        self.put_calls: list[tuple[str, ...]] = []
+
+    def _row_fails(self, key: str) -> bool:
+        if key not in self._first_keys:
+            self._first_keys.append(key)
+        if self._first_keys.index(key) < self.permanent_fail_first_keys:
+            return True
+        writes = self._writes_seen.get(key, 0)
+        self._writes_seen[key] = writes + 1
+        return writes < self.fail_first_writes_per_key
+
+    def batch_put_from_multi_buffer_ranges(self, keys, buffers, sizes, offsets):
+        self.put_calls.append(tuple(keys))
+        results = []
+        with self.lock:
+            for key, addresses, lengths, starts in zip(keys, buffers, sizes, offsets, strict=True):
+                if self._row_fails(key):
+                    results.append(-800)
+                    continue
+                assert key in self.open_puts
+                for address, size, offset in zip(addresses, lengths, starts, strict=True):
+                    assert any(start <= address < address + size <= start + length for start, length in self.regions)
+                    assert 0 <= offset < offset + size <= self.objects[key].size
+                    remote = self.objects[key].ctypes.data + offset
+                    ctypes.memmove(remote, address, size)
+                    self.copies.append((True, address, size, key))
+                results.append(sum(lengths))
+        return results
+
+
 def aligned_tensor(shape):
     alignment = 2 * 1024 * 1024
     size = int(np.prod(shape)) * 4
@@ -155,9 +203,7 @@ def wait_until(predicate, pool):
         time.sleep(0.001)
 
 
-@pytest.fixture
-def memory_store(monkeypatch, tmp_path):
-    store = MemoryStore()
+def _install_store(monkeypatch, tmp_path, store):
     monkeypatch.setitem(
         sys.modules,
         "mooncake.store",
@@ -185,6 +231,19 @@ def memory_store(monkeypatch, tmp_path):
     reset_attention_compute_start_gate()
     register_all_kvcache_specs(None)
     init_none_hash(sha256)
+
+
+@pytest.fixture
+def memory_store(monkeypatch, tmp_path):
+    store = MemoryStore()
+    _install_store(monkeypatch, tmp_path, store)
+    return store
+
+
+@pytest.fixture
+def flaky_save_store(monkeypatch, tmp_path):
+    store = FlakySaveStore()
+    _install_store(monkeypatch, tmp_path, store)
     return store
 
 
@@ -215,9 +274,11 @@ def _text_config():
     return config
 
 
-def _build_engine():
+def _build_engine(extra_config=None):
     plan = _text_plan()
     config = _text_config()
+    if extra_config:
+        config.kv_transfer_config.kv_connector_extra_config.update(extra_config)
     block_size, hash_size = resolve_kv_cache_block_sizes(plan, config)
     worker = KVConnectorFactory.create_connector(config, KVConnectorRole.WORKER, plan)
     specs = get_layerwise_kv_cache_specs(plan)
@@ -233,6 +294,15 @@ def _build_engine():
         hash_block_size=hash_size,
     )
     return config, plan, worker, specs, caches, scheduler, hash_size
+
+
+def _register_and_check_engine(worker, caches):
+    pool = worker.connector_worker
+    worker.register_kv_caches(caches)
+    assert worker.use_layerwise is True
+    assert pool.use_block_key_layerwise is True
+    assert pool.block_key_hybrid is False
+    return pool
 
 
 def _layer_geometry(pool):
@@ -349,6 +419,8 @@ def _assert_block_key_save(store, config, request, pool, caches, prefill_blocks,
     model_name = config.model_config.model.split("/")[-1]
     for index, bid in enumerate(prefill_blocks):
         key = make_block_key(model_name, block_hash_to_str(request.block_hashes[index]), pool.head_or_tp_rank)
+        if key not in expected_keys:
+            continue
         obj = store.objects[key]
         assert obj.size == object_size, "one layerless object per block (D7)"
         for layer in range(NUM_LAYERS):
@@ -384,11 +456,15 @@ def _assert_commit_at_final_layer(store, pool, expected_keys, events_before):
 @pytest.fixture
 def text_engine(memory_store):
     config, plan, worker, specs, caches, scheduler, hash_size = _build_engine()
-    pool = worker.connector_worker
-    worker.register_kv_caches(caches)
-    assert worker.use_layerwise is True
-    assert pool.use_block_key_layerwise is True
-    assert pool.block_key_hybrid is False
+    pool = _register_and_check_engine(worker, caches)
+    assert hash_size == FULL_BLOCK
+    yield config, plan, worker, specs, caches, scheduler, pool
+
+
+@pytest.fixture
+def flaky_engine(flaky_save_store):
+    config, plan, worker, specs, caches, scheduler, hash_size = _build_engine()
+    pool = _register_and_check_engine(worker, caches)
     assert hash_size == FULL_BLOCK
     yield config, plan, worker, specs, caches, scheduler, pool
 
@@ -687,3 +763,146 @@ def test_validate_notified_save_layer_refuses_wrong_layer():
 def test_validate_notified_save_layer_past_end_is_noop():
     pool = _validation_pool(NUM_LAYERS)
     pool.validate_notified_save_layer("model.layers.0.self_attn.attn")
+
+
+class _RecordingLogger:
+    """Capture the transfer module logger's formatted lines (level-agnostic)."""
+
+    def __init__(self):
+        self.lines = []
+
+    def __getattr__(self, level):
+        def record(fmt, *args):
+            self.lines.append(fmt % args if args else fmt)
+
+        return record
+
+
+def _capture_retry_events(monkeypatch):
+    """Arm RANGE_DEBUG, capture the emitters' log lines and the retry sleeps."""
+    monkeypatch.setenv("VLLM_ASCEND_KVPOOL_RANGE_DEBUG", "1")
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(kv_transfer_module, "logger", recorder)
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+    return recorder, sleeps
+
+
+def _range_retry_events(recorder):
+    prefix = kv_transfer_module._KVPOOL_RANGE_DEBUG_PREFIX
+    events = []
+    for line in recorder.lines:
+        if line.startswith(prefix) and '"event":"range_retry"' in line:
+            events.append(json.loads(line[len(prefix) :].strip()))
+    return events
+
+
+def test_transient_range_write_failures_retry_green(flaky_engine, flaky_save_store, monkeypatch):
+    """B20 transient class: every key's first write fails with -800 (the
+    layer-0 first-write race) and recovers on retry — no key is revoked, the
+    payload stays byte-exact, and exactly one retry event is emitted."""
+    config, plan, worker, specs, caches, scheduler, pool = flaky_engine
+    flaky_save_store.fail_first_writes_per_key = 1
+    recorder, sleeps = _capture_retry_events(monkeypatch)
+
+    request, prefill_blocks = _drive_request(
+        worker,
+        scheduler,
+        "transient",
+        list(range(NUM_TOKENS)),
+        max_tokens=2,
+        specs=specs,
+        caches=caches,
+        named_layers=False,
+    )
+    expected_keys = _expected_keys(config, request, pool)
+    assert set(flaky_save_store.complete) == expected_keys, "a retried transient key must not be lost"
+    _assert_block_key_save(flaky_save_store, config, request, pool, caches, prefill_blocks, expected_keys)
+    commits = [event for event in flaky_save_store.events if event[0] == "commit"]
+    assert len(commits) == 1 and set(commits[0][1]) == expected_keys
+
+    retries = _range_retry_events(recorder)
+    assert len(retries) == 1, "only layer 0 fails; one retry attempt recovers every key"
+    assert retries[0]["event"] == "range_retry"
+    assert retries[0]["direction"] == "save"
+    assert retries[0]["layer_id"] == 0
+    assert retries[0]["attempt"] == 1
+    assert retries[0]["backoff_ms"] == kv_transfer_module.RANGE_WRITE_RETRY_BACKOFF_MS
+    assert retries[0]["key_count"] == len(expected_keys)
+    assert all(result > 0 for result in retries[0]["results"])
+    assert sleeps == [kv_transfer_module.RANGE_WRITE_RETRY_BACKOFF_MS / 1000]
+
+
+def test_permanent_range_write_failure_revokes_after_bounded_attempts(flaky_engine, flaky_save_store, monkeypatch):
+    """B20 permanent class: a key that always fails is attempted exactly
+    1 + RANGE_WRITE_MAX_RETRIES times with an escalating backoff, then
+    revoked exactly as before — the survivors still commit byte-exact."""
+    config, plan, worker, specs, caches, scheduler, pool = flaky_engine
+    flaky_save_store.permanent_fail_first_keys = 1
+    recorder, sleeps = _capture_retry_events(monkeypatch)
+
+    request, prefill_blocks = _drive_request(
+        worker,
+        scheduler,
+        "permanent",
+        list(range(NUM_TOKENS)),
+        max_tokens=2,
+        specs=specs,
+        caches=caches,
+        named_layers=False,
+    )
+    expected_keys = _expected_keys(config, request, pool)
+    doomed = flaky_save_store._first_keys[0]
+    survivors = expected_keys - {doomed}
+    assert set(flaky_save_store.complete) == survivors
+    assert doomed not in flaky_save_store.objects, "the exhausted key must be revoked"
+    _assert_block_key_save(flaky_save_store, config, request, pool, caches, prefill_blocks, survivors)
+    commits = [event for event in flaky_save_store.events if event[0] == "commit"]
+    assert len(commits) == 1 and set(commits[0][1]) == survivors
+
+    doomed_calls = [call for call in flaky_save_store.put_calls if doomed in call]
+    # The bound is the B20 contract, pinned to its literal value: deriving
+    # the expectation from the module constant would validate any cap.
+    assert kv_transfer_module.RANGE_WRITE_MAX_RETRIES == 3
+    assert kv_transfer_module.RANGE_WRITE_RETRY_BACKOFF_MS == 100
+    assert len(doomed_calls) == 1 + kv_transfer_module.RANGE_WRITE_MAX_RETRIES
+    retries = _range_retry_events(recorder)
+    assert [event["attempt"] for event in retries] == list(range(1, kv_transfer_module.RANGE_WRITE_MAX_RETRIES + 1))
+    assert all(event["key_count"] == 1 and event["results"] == [-800] for event in retries)
+    base = kv_transfer_module.RANGE_WRITE_RETRY_BACKOFF_MS / 1000
+    assert sleeps == [base * 2**attempt for attempt in range(kv_transfer_module.RANGE_WRITE_MAX_RETRIES)]
+
+
+def test_retry_rechunks_failed_rows(flaky_save_store, monkeypatch):
+    """Failed rows re-batch through the chunking knobs: with a 4-key cap the
+    8-key layer-0 batch and its full-key retry both issue 4+4-key calls."""
+    config, plan, worker, specs, caches, scheduler, hash_size = _build_engine(
+        extra_config={"layerwise_max_transfer_blocks": 4}
+    )
+    pool = _register_and_check_engine(worker, caches)
+    flaky_save_store.fail_first_writes_per_key = 1
+    recorder, sleeps = _capture_retry_events(monkeypatch)
+
+    request, prefill_blocks = _drive_request(
+        worker,
+        scheduler,
+        "rechunk",
+        list(range(NUM_TOKENS)),
+        max_tokens=2,
+        specs=specs,
+        caches=caches,
+        named_layers=False,
+    )
+    expected_keys = _expected_keys(config, request, pool)
+    assert set(flaky_save_store.complete) == expected_keys
+    _assert_block_key_save(flaky_save_store, config, request, pool, caches, prefill_blocks, expected_keys)
+
+    assert flaky_save_store.put_calls
+    assert all(len(call) <= 4 for call in flaky_save_store.put_calls), "every batch must respect the knob"
+    # layer 0 = 2 chunks, one 8-key retry = 2 re-chunked batches, layers 1-3 = 2 chunks each
+    assert len(flaky_save_store.put_calls) == 2 * (NUM_LAYERS + 1)
+    retry_calls = flaky_save_store.put_calls[2:4]
+    assert set(retry_calls[0]) | set(retry_calls[1]) == expected_keys
+    assert not (set(retry_calls[0]) & set(retry_calls[1]))
+    retries = _range_retry_events(recorder)
+    assert len(retries) == 1 and retries[0]["key_count"] == len(expected_keys)

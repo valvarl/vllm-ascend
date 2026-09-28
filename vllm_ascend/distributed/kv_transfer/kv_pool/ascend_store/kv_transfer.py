@@ -42,6 +42,18 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 
 _KVPOOL_RANGE_DEBUG_PREFIX = "[KVPOOL_RANGE_DEBUG]"
 
+# Bounded retry for transient save-path range-write failures (B20): the
+# remote ACL copy rejects first writes to freshly-registered objects with
+# TRANSFER_FAIL (-800) while the identical path succeeds for established
+# keys on every subsequent layer, and revoking on the first negative
+# converted that transient into permanent key loss. Failed rows are
+# re-issued with an escalating backoff (base * 2**(attempt-1), 700 ms total
+# worst case); only rows still failing after RANGE_WRITE_MAX_RETRIES extra
+# attempts are revoked. Save direction only — load-path failures feed the
+# EIO/HR machinery and must fail fast.
+RANGE_WRITE_MAX_RETRIES = 3
+RANGE_WRITE_RETRY_BACKOFF_MS = 100
+
 
 def _build_range_debug_payload(
     direction: str,
@@ -92,6 +104,28 @@ def _emit_commit_debug_event(layer_id: int, key_count: int, results: list[int]) 
         }
         logger.info("%s %s", _KVPOOL_RANGE_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
     except Exception:
+        pass
+
+
+def _emit_range_retry_debug_event(
+    direction: str,
+    layer_id: int,
+    attempt: int,
+    sizes: list[list[int]],
+    object_offsets: list[list[int]],
+    results: list[int],
+    backoff_ms: int,
+) -> None:
+    try:
+        if not envs.VLLM_ASCEND_KVPOOL_RANGE_DEBUG:
+            return
+        payload = _build_range_debug_payload(direction, layer_id, sizes, object_offsets, results)
+        payload["event"] = "range_retry"
+        payload["attempt"] = int(attempt)
+        payload["backoff_ms"] = int(backoff_ms)
+        logger.info("%s %s", _KVPOOL_RANGE_DEBUG_PREFIX, json.dumps(payload, separators=(",", ":")))
+    except Exception:
+        # Debug instrumentation must never affect the transfer path.
         pass
 
 
@@ -1749,6 +1783,44 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         self.m_store.batch_copy_put(keys, buffers, sizes, offsets),
                     )
                 )
+            failed_indices = [index for index, result in enumerate(results) if result < 0]
+            for attempt in range(1, RANGE_WRITE_MAX_RETRIES + 1):
+                if not failed_indices:
+                    break
+                backoff_ms = RANGE_WRITE_RETRY_BACKOFF_MS * 2 ** (attempt - 1)
+                # The write is idempotent (device source buffers and dest
+                # offsets are stable for the step), so re-issuing only the
+                # failed rows is byte-identical to a single success. The
+                # send thread blocks here on purpose: the save fence only
+                # polls at the final layer (10 s), so a bounded backoff is
+                # invisible to the step envelope.
+                time.sleep(backoff_ms / 1000)
+                retry_keys = [active_keys[index] for index in failed_indices]
+                retry_sizes = [active_sizes[index] for index in failed_indices]
+                retry_offsets = [active_offsets[index] for index in failed_indices]
+                retry_buffers = [active_buffers[index] for index in failed_indices]
+                retry_results: list[int] = []
+                for keys, buffers, sizes, offsets in self._range_transfer_batches(
+                    retry_keys,
+                    retry_buffers,
+                    retry_sizes,
+                    retry_offsets,
+                    self.max_transfer_blocks,
+                    self.max_transfer_bytes,
+                ):
+                    retry_results.extend(
+                        require_aligned_batch_results(
+                            "batch_copy_put",
+                            keys,
+                            self.m_store.batch_copy_put(keys, buffers, sizes, offsets),
+                        )
+                    )
+                _emit_range_retry_debug_event(
+                    "save", layer_id, attempt, retry_sizes, retry_offsets, retry_results, backoff_ms
+                )
+                for index, result in zip(failed_indices, retry_results, strict=True):
+                    results[index] = result
+                failed_indices = [index for index in failed_indices if results[index] < 0]
             _emit_range_debug_event("save", layer_id, active_sizes, active_offsets, results)
             failed_keys = [key for key, result in zip(active_keys, results, strict=True) if result < 0]
             if failed_keys:
