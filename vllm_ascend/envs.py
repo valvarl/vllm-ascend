@@ -107,6 +107,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "HOLEMISS_SYNC_LAYERWISE_LOAD": lambda: os.getenv("HOLEMISS_SYNC_LAYERWISE_LOAD", "0") == "1",
     # Emit the HOLEMISS_KV_LOAD_DURATION timing channel. Default: 0 (disabled).
     "HOLEMISS_KV_LOAD_TIMING": lambda: os.getenv("HOLEMISS_KV_LOAD_TIMING", "0") == "1",
+    # G12 rehearsal lever: disable the GDN state-save channel so the T15
+    # missing-state arm exercises the ladder's zero-recompute rung. This gates
+    # the SAVE capability signal the ladder sees, NOT use_layerwise (the bulk
+    # whole-object path still saves when use_layerwise=false — cfgoff is not
+    # save-off). Default: 0 (save enabled).
+    "HOLEMISS_STATE_SAVE_DISABLED": lambda: os.getenv("HOLEMISS_STATE_SAVE_DISABLED", "0") == "1",
     # Master switch for the real disk-EIO injection family. Default: 0 (off).
     "HOLEMISS_DISK_EIO_ENABLED": lambda: os.getenv("HOLEMISS_DISK_EIO_ENABLED", "0") == "1",
     # Synthetic fault-injector layer id. A non-negative digit string enables

@@ -502,6 +502,18 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()
 
+    def get_gdn_state_load_result(self, req_id: str):
+        """The request's GDN state-ladder result (G14's dynamic boundary).
+
+        Called by the vllm-side HR mixin (hasattr-gated) when arming a hybrid
+        repair: the rollback boundary is the boundary whose state ACTUALLY
+        loaded, not the dense floor assumption, when the ladder degraded.
+        """
+        worker = getattr(self, "connector_worker", None)
+        if worker is None or not hasattr(worker, "get_gdn_state_load_result"):
+            return None
+        return worker.get_gdn_state_load_result(req_id)
+
     def get_hole_recovery_regions(self) -> list:
         """Holemiss HR payload passthrough; the worker store is canonical.
 

@@ -5,7 +5,7 @@ import math
 import os
 import threading
 import time
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import suppress
 from typing import Any
 
@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import gdn_state_ladder
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     get_attention_compute_start_gate,
     reset_attention_compute_start_gate,
@@ -146,6 +147,13 @@ def _hm_kv_load_timing_enabled() -> bool:
     return os.getenv("HOLEMISS_KV_LOAD_TIMING", "0") == "1"
 
 
+def _hm_state_save_enabled() -> bool:
+    # G12 rehearsal lever: the ladder's save-capability signal. Live getenv
+    # (the HOLEMISS family pattern); NOT use_layerwise — the bulk whole-object
+    # path still saves when use_layerwise=false (T13 control (a)).
+    return os.getenv("HOLEMISS_STATE_SAVE_DISABLED", "0") != "1"
+
+
 def _hm_env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
@@ -169,9 +177,7 @@ def _holemiss_device_synchronize() -> None:
         npu.synchronize()
 
 
-def hybrid_group0_fa_physical_layers(
-    kv_cache_config: Any, num_layers: int, base_layers: int
-) -> list[int] | None:
+def hybrid_group0_fa_physical_layers(kv_cache_config: Any, num_layers: int, base_layers: int) -> list[int] | None:
     """Ordered physical layers of kv-cache group 0 - the FA store group.
 
     SINGLE layout-truth derivation for hybrid FA-group enumeration, shared by
@@ -543,6 +549,14 @@ class KVPoolWorker:
         self._hole_recovery_lock = threading.Lock()
         self._holemiss_armed_fault: dict | None = None
         self._holemiss_fa_layer_map: list[int] | None = None
+        # GDN state-load ladder (T14): per-request results (G14's dynamic
+        # rollback boundary), failed load keys (the drain's outcome record),
+        # and the block ids the ladder already dispositioned (rung 2 keeps
+        # them on the invalid-block surface but must not re-raise).
+        self._holemiss_state_load_results: dict[str, Any] = {}
+        self._holemiss_state_markers: dict[str, list[str]] = {}
+        self._holemiss_failed_load_keys: dict[str, set[str]] = {}
+        self._holemiss_state_dispositioned_blocks: set[int] = set()
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -1214,6 +1228,10 @@ class KVPoolWorker:
             self.layer_load_tasks = [[] for _ in range(self.num_layers)]
             reset_attention_compute_start_gate()
             self._attention_saved_layers = set()
+            # Block ids are recycled across requests: a disposition must not
+            # outlive the step whose failed loads it dispositioned, or a
+            # recycled id could silently mask a future FA failure's raise.
+            getattr(self, "_holemiss_state_dispositioned_blocks", set()).clear()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         holemiss_load_requests = [
             request for request in metadata.requests if request.load_spec is not None and request.load_spec.can_load
@@ -2353,10 +2371,15 @@ class KVPoolWorker:
             request_load_keys.setdefault(request_identity, [])
             request_seen_keys.setdefault(request_identity, set())
             if results_by_key[key] == 0:
+                # A retry that succeeds must leave the failed-key record: the
+                # session tracker retains failed keys for re-attempt, and a
+                # stale entry would demote a boundary whose retry loaded.
+                self._holemiss_failed_load_keys.get(request.req_id, set()).discard(key)
                 if key not in request_seen_keys[request_identity]:
                     request_load_keys[request_identity].append(key)
                     request_seen_keys[request_identity].add(key)
                 continue
+            self._holemiss_record_failed_load_keys(request.req_id, [key])
             self._record_layerwise_invalid_blocks([block_id])
             if slot is None:
                 request.load_last_block_key = None
@@ -2546,7 +2569,8 @@ class KVPoolWorker:
         # A hybrid block ID can belong to SWA, compressed KV or compressor
         # state. Do not feed partially restored state to the attention kernel.
         with self._invalid_block_ids_lock:
-            if self._invalid_block_ids:
+            undispositioned = self._invalid_block_ids - self._holemiss_state_dispositioned_blocks
+            if undispositioned:
                 self._layer_load_aborted.set()
                 raise RuntimeError("Hybrid layerwise load failed; refusing incomplete KV/state")
 
@@ -2745,10 +2769,7 @@ class KVPoolWorker:
 
     @staticmethod
     def _holemiss_fault_env_active() -> bool:
-        return (
-            os.getenv("HOLEMISS_DISK_EIO_ENABLED", "0") == "1"
-            or os.getenv("HOLEMISS_FAIL_LAYER", "-1").isdigit()
-        )
+        return os.getenv("HOLEMISS_DISK_EIO_ENABLED", "0") == "1" or os.getenv("HOLEMISS_FAIL_LAYER", "-1").isdigit()
 
     def _holemiss_emit_state_readback(self, reason: str) -> None:
         if not (_hm_is_evidence() or _hm_diag_enabled()):
@@ -3134,6 +3155,7 @@ class KVPoolWorker:
         self.next_layer_to_submit = self.num_layers
         _holemiss_device_synchronize()
         for request in load_requests:
+            self._holemiss_run_gdn_state_ladder(request)
             self._holemiss_emit_load_duration(request.req_id, self.num_layers, holemiss_t0)
             if _hm_is_evidence():
                 logger.info("HOLEMISS_ALL_LAYER_GETS_COMPLETE tp=%d req=%s", self.tp_rank, request.req_id)
@@ -3149,16 +3171,165 @@ class KVPoolWorker:
             (time.perf_counter() - t0) * 1000.0,
         )
 
+    def _holemiss_state_groups(self) -> tuple[int, ...]:
+        """Group ids whose cache spec is MambaSpec (the GDN state groups)."""
+        if not self.use_hybrid or self.kv_cache_config is None:
+            return ()
+        state_groups = []
+        for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
+            spec = group_spec.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = next(iter(spec.kv_cache_specs.values()))
+            if isinstance(spec, MambaSpec):
+                state_groups.append(group_id)
+        return tuple(state_groups)
+
+    def _holemiss_build_state_ladder_plan(self, request: ReqMeta) -> Any:
+        """Build the GDN state ladder plan for one load-bearing request.
+
+        Returns None for text/single-group layouts (structural inertness) and
+        for requests with no state loads (no load spec / no boundary blocks).
+        """
+        state_groups = self._holemiss_state_groups()
+        if not state_groups:
+            return None
+        load_spec = request.load_spec
+        if load_spec is None or not load_spec.can_load:
+            return None
+        cached_tokens = load_spec.kvpool_cached_tokens
+        if not self.use_eagle and load_spec.kvpool_store_skip_tokens is not None:
+            cached_tokens = load_spec.kvpool_store_skip_tokens
+        boundaries = []
+        for group_id in state_groups:
+            block_size = get_group_block_size(self.grouped_block_size, group_id)
+            group_block_hashes = get_block_hashes(request.block_hashes, block_size, self.hash_block_size)
+            group_blocks = request.block_ids_by_group[group_id]
+            num_blocks = min(cached_tokens // block_size, len(group_block_hashes), len(group_blocks))
+            first_layer = min(
+                (
+                    self._global_to_local_layer.get(
+                        self._extract_physical_layer_index(layer_name), self._extract_physical_layer_index(layer_name)
+                    )
+                    for layer_name in self.kv_cache_config.kv_cache_groups[group_id].layer_names
+                ),
+                default=0,
+            )
+            for block_index in range(num_blocks):
+                key = self._make_layerwise_full_key(group_id, block_hash_to_str(group_block_hashes[block_index]))
+                while len(boundaries) <= block_index:
+                    placeholder_index = len(boundaries)
+                    boundaries.append(
+                        gdn_state_ladder.StateBoundary(
+                            block_index=placeholder_index,
+                            boundary_tokens=(placeholder_index + 1) * block_size,
+                            keys_by_group={},
+                            blocks_by_group={},
+                            first_layer_by_group={},
+                        )
+                    )
+                boundary = boundaries[block_index]
+                boundary.keys_by_group.setdefault(group_id, []).append(key)
+                boundary.blocks_by_group.setdefault(group_id, []).append(group_blocks[block_index])
+                boundary.first_layer_by_group.setdefault(group_id, first_layer)
+        if not boundaries:
+            return None
+        frozen_boundaries = tuple(
+            gdn_state_ladder.StateBoundary(
+                block_index=boundary.block_index,
+                boundary_tokens=boundary.boundary_tokens,
+                keys_by_group={group: tuple(keys) for group, keys in boundary.keys_by_group.items()},
+                blocks_by_group={group: tuple(blocks) for group, blocks in boundary.blocks_by_group.items()},
+                first_layer_by_group=dict(boundary.first_layer_by_group),
+            )
+            for boundary in boundaries
+        )
+        return gdn_state_ladder.build_state_load_plan(
+            req_id=request.req_id,
+            state_groups=state_groups,
+            boundaries=frozen_boundaries,
+            fa_hit_tokens=cached_tokens,
+            save_enabled=_hm_state_save_enabled(),
+        )
+
+    def _holemiss_record_failed_load_keys(self, req_id: str, keys: Iterable[str]) -> None:
+        """Record per-request keys whose layerwise load session failed."""
+        if not keys:
+            return
+        self._holemiss_failed_load_keys.setdefault(req_id, set()).update(keys)
+
+    def _holemiss_run_gdn_state_ladder(self, request: ReqMeta) -> Any:
+        """Run the state ladder post-drain for one request; record the result.
+
+        The drain already attempted every boundary's state objects through the
+        group-block channel; the ladder walks those outcomes newest boundary
+        first, demoting LOUDLY on failures. Rung 2 keeps its blocks on the
+        invalid-block surface (whole-request recompute) but marks them
+        dispositioned so the hybrid load-error check does not re-raise.
+        """
+        plan = self._holemiss_build_state_ladder_plan(request)
+        if plan is None:
+            return None
+        failed_keys = self._holemiss_failed_load_keys.get(request.req_id, set())
+        object_bytes = sum(sum(self.group_block_len.get(group_id, [])) for group_id in plan.state_groups)
+
+        def attempt_boundary(boundary: Any) -> gdn_state_ladder.BoundaryOutcome:
+            keys = [key for group in plan.state_groups for key in boundary.keys_by_group.get(group, ())]
+            if not keys:
+                return gdn_state_ladder.BoundaryOutcome(attempted=False, loaded=False)
+            failed = [key for key in keys if key in failed_keys]
+            if failed:
+                failed_blocks = tuple(
+                    block_id for group in plan.state_groups for block_id in boundary.blocks_by_group.get(group, ())
+                )
+                return gdn_state_ladder.BoundaryOutcome(attempted=True, loaded=False, failed_block_ids=failed_blocks)
+            return gdn_state_ladder.BoundaryOutcome(
+                attempted=True, loaded=True, payload_bytes=object_bytes, content_sha=None
+            )
+
+        def emit(line: str) -> None:
+            self._holemiss_state_markers.setdefault(request.req_id, []).append(line)
+            if _hm_is_evidence() or _hm_diag_enabled():
+                logger.info("%s", line)
+
+        result = gdn_state_ladder.run_gdn_state_load_ladder(plan, attempt_boundary, emit)
+        self._holemiss_state_load_results[request.req_id] = result
+        if result.failed_block_ids:
+            # Any rung: the failed blocks are dispositioned off the hybrid
+            # load-error raise — on a LOADED rung the recompute span
+            # [loaded, fa_hit) regenerates the demoted boundary's state, and
+            # on rung 2 the whole-request recompute does; the ids also stay
+            # on the invalid-block surface so the scheduler still sees the
+            # load error. FA-group failures never enter this set (the ladder
+            # only dispositions its own state groups) and keep the raise.
+            with self._invalid_block_ids_lock:
+                self._invalid_block_ids.update(result.failed_block_ids)
+            self._holemiss_state_dispositioned_blocks.update(result.failed_block_ids)
+        return result
+
+    def get_gdn_state_load_result(self, req_id: str) -> Any:
+        """The request's state-ladder result (G14's dynamic boundary input)."""
+        return self._holemiss_state_load_results.get(req_id)
+
     def _holemiss_teardown_finished(self, finished_req_ids: set[str]) -> None:
         """B12b: purge HR regions for EVERY finished/failed request.
 
         A request failed by the scheduler never re-enters configure_fault, and
         the mixin clears only when the hook armed this step, so without this
         purge a late region would re-arm the mixin against a req_id no longer
-        in the batch.
+        in the batch. The state-ladder per-request records purge here too:
+        the G14 result was consumed at this step's arming, and stale failed
+        keys must not outlive their request.
         """
         for req_id in finished_req_ids:
             self._holemiss_purge_regions(req_id)
+            # The state-ladder records are set in __init__; __new__-stub tests
+            # bypass it, so tolerate their absence (the file's getattr law).
+            for record_name in (
+                "_holemiss_state_load_results",
+                "_holemiss_state_markers",
+                "_holemiss_failed_load_keys",
+            ):
+                getattr(self, record_name, {}).pop(req_id, None)
         armed = self._holemiss_armed_fault
         if armed is None or armed.get("request_id") not in finished_req_ids:
             return
