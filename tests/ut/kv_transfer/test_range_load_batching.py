@@ -13,9 +13,10 @@ single-delivery semantics.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    LOAD_LEASE_RETRY_MAX_ATTEMPTS,
     KVCacheStoreLayerRecvingThread,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -23,6 +24,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LayerLoadTask,
     LayerRangeReqMeta,
 )
+
+KV_TIME_SLEEP = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.sleep"
 
 NUM_LAYERS = 4
 NUM_KEYS = 3
@@ -389,3 +392,123 @@ class TestMemoryTierUnchanged(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLoadLeaseRetry(unittest.TestCase):
+    """B27: the bounded OBJECT_HAS_LEASE (-706) retry in the batched handler."""
+
+    def _task(self):
+        metas = _per_layer_metas()
+        return _batched_task(metas)
+
+    def _flaky_thread(self, build_map, lease_failures: dict):
+        """A stub thread whose store fails specific keys with -706 for the
+        first N calls (the transient restore-lease straddle), then succeeds."""
+        thread = _stub_recv_thread(build_map)
+        calls: list[tuple] = []
+
+        def store_call(keys, buffers, sizes, offsets):
+            calls.append(tuple(keys))
+            results = []
+            for key, sizes_k in zip(keys, sizes):
+                remaining = lease_failures.get(key, 0)
+                if remaining > 0:
+                    lease_failures[key] = remaining - 1
+                    results.append(-706)
+                else:
+                    results.append(sum(sizes_k) if sizes_k else 0)
+            return results
+
+        thread.m_store.batch_copy_get.side_effect = store_call
+        thread._store_calls = calls
+        return thread
+
+    def test_transient_lease_straddle_retries_green(self):
+        """UT-1: a -706 on the first call for one key -> the retry re-issues
+        the failed rows only -> the load completes, no invalidation, the
+        fence fires."""
+        task, build_map = self._task()
+        thread = self._flaky_thread(build_map, {"m@h1@0": 1})
+        with patch(KV_TIME_SLEEP):
+            thread._handle_batched_range_layer_task(task)
+        self.assertEqual(len(thread._store_calls), 2, "the first call + one retry")
+        self.assertEqual(thread._store_calls[1], ("m@h1@0",), "the retry carries the failed rows only")
+        self.assertEqual(thread._invalid_block_ids, set(), "the transient class never invalidates")
+        for event in thread.layer_load_finished_events:
+            self.assertTrue(event.is_set())
+
+    def test_permanent_lease_straddle_exhausts_loud(self):
+        """UT-2: a permanent -706 -> the bound exhausted -> the EXISTING loud
+        failure mapping (the invalid block), 1 + MAX calls total."""
+        task, build_map = self._task()
+        thread = self._flaky_thread(build_map, {"m@h1@0": 99})
+        with patch(KV_TIME_SLEEP):
+            thread._handle_batched_range_layer_task(task)
+        self.assertEqual(len(thread._store_calls), 1 + LOAD_LEASE_RETRY_MAX_ATTEMPTS)
+        self.assertEqual(thread._invalid_block_ids, {101}, "the exhausted key maps to its block")
+        for event in thread.layer_load_finished_events:
+            self.assertTrue(event.is_set(), "the fences fire even on exhaustion")
+
+    def test_eio_negative_is_never_retried(self):
+        """UT-3 (the D5 pin): the -1102 EIO-injected fault class is NEVER
+        retried — one call, the failure mapping immediate."""
+        task, build_map = self._task()
+        thread = _stub_recv_thread(build_map)
+        thread.m_store.batch_copy_get.side_effect = lambda keys, buffers, sizes, offsets: [
+            -1102 if key == "m@h1@0" else sum(sizes_k) for key, sizes_k in zip(keys, sizes)
+        ]
+        with patch(KV_TIME_SLEEP) as slept:
+            thread._handle_batched_range_layer_task(task)
+        self.assertEqual(thread.m_store.batch_copy_get.call_count, 1, "the EIO class is fail-fast")
+        slept.assert_not_called()
+        self.assertEqual(thread._invalid_block_ids, {101})
+
+    def test_session_lease_negative_is_never_retried(self):
+        """UT-4: the -707 session-lease class (B26's mechanism) stays
+        fail-fast — the retry is the -706 restore-lease class ONLY."""
+        task, build_map = self._task()
+        thread = _stub_recv_thread(build_map)
+        thread.m_store.batch_copy_get.side_effect = lambda keys, buffers, sizes, offsets: [
+            -707 if key == "m@h2@0" else sum(sizes_k) for key, sizes_k in zip(keys, sizes)
+        ]
+        with patch(KV_TIME_SLEEP) as slept:
+            thread._handle_batched_range_layer_task(task)
+        self.assertEqual(thread.m_store.batch_copy_get.call_count, 1)
+        slept.assert_not_called()
+        self.assertEqual(thread._invalid_block_ids, {102})
+
+    def test_armed_target_excluded_from_the_retry(self):
+        """The armed key's result stands as-is (its own delivery contract);
+        a -706 on a HEALTHY key retries while the armed key's -1102 does
+        not ride the plain re-issue."""
+        task, build_map = self._task()
+        thread = _stub_recv_thread(build_map)
+        worker = SimpleNamespace(
+            _holemiss_armed_fault={"key": "m@h2@0", "layer_id": 1},
+            use_hybrid=False,
+        )
+        worker.holemiss_range_target_position = lambda keys, layer: keys.index("m@h2@0") if "m@h2@0" in keys else None
+
+        def execute_target(keys, buffers, sizes, offsets, target_pos):
+            # The isolated executor: the armed key gets the injected fault;
+            # one healthy key straddled the restore lease.
+            return [-706 if i == 0 else (-1102 if i == target_pos else sum(sizes[i])) for i in range(len(keys))]
+
+        worker.execute_holemiss_range_target = execute_target
+        thread.worker = worker
+        store_calls: list[tuple] = []
+
+        def store_call(keys, buffers, sizes, offsets):
+            store_calls.append(tuple(keys))
+            return [sum(sizes_k) for sizes_k in sizes]
+
+        thread.m_store.batch_copy_get.side_effect = store_call
+        with patch(KV_TIME_SLEEP):
+            thread._handle_batched_range_layer_task(task)
+        # The healthy -706 retried via exactly one plain call carrying ONLY
+        # that key — the armed key never appears in a plain call.
+        self.assertEqual(len(store_calls), 1)
+        self.assertNotIn("m@h2@0", store_calls[0])
+        self.assertEqual(store_calls[0], ("m@h0@0",))
+        # The armed key's injected fault stands in the final mapping.
+        self.assertEqual(thread._invalid_block_ids, {102})

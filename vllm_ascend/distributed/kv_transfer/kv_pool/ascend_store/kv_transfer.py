@@ -55,6 +55,20 @@ _KVPOOL_RANGE_DEBUG_PREFIX = "[KVPOOL_RANGE_DEBUG]"
 RANGE_WRITE_MAX_RETRIES = 3
 RANGE_WRITE_RETRY_BACKOFF_MS = 100
 
+# Bounded retry for the LOAD-side restore-lease straddle (B27): the owner
+# side stages each key's object per CALL under a client_buffer_gc_ttl_ms
+# window (default 5000, no env surface) measured from the restore RPC's
+# return; a disk-contended whole-object restore can outlast it and the tail
+# objects return OBJECT_HAS_LEASE (-706, real_client.cpp:540-542/:7494-7501).
+# The staging batch is RAII-released when the call returns, so a fresh call
+# re-stages with a fresh window — an immediate re-issue is structurally
+# safe; the escalating backoff settles the /data contention. ONLY the -706
+# class is retried: the -707 session lease (B26) and the -1102 EIO-injected
+# fault (D5) stay FAIL-FAST.
+LOAD_LEASE_RETRY_ERROR = -706
+LOAD_LEASE_RETRY_MAX_ATTEMPTS = 3
+LOAD_LEASE_RETRY_BACKOFF_MS = 200
+
 
 def _build_range_debug_payload(
     direction: str,
@@ -2235,6 +2249,57 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                             self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
                         )
                     )
+            # B27: retry the restore-lease straddle rows (-706 ONLY). The
+            # armed key (the isolated target) is excluded by construction —
+            # its result is the injected fault and the plain re-issue must
+            # never trigger the all-or-nothing EIO wholesale failure. Every
+            # other negative stays FAIL-FAST (the -707 session lease and
+            # the -1102 EIO contract).
+            lease_straddled = [
+                index
+                for index, result in enumerate(results)
+                if result == LOAD_LEASE_RETRY_ERROR and index != target_position
+            ]
+            for attempt in range(1, LOAD_LEASE_RETRY_MAX_ATTEMPTS + 1):
+                if not lease_straddled:
+                    break
+                backoff_ms = LOAD_LEASE_RETRY_BACKOFF_MS * 2 ** (attempt - 1)
+                # The staging batch is RAII-released when the failed call
+                # returned, so the fresh call re-stages with a fresh
+                # gc_ttl window; the backoff settles the disk contention.
+                time.sleep(backoff_ms / 1000)
+                retry_keys = [active_keys[index] for index in lease_straddled]
+                retry_buffers = [active_buffers[index] for index in lease_straddled]
+                retry_sizes = [active_sizes[index] for index in lease_straddled]
+                retry_offsets = [active_offsets[index] for index in lease_straddled]
+                retry_results: list[int] = []
+                for keys, buffers, sizes, offsets in self._range_transfer_batches(
+                    retry_keys,
+                    retry_buffers,
+                    retry_sizes,
+                    retry_offsets,
+                    self.max_transfer_blocks,
+                    self.max_transfer_bytes,
+                ):
+                    retry_results.extend(
+                        require_aligned_batch_results(
+                            "batch_copy_get",
+                            keys,
+                            self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
+                        )
+                    )
+                _emit_range_retry_debug_event(
+                    "load", layer_ids[0], attempt, retry_sizes, retry_offsets, retry_results, backoff_ms
+                )
+                for index, result in zip(lease_straddled, retry_results, strict=True):
+                    results[index] = result
+                lease_straddled = [index for index in lease_straddled if results[index] == LOAD_LEASE_RETRY_ERROR]
+            if lease_straddled:
+                logger.error(
+                    "Batched load lease retry exhausted attempts=%d failed_keys=%d",
+                    LOAD_LEASE_RETRY_MAX_ATTEMPTS,
+                    len(lease_straddled),
+                )
             _emit_range_debug_event("load", layer_ids[0], active_sizes, active_offsets, results)
             failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
             if failed_indices:
