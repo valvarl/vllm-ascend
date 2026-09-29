@@ -92,6 +92,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_tp_mismatch_info,
     is_kv_save_role,
     masked_block_runs,
+    partial_tail_key_suffix,
     uses_hybrid_kv_cache,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
@@ -2254,8 +2255,22 @@ class KVPoolWorker:
             key_slots.append((key, block_index - start_block, block_index))
 
         if request.partial_block_index is not None:
-            request.save_last_block_key = self._make_mooncake_layerwise_key(f"{request.req_id}_lastblock")
-            key_slots.append((request.save_last_block_key, None, request.partial_block_index))
+            if request.finished_tail_boundary is not None:
+                # The finish-time tail persists under the cross-request
+                # boundary sub-hash key (T18); the req-id last-block key is
+                # intra-request only (the false-gap trap).
+                tail_hash_index = request.finished_tail_boundary // self.hash_block_size - 1
+                if 0 <= tail_hash_index < len(request.block_hashes):
+                    request.save_last_block_key = self._make_mooncake_layerwise_key(
+                        partial_tail_key_suffix(
+                            block_hash_to_str(request.block_hashes[tail_hash_index]),
+                            request.finished_tail_boundary,
+                        )
+                    )
+            else:
+                request.save_last_block_key = self._make_mooncake_layerwise_key(f"{request.req_id}_lastblock")
+            if request.save_last_block_key is not None:
+                key_slots.append((request.save_last_block_key, None, request.partial_block_index))
 
         requested_keys = list(dict.fromkeys(key for key, _, _ in key_slots))
         if not requested_keys:
@@ -2318,12 +2333,20 @@ class KVPoolWorker:
             )
             partial_block_index = cached_full_blocks if cached_tokens % self.block_size else cached_full_blocks - 1
             if needs_last_block and 0 <= partial_block_index < len(request.block_ids):
-                current_entries.append(
-                    (
-                        self._make_mooncake_layerwise_key(f"{request.req_id}_lastblock"),
-                        partial_block_index,
-                    )
-                )
+                last_block_key = self._make_mooncake_layerwise_key(f"{request.req_id}_lastblock")
+                tail_boundary = getattr(load_spec, "tail_boundary_tokens", None)
+                if tail_boundary is not None and partial_block_index == tail_boundary // self.block_size:
+                    # The exact-end hit (T18): the persisted tail loads under
+                    # the cross-request boundary sub-hash key.
+                    tail_hash_index = tail_boundary // self.hash_block_size - 1
+                    if 0 <= tail_hash_index < len(request.block_hashes):
+                        last_block_key = self._make_mooncake_layerwise_key(
+                            partial_tail_key_suffix(
+                                block_hash_to_str(request.block_hashes[tail_hash_index]),
+                                tail_boundary,
+                            )
+                        )
+                current_entries.append((last_block_key, partial_block_index))
 
         load_entries = self._layerwise_session_tracker.prepare_load_entries(request.req_id, current_entries)
         valid_entries = [

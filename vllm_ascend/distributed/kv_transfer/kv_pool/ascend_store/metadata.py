@@ -735,6 +735,21 @@ def get_partial_block_index(
     return None
 
 
+def partial_tail_key_suffix(boundary_hash_str: str, boundary_tokens: int) -> str:
+    """The finish-time partial-tail key material (T18, cross-request).
+
+    The tail block persists under the boundary sub-hash (the last complete
+    hash block at the boundary) qualified by the boundary position: at
+    hash_block_size == block_size the bare sub-hash would collide with the
+    last full block's own key, and an unqualified hash could not distinguish
+    two tail boundaries over the same prefix. The suffix feeds the SAME key
+    builders the full-block keys use (``_make_mooncake_layerwise_key`` /
+    ``make_hit_check_keys``) — never the req-id ``{req_id}_lastblock`` key
+    (intra-request only, the false-gap trap).
+    """
+    return f"{boundary_hash_str}_tail_{boundary_tokens}"
+
+
 def masked_block_runs(
     mask: Sequence[bool] | None,
     start_block: int,
@@ -813,6 +828,11 @@ class LoadSpec:
     kvpool_store_skip_tokens: int | None = None
 
     token_len: int = 0
+
+    # Token boundary of a persisted partial tail that extended the hit to the
+    # prompt's exact end (T18). The worker substitutes the tail key for the
+    # last partial block's load when set.
+    tail_boundary_tokens: int | None = None
 
 
 @dataclass(init=False)
@@ -987,6 +1007,7 @@ class ReqMeta:
         save_start_token: int = 0,
         last_block_gva: int | None = None,
         partial_block_index: int | None = None,
+        finished_tail_boundary: int | None = None,
         block_ids_np: np.ndarray | None = None,
         block_ids_by_group_np: list[np.ndarray] | None = None,
         block_gvas_np: np.ndarray | None = None,
@@ -1028,6 +1049,7 @@ class ReqMeta:
         self.event_id = event_id
         self.last_block_gva = last_block_gva
         self.partial_block_index = partial_block_index
+        self.finished_tail_boundary = finished_tail_boundary
         self.block_ids_np = block_ids_np
         self.block_ids_by_group_np = block_ids_by_group_np
         self.block_gvas_np = block_gvas_np

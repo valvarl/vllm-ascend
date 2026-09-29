@@ -53,7 +53,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_group_block_sizes,
     infer_group_cache_families,
     infer_tp_mismatch_info,
+    is_kv_save_role,
     normalize_block_ids_by_group,
+    partial_tail_key_suffix,
     uses_hybrid_kv_cache,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
@@ -142,6 +144,7 @@ class KVPoolScheduler:
         self.cache_coordinator = self._build_cache_coordinator()
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
+        self._finished_partial_tail_metas: dict[str, ReqMeta] = {}
         self._preempted_req_ids: set[str] = set()
         # Whether to discard partial chunks
         self._discard_partial_chunks = vllm_config.kv_transfer_config.get_from_extra_config(
@@ -566,6 +569,94 @@ class KVPoolScheduler:
                 num_speculative_blocks_by_group[group_id] = kv_cache_spec.num_speculative_blocks
         return num_speculative_blocks_by_group
 
+    def _probe_partial_tail_hit(self, request: "Request", boundary_tokens: int) -> int | None:
+        """Probe the FA partial-tail key at the prompt's exact end (T18).
+
+        Returns the exact-end boundary on a hit, None otherwise. The key is
+        the boundary sub-hash (the last complete hash block at the boundary)
+        qualified by the boundary position — the same derivation the worker
+        persists under, never the req-id last-block key.
+        """
+        hash_block_size = self.hash_block_size
+        hash_index = boundary_tokens // hash_block_size - 1
+        if hash_index < 0 or hash_index >= len(request.block_hashes):
+            return None
+        block_size = get_group_block_size(self.grouped_block_size, 0)
+        if boundary_tokens % block_size == 0:
+            return None
+        suffix = partial_tail_key_suffix(block_hash_to_str(request.block_hashes[hash_index]), boundary_tokens)
+        keys = self._make_layerwise_hit_check_keys(0, suffix)
+        if not keys:
+            return None
+        hits = self._query_layerwise_block_hits([keys])
+        if hits and all(hits):
+            return boundary_tokens
+        return None
+
+    def register_finished_partial_tail(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
+        """Queue a finish-time partial tail for the next connector step (T18).
+
+        Accepting responsibility returns True: the caller delays the
+        request's block free until the connector reports the save finished,
+        which keeps the CoW'd tail blocks readable while the offload-only
+        ReqMeta (consumed at the next build_connector_meta) persists them
+        under the cross-request boundary sub-hash key.
+        """
+        if self.kv_role == "kv_consumer" or not partial_tail_offloads:
+            return False
+        if not self.use_layerwise or not is_kv_save_role(self.kv_role, self.consumer_is_to_put):
+            return False
+        tracker = self._request_trackers.get(request.request_id)
+        if tracker is None or not any(block_ids):
+            return False
+        boundaries = {boundary for _, _, boundary in partial_tail_offloads}
+        if len(boundaries) != 1:
+            raise ValueError(f"Partial-tail offloads for one request must share a boundary: {sorted(boundaries)}")
+        boundary_tokens = next(iter(boundaries))
+        if boundary_tokens <= 0 or boundary_tokens > tracker.token_len:
+            return False
+        # The offered (align/boundary-state) blocks carry the shared boundary;
+        # the GDN tail state composes with the existing boundary-state channel
+        # (the T14 ladder) — only the FA partial block is a NEW tail artifact,
+        # taken from the caller's FA block table.
+        if any(block_id == 0 for _, block_id, _ in partial_tail_offloads):
+            return False
+        block_size = get_group_block_size(self.grouped_block_size, 0)
+        if boundary_tokens % block_size == 0:
+            return False
+        tail_block_index = boundary_tokens // block_size
+        fa_blocks = block_ids[0] if block_ids and block_ids[0] else []
+        if tail_block_index >= len(fa_blocks):
+            return False
+        if request.request_id in self._finished_partial_tail_metas:
+            return False
+        self._finished_partial_tail_metas[request.request_id] = ReqMeta(
+            req_id=request.request_id,
+            token_len_chunk=0,
+            save_end_token=boundary_tokens,
+            save_start_token=boundary_tokens,
+            target_token_len=boundary_tokens,
+            block_ids_by_group=[list(ids) for ids in block_ids],
+            block_hashes=list(request.block_hashes),
+            can_save=True,
+            is_last_chunk=True,
+            partial_block_index=tail_block_index,
+            finished_tail_boundary=boundary_tokens,
+            num_prompt_tokens=tracker.num_prompt_tokens,
+        )
+        logger.info(
+            "KV pool partial tail accepted req=%s boundary=%d tail_block=%d",
+            request.request_id,
+            boundary_tokens,
+            tail_block_index,
+        )
+        return True
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -623,6 +714,26 @@ class KVPoolScheduler:
         if num_external_hit_tokens == 0:
             return 0, False
 
+        # T18 exact-end tail probe: when the floor truncated a partial tail
+        # and the full-block hit is COMPLETE at the floor (the FA-prefix
+        # anchor — the full-block check already validated every group's full
+        # blocks), probe the FA tail key at the prompt's exact end. The GDN
+        # tail state is the last full boundary's state (already covered by
+        # the full-block hit): nothing is checked at the tail boundary
+        # except this one FA key — never an all-groups-complete-chunks
+        # anchor (the #57216 defect class).
+        tail_boundary_tokens = None
+        if self.use_block_key_layerwise and prompt_token_len > token_len and num_external_hit_tokens == token_len:
+            tail_boundary_tokens = self._probe_partial_tail_hit(request, prompt_token_len)
+            if tail_boundary_tokens is not None:
+                num_external_hit_tokens = tail_boundary_tokens
+                logger.info(
+                    "KV pool partial tail hit req=%s exact_end=%d (floor was %d)",
+                    request.request_id,
+                    tail_boundary_tokens,
+                    token_len,
+                )
+
         store_skip_tokens = num_external_hit_tokens
         if self.use_eagle:
             # Keep the draft model's recomputation zone intact: the
@@ -677,6 +788,7 @@ class KVPoolScheduler:
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=force_layerwise_load,
             kvpool_store_skip_tokens=store_skip_tokens,
+            tail_boundary_tokens=tail_boundary_tokens,
         )
         logger.debug(
             "KV pool load spec created req=%s vllm_cached=%d kvpool_cached=%d "
@@ -1021,6 +1133,17 @@ class KVPoolScheduler:
                 if req_meta is not None:
                     self.touch_sending_mamba_blocks(req_meta)
                     meta.add_request(req_meta)
+
+        # Finish-time partial tails ride the next FORWARD-BEARING connector
+        # step: their requests are finished (the caller delayed their block
+        # free on our acceptance), but the per-layer save submission needs
+        # this step's forward — an idle step's tasks would be dropped by the
+        # next step's fresh-list swap, leaving the put session open forever.
+        if scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs.req_ids:
+            for queued_tail in self._finished_partial_tail_metas.values():
+                self.touch_sending_mamba_blocks(queued_tail)
+                meta.add_request(queued_tail)
+            self._finished_partial_tail_metas.clear()
 
         request_ids = [req.req_id for req in scheduler_output.scheduled_new_reqs]
         for request_id, (request, block_ids) in self._unfinished_requests.items():

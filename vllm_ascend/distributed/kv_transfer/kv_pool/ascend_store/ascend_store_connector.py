@@ -272,6 +272,23 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def register_finished_partial_tail(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
+        """Queue a finish-time partial tail (T18); True delays the block free.
+
+        Accepting the tail keeps the CoW'd blocks readable until the
+        offload-only save finishes (the caller's delay-free contract); the
+        tail persists under the cross-request boundary sub-hash key, never
+        the req-id last-block key.
+        """
+        if self.connector_scheduler is None:
+            return False
+        return self.connector_scheduler.register_finished_partial_tail(request, block_ids, partial_tail_offloads)
+
     def request_finished_all_groups(
         self,
         request: "Request",
