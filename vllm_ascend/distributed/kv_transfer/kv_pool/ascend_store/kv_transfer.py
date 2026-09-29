@@ -31,6 +31,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LayerBatchReqMeta,
     LayerBlockRange,
     LayerLoadTask,
+    LayerBatchedLoadTask,
     LayerRangeReqMeta,
     LayerTransferTask,
     ReqMeta,
@@ -2131,6 +2132,129 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     self.set_finished_request(req_id)
             self._active_load_indices = None
 
+    def _handle_batched_range_layer_task(self, data: LayerBatchedLoadTask) -> None:
+        """One ranged call per key carrying all its layer ranges.
+
+        The ported session read stages each key's object per CALL; issuing
+        one call per layer would re-stage every object num_layers times.
+        Merge every (group, layer) range metadata by key — a key belongs to
+        exactly one group, so per-key segment lists concatenate cleanly —
+        issue ONE batch_copy_get, map failures to the keys' block ids, and
+        fire every layer's finished event.
+        """
+        layer_ids: list[int] = []
+        merged_keys: list[str] = []
+        key_index: dict[str, int] = {}
+        merged_buffers: list[list[int]] = []
+        merged_sizes: list[list[int]] = []
+        merged_offsets: list[list[int]] = []
+        merged_block_ids: list[int] = []
+        final_req_ids: list[str] = []
+        armed_layer_id: int | None = None
+        try:
+            aborted = self._load_abort_event.is_set()
+            worker = self.worker
+            armed = getattr(worker, "_holemiss_armed_fault", None) if worker is not None else None
+            if armed is not None:
+                armed_layer_id = int(armed["layer_id"])
+                if getattr(worker, "use_hybrid", False):
+                    # The arming bound speaks the FA-STORE-LOCAL k (0..15)
+                    # while the gate's hybrid branch compares PHYSICAL layers
+                    # (3+4k) — map through the worker's own single-source
+                    # map (D-T5.5); text stays byte-identical (store-local
+                    # == physical for single-group layouts).
+                    physical_mapper = getattr(worker, "_holemiss_hybrid_physical_layer", None)
+                    if not callable(physical_mapper):
+                        raise RuntimeError(
+                            "Hybrid fault arm on a worker without the FA physical-layer map; "
+                            "refusing to gate the EIO isolation on a store-local layer id."
+                        )
+                    armed_layer_id = physical_mapper(armed_layer_id)
+            for layer_task in data.layer_tasks:
+                layer_id = layer_task.layer_id
+                if layer_task.transfer_tasks:
+                    layer_ids.append(layer_id)
+                for task in layer_task.transfer_tasks:
+                    shared = task.shared_block_data
+                    if shared is None:
+                        raise RuntimeError("Layerwise range load requires shared block metadata")
+                    builder = self.group_builders[task.group_id] if self.group_builders else self.layer_batch_builder
+                    req_meta = builder.build_addrs(shared, task.layer_idx_in_group)
+                    if not isinstance(req_meta, LayerRangeReqMeta):
+                        raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
+                    for index, key in enumerate(req_meta.keys):
+                        slot = key_index.get(key)
+                        if slot is None:
+                            slot = len(merged_keys)
+                            key_index[key] = slot
+                            merged_keys.append(key)
+                            merged_buffers.append([])
+                            merged_sizes.append([])
+                            merged_offsets.append([])
+                            merged_block_ids.append(req_meta.block_ids[index])
+                        merged_buffers[slot].extend(req_meta.all_buffers[index])
+                        merged_sizes[slot].extend(req_meta.all_sizes[index])
+                        merged_offsets[slot].extend(req_meta.all_offsets[index])
+                    if task.final_group_layer:
+                        for req_id, is_last_chunk in zip(req_meta.req_ids, shared.is_last_chunks, strict=True):
+                            if is_last_chunk:
+                                final_req_ids.append(req_id)
+            if not merged_keys or aborted:
+                return
+            self._stagger_h2d_submit(layer_ids[0])
+            active_indices = list(range(len(merged_keys)))
+            active_keys = merged_keys
+            active_buffers = merged_buffers
+            active_sizes = merged_sizes
+            active_offsets = merged_offsets
+            target_position = None
+            if worker is not None and hasattr(worker, "holemiss_range_target_position") and armed is not None:
+                # The merged call spans every layer; the position logic gates
+                # on the ARMED layer so the isolated target read fires
+                # exactly once (the per-layer shape deduplicated via the
+                # active-index skip — the count is unchanged).
+                target_position = worker.holemiss_range_target_position(active_keys, armed_layer_id)
+            if target_position is not None and worker is not None:
+                results = worker.execute_holemiss_range_target(
+                    active_keys, active_buffers, active_sizes, active_offsets, target_position
+                )
+            else:
+                results = []
+                for keys, buffers, sizes, offsets in self._range_transfer_batches(
+                    active_keys,
+                    active_buffers,
+                    active_sizes,
+                    active_offsets,
+                    self.max_transfer_blocks,
+                    self.max_transfer_bytes,
+                ):
+                    results.extend(
+                        require_aligned_batch_results(
+                            "batch_copy_get",
+                            keys,
+                            self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
+                        )
+                    )
+            _emit_range_debug_event("load", layer_ids[0], active_sizes, active_offsets, results)
+            failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
+            if failed_indices:
+                with self._invalid_block_ids_lock:
+                    self._invalid_block_ids.update(merged_block_ids[index] for index in failed_indices)
+            for req_id in final_req_ids:
+                self.set_finished_request(req_id)
+        except Exception as exc:
+            self._fatal_error = exc
+            for layer_task in data.layer_tasks:
+                self._mark_invalid_transfer_task_blocks(layer_task.transfer_tasks)
+            self._load_abort_event.set()
+            raise
+        finally:
+            for layer_id in layer_ids:
+                if not self.layer_load_finished_events[layer_id].is_set():
+                    self.layer_load_finished_events[layer_id].set()
+            self.request_queue.task_done()
+            self.get_event.set()
+
     def _handle_range_layer_task(self, data: LayerLoadTask) -> None:
         layer_id = data.layer_id
         try:
@@ -2190,8 +2314,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             pass
 
     def _handle_request(  # type: ignore[override]
-        self, data: LayerLoadTask
+        self,
+        data: LayerLoadTask | LayerBatchedLoadTask,
     ):
+        if isinstance(data, LayerBatchedLoadTask):
+            self._handle_batched_range_layer_task(data)
+            return
         if data.transfer_tasks and data.transfer_tasks[0].use_key_major_ranges:
             self._handle_range_layer_task(data)
             return

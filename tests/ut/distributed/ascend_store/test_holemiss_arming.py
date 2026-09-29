@@ -36,7 +36,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_l
     make_block_key,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
-    LayerLoadTask,
+    LayerBatchedLoadTask,
     LoadSpec,
     ReqMeta,
 )
@@ -371,11 +371,15 @@ class TestSyncDrain(HolemissTestBase):
 
         worker._holemiss_sync_layerwise_drain([_make_request()])
 
-        self.assertEqual(worker.kv_recv_thread.add_request.call_count, 2)
-        submitted = [call.args[0] for call in worker.kv_recv_thread.add_request.call_args_list]
-        self.assertTrue(all(isinstance(task, LayerLoadTask) for task in submitted))
-        self.assertEqual([task.layer_id for task in submitted], [0, 2])
-        self.assertTrue(all(task.attention_start_gate is None for task in submitted))
+        # The drain batches every layer's tasks into ONE queue entry: the
+        # ported session read stages each key's object per CALL, so one
+        # merged ranged call per key replaces the per-layer calls.
+        self.assertEqual(worker.kv_recv_thread.add_request.call_count, 1)
+        submitted = worker.kv_recv_thread.add_request.call_args_list[0].args[0]
+        self.assertIsInstance(submitted, LayerBatchedLoadTask)
+        self.assertEqual([task.layer_id for task in submitted.layer_tasks], [0, 2])
+        self.assertTrue(all(task.attention_start_gate is None for task in submitted.layer_tasks))
+        self.assertTrue(all(task.wait_for_save_layer is None for task in submitted.layer_tasks))
         self.assertEqual(worker.layer_load_tasks, [[] for _ in range(NUM_LAYERS)])
         self.assertEqual(worker.next_layer_to_submit, NUM_LAYERS)
 

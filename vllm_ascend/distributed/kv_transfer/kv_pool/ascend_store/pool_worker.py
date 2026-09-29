@@ -74,6 +74,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendStoreKVConnectorWorkerMetadata,
     ChunkedTokenDatabase,
     KeyMetadata,
+    LayerBatchedLoadTask,
     LayerBlockRange,
     LayerLoadTask,
     LayerMultiBlockReqMeta,
@@ -3157,22 +3158,29 @@ class KVPoolWorker:
         if recv_thread is None:
             return
         holemiss_t0 = time.perf_counter()
-        for layer_id in range(self.num_layers):
-            tasks = self.layer_load_tasks[layer_id]
-            if not tasks:
-                continue
-            recv_thread.add_request(  # type: ignore[union-attr]
-                LayerLoadTask(
-                    wait_for_save_layer=None,
-                    transfer_tasks=tasks,
-                    layer_id=layer_id,
-                    attention_start_gate=None,
-                )
+        layer_tasks = [
+            LayerLoadTask(
+                wait_for_save_layer=None,
+                transfer_tasks=self.layer_load_tasks[layer_id],
+                layer_id=layer_id,
+                attention_start_gate=None,
             )
-            event = self.layer_load_finished_events[layer_id]
+            for layer_id in range(self.num_layers)
+            if self.layer_load_tasks[layer_id]
+        ]
+        if layer_tasks:
+            # One ranged call per key carrying all its layer ranges: the
+            # ported session read stages each key's object per CALL, so
+            # per-layer calls would re-stage every object num_layers times
+            # (the measured 6-13s/rank band). The batched task fires every
+            # layer's finished event on completion; the wait loop below
+            # tolerates the all-at-once setting.
+            recv_thread.add_request(LayerBatchedLoadTask(layer_tasks=layer_tasks))  # type: ignore[union-attr]
+        for layer_task in layer_tasks:
+            event = self.layer_load_finished_events[layer_task.layer_id]
             while not event.wait(timeout=10):
                 recv_thread.raise_if_failed()  # type: ignore[union-attr]
-                logger.info("Layerwise %d load not done, keep waiting", layer_id)
+                logger.info("Layerwise %d load not done, keep waiting", layer_task.layer_id)
             event.clear()
         self.layer_load_tasks = [[] for _ in range(self.num_layers)]
         self.next_layer_to_submit = self.num_layers

@@ -1308,6 +1308,22 @@ class LayerLoadTask:
     attention_start_gate: AttentionComputeStartGate | None = None
 
 
+@dataclass
+class LayerBatchedLoadTask:
+    """Every layer's load tasks of one drain step in ONE queue entry.
+
+    The block-key ranged reads are issued as ONE call per key carrying all
+    its layer ranges: the ported session read stages each key's object per
+    CALL (no session-level pin), so per-layer calls would re-stage every
+    object 64x. The receiving thread merges the per-(group, layer) range
+    metadata by key and fires every layer's finished event on completion.
+    Only the sync drain submits this shape; the native per-layer pipeline
+    (which overlaps loads with the forward) is untouched.
+    """
+
+    layer_tasks: list[LayerLoadTask]
+
+
 @dataclass(init=False)
 class LayerMultiBlockReqMeta:
     req_id: str
