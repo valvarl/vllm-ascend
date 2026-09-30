@@ -1064,7 +1064,13 @@ def _validate_kv_load_failure_policy(vllm_config: VllmConfig) -> None:
         return
     if getattr(kv_transfer_config, "kv_load_failure_policy", "fail") == "recompute":
         if getattr(vllm_config.model_config, "is_hybrid", False):
-            raise AssertionError("Hybrid models do not support recompute mode kv load failure policy now.")
+            if os.getenv("HOLEMISS_ALLOW_HYBRID_RECOMPUTE_POLICY", "0") != "1":
+                raise AssertionError(
+                    "Hybrid models do not support recompute mode kv load failure policy now. "
+                    "Set HOLEMISS_ALLOW_HYBRID_RECOMPUTE_POLICY=1 to opt in: the fork's "
+                    "state-load ladder (T14) supports the rung-2 zero-recompute path for "
+                    "hybrid models by design."
+                )
 
 
 def _update_compilation_modes(vllm_config: VllmConfig, ascend_config: AscendConfig) -> None:

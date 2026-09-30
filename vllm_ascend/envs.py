@@ -113,6 +113,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # whole-object path still saves when use_layerwise=false — cfgoff is not
     # save-off). Default: 0 (save enabled).
     "HOLEMISS_STATE_SAVE_DISABLED": lambda: os.getenv("HOLEMISS_STATE_SAVE_DISABLED", "0") == "1",
+    # B32: opt-in bypass of the hybrid+recompute kv-load-failure-policy gate
+    # (platform.py _validate_kv_load_failure_policy). Default 0 = the gate
+    # INTACT (the upstream behavior). The fork's T14 state-load ladder
+    # supports the rung-2 zero-recompute path for hybrid models by design;
+    # the T15 (d) missing-state rehearsal arm opts in. Values "0"/"1".
+    "HOLEMISS_ALLOW_HYBRID_RECOMPUTE_POLICY": lambda: os.getenv("HOLEMISS_ALLOW_HYBRID_RECOMPUTE_POLICY", "0") == "1",
     # Master switch for the real disk-EIO injection family. Default: 0 (off).
     "HOLEMISS_DISK_EIO_ENABLED": lambda: os.getenv("HOLEMISS_DISK_EIO_ENABLED", "0") == "1",
     # Synthetic fault-injector layer id. A non-negative digit string enables

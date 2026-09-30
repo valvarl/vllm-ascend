@@ -1,4 +1,5 @@
 import importlib
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1535,6 +1536,63 @@ class TestNPUPlatform(TestBase):
             from vllm_ascend import platform
 
             platform._validate_kv_load_failure_policy(vllm_config)
+
+    def test_hybrid_recompute_gate_default_is_byte_identical_upstream(self):
+        """B32 UT-1: without the opt-in env the gate raises EXACTLY as the
+        upstream behavior (the default path unchanged)."""
+        from vllm_ascend import platform
+
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.kv_transfer_config = MagicMock(kv_load_failure_policy="recompute")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HOLEMISS_ALLOW_HYBRID_RECOMPUTE_POLICY", None)
+            with pytest.raises(
+                AssertionError,
+                match="Hybrid models do not support recompute mode kv load failure policy",
+            ):
+                platform._validate_kv_load_failure_policy(vllm_config)
+
+    def test_hybrid_recompute_gate_bypass_via_env(self):
+        """B32 UT-2: the opt-in env permits the hybrid+recompute combination
+        (the T14 ladder's rung-2 zero-recompute path)."""
+        from vllm_ascend import platform
+
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.kv_transfer_config = MagicMock(kv_load_failure_policy="recompute")
+        with patch.dict(os.environ, {"HOLEMISS_ALLOW_HYBRID_RECOMPUTE_POLICY": "1"}):
+            platform._validate_kv_load_failure_policy(vllm_config)
+
+    def test_text_models_unaffected_by_the_gate_either_way(self):
+        """B32 UT-3: non-hybrid models pass regardless of the env (the gate
+        is hybrid-specific)."""
+        from vllm_ascend import platform
+
+        for env_value in ("0", "1", None):
+            with self.subTest(env=env_value):
+                vllm_config = TestNPUPlatform.mock_vllm_config()
+                vllm_config.model_config.is_hybrid = False
+                vllm_config.kv_transfer_config = MagicMock(kv_load_failure_policy="recompute")
+                env = {} if env_value is None else {"HOLEMISS_ALLOW_HYBRID_RECOMPUTE_POLICY": env_value}
+                with patch.dict(os.environ, env, clear=False):
+                    if env_value is None:
+                        os.environ.pop("HOLEMISS_ALLOW_HYBRID_RECOMPUTE_POLICY", None)
+                    platform._validate_kv_load_failure_policy(vllm_config)
+
+    def test_policy_fail_and_other_values_unaffected(self):
+        """B32 UT-4: the default policy (and any non-recompute value) passes
+        for hybrid models without the env."""
+        from vllm_ascend import platform
+
+        for policy in ("fail", "raise", "other"):
+            with self.subTest(policy=policy):
+                vllm_config = TestNPUPlatform.mock_vllm_config()
+                vllm_config.model_config.is_hybrid = True
+                vllm_config.kv_transfer_config = MagicMock(kv_load_failure_policy=policy)
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("HOLEMISS_ALLOW_HYBRID_RECOMPUTE_POLICY", None)
+                    platform._validate_kv_load_failure_policy(vllm_config)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch(
