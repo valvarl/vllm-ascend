@@ -512,3 +512,34 @@ class TestLoadLeaseRetry(unittest.TestCase):
         self.assertEqual(store_calls[0], ("m@h0@0",))
         # The armed key's injected fault stands in the final mapping.
         self.assertEqual(thread._invalid_block_ids, {102})
+
+
+class TestLoadLeaseRetryLiteralPins(unittest.TestCase):
+    """F-1 follow-up: the B27 retry bounds are contract values, pinned
+    LITERALLY (D-B20.10) so a bound-widening edit trips a UT instead of
+    shipping silently (the verifier's M3b probe proved 4..99 currently
+    pass UT-undetected)."""
+
+    def test_max_attempts_is_the_contract_value(self):
+        self.assertEqual(LOAD_LEASE_RETRY_MAX_ATTEMPTS, 3)
+
+    def test_backoff_base_is_the_contract_value(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import kv_transfer
+
+        self.assertEqual(kv_transfer.LOAD_LEASE_RETRY_BACKOFF_MS, 200)
+
+    def test_retry_error_is_object_has_lease_only(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import kv_transfer
+
+        self.assertEqual(kv_transfer.LOAD_LEASE_RETRY_ERROR, -706)
+
+    def test_total_backoff_is_bounded_well_inside_watchdogs(self):
+        """The escalating schedule 200/400/800ms sums to 1.4s — the derived
+        bound (b27_retry_semantics.md); a widening breaks this pin."""
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import kv_transfer
+
+        total_ms = sum(
+            kv_transfer.LOAD_LEASE_RETRY_BACKOFF_MS * 2**attempt
+            for attempt in range(kv_transfer.LOAD_LEASE_RETRY_MAX_ATTEMPTS)
+        )
+        self.assertEqual(total_ms, 1400)
