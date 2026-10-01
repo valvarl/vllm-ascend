@@ -51,9 +51,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tr
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
-    LOAD_LEASE_RETRY_BACKOFF_MS,
     LOAD_LEASE_RETRY_ERROR,
-    LOAD_LEASE_RETRY_MAX_ATTEMPTS,
     RANGE_WRITE_MAX_RETRIES,
     RANGE_WRITE_RETRY_BACKOFF_MS,
     KVCacheStoreBatch,
@@ -128,6 +126,21 @@ SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
 # every read is a live os.getenv (P0.2: Python and C++ must never diverge).
 HOLEMISS_SYNTHETIC_FAULT_RC = -800  # simulated rc; real disk-EIO surfaces -800/-1102
 HOLEMISS_EIO_TARGET_ENV = "EIO_TARGET_KEY"  # empty/unset == injector off
+
+# B37: the write-back remove waits out the Mooncake MASTER-side read lease.
+# The consumer's own query sites (ExistKey / GetReplicaList via
+# GrantLeaseForGroup, master_service.cpp) grant a per-group read lease at
+# query time; the TTL is default_kv_lease_ttl=60000 (B28) and there is NO
+# release RPC at 0.3.13 (GrantReadLease only extends via
+# ``lease_timeout = max(lease_timeout, now + ttl)``, refreshed only past the
+# 30s half-life per NeedsReadLeaseRefresh), so a lease ~15-45s old at the
+# teardown refuses RemoveObject (IsLeaseExpired) with OBJECT_HAS_LEASE
+# (-706) until it ages out. The budget carries >= 2x the lease TTL (the
+# calibration law); the interval is a civil poll cadence whose retry lines
+# double as the re-run's calibration measurement. These are the write-back's
+# OWN bounds: the F-1-pinned LOAD_LEASE_RETRY_* stay load-path only.
+WRITEBACK_REMOVE_LEASE_WAIT_BUDGET_MS = 120_000
+WRITEBACK_REMOVE_RETRY_INTERVAL_MS = 5_000
 
 
 def _hm_profile() -> str:
@@ -3301,31 +3314,56 @@ class KVPoolWorker:
             return {"key": key, "result": -1, "stage": "exception"}
 
     def _holemiss_writeback_remove(self, key: str) -> int:
-        """S4 non-force remove with the bounded OBJECT_HAS_LEASE retry.
+        """S4 non-force remove that waits out the master read-lease window (B37).
 
-        The load-path leases are released at load end, so the sequential
-        flow's remove passes IsLeaseExpired; a straddling lease (the B25/B27
-        class) is retried with the pinned escalation before the loud
-        failure. force stays False at every attempt - force would bypass
-        exactly the live-reader protection the check exists for.
+        The binding blocker is the Mooncake MASTER-side read lease: the
+        consumer's own query sites (ExistKey / GetReplicaList via
+        GrantLeaseForGroup) grant a per-group read lease at query time — TTL
+        default_kv_lease_ttl=60000 — and the lease only ever extends
+        (``lease_timeout = max(lease_timeout, now + ttl)``, refreshed only
+        past the 30s half-life per NeedsReadLeaseRefresh); there is NO
+        release RPC at 0.3.13 (GrantReadLease only extends; the B35
+        batch_get_session_end is a pure client-side map erase). RemoveObject
+        is gated on IsLeaseExpired, so a lease granted ~15-45s before the
+        teardown refuses the remove with OBJECT_HAS_LEASE (-706) until it
+        ages out. The wait polls at a civil interval under a budget >= 2x
+        the lease TTL (the calibration law): the R1 teardown may extend up
+        to ~2min worst case — by design, the teardown is sync per the
+        signed-off W0 decision and the bench watchdogs have headroom.
+        ONLY the -706 class waits: any other rc returns immediately (the
+        B27 -706-only law). force stays False at every attempt — force
+        would bypass exactly the live-reader protection the check exists
+        for.
+
+        Considered and rejected (D-W2R.3): a master-side ReleaseReadLease
+        RPC — the Mooncake ABI/wheel blast radius (a C++ master + client +
+        wheel rebuild for a teardown-only path) versus a client-side wait;
+        the arbitration ranked the executor-side wait first.
         """
-        results = require_aligned_batch_results(
-            "batch_remove",
-            [key],
-            self.m_store.batch_remove([key]),
-        )
-        rc = results[0]
-        for attempt in range(1, LOAD_LEASE_RETRY_MAX_ATTEMPTS + 1):
-            if rc != LOAD_LEASE_RETRY_ERROR:
-                break
-            time.sleep(LOAD_LEASE_RETRY_BACKOFF_MS * 2 ** (attempt - 1) / 1000)
+        wait_start = time.monotonic()
+        attempt = 0
+        while True:
             results = require_aligned_batch_results(
                 "batch_remove",
                 [key],
                 self.m_store.batch_remove([key]),
             )
             rc = results[0]
-        return rc
+            if rc != LOAD_LEASE_RETRY_ERROR:
+                return rc
+            attempt += 1
+            elapsed_ms = int((time.monotonic() - wait_start) * 1000)
+            if elapsed_ms >= WRITEBACK_REMOVE_LEASE_WAIT_BUDGET_MS:
+                return rc
+            logger.info(
+                "HOLEMISS_WRITEBACK_REMOVE_RETRY tp=%d key=%s attempt=%d elapsed_ms=%d reason=%d",
+                self.tp_rank,
+                key,
+                attempt,
+                elapsed_ms,
+                rc,
+            )
+            time.sleep(WRITEBACK_REMOVE_RETRY_INTERVAL_MS / 1000)
 
     def _holemiss_writeback_copy_put(
         self,

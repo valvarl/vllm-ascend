@@ -286,6 +286,33 @@ class WritebackTestBase(unittest.TestCase):
         )
         return patcher, slept
 
+    def _fake_clock(self):
+        """A faked sleep that also advances a faked monotonic clock.
+
+        B37's remove wait is budget-driven on time.monotonic: with only the
+        sleep faked the clock never advances and a never-succeeding remove
+        would poll forever, so the budget-exhaustion tests drive both.
+        """
+        clock = [1000.0]
+        slept: list[float] = []
+
+        def _fake_sleep(seconds):
+            slept.append(seconds * 1000)
+            clock[0] += seconds
+
+        def _fake_monotonic():
+            return clock[0]
+
+        sleep_patcher = patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.time.sleep",
+            side_effect=_fake_sleep,
+        )
+        monotonic_patcher = patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.time.monotonic",
+            side_effect=_fake_monotonic,
+        )
+        return sleep_patcher, monotonic_patcher, slept
+
 
 class TestBackendBatchRemoveShape(unittest.TestCase):
     """A2: the pybind force slot receives the literal False."""
@@ -447,28 +474,86 @@ class TestWritebackExecutor(WritebackTestBase):
         self.assertLess(names.index("batch_remove"), names.index("batch_put_start"))
 
     def test_lease_straddle_retries_then_succeeds(self):
+        """B37: an aging lease (the master read lease, ~15-45s old at the
+        teardown) is polled at the civil interval until it expires."""
         worker = self._make_worker()
         worker.m_store.lease_failures[REGION_KEY] = 2
         worker.record_hole_recovery_region(self._region())
         patcher, slept = self._no_sleep()
-        with patcher:
+        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
             results = worker.writeback_hole_recovery_regions()
         self.assertEqual(results[0]["result"], 0)
         self.assertEqual(worker.m_store.call_names().count("batch_remove"), 3)
-        self.assertEqual([round(ms) for ms in slept], [200, 400])
+        self.assertEqual([round(ms) for ms in slept], [5000, 5000])
+        retry_lines = [line for line in logs.output if "HOLEMISS_WRITEBACK_REMOVE_RETRY" in line]
+        self.assertEqual(len(retry_lines), 2)
+        self.assertIn("attempt=1", retry_lines[0])
+        self.assertIn("reason=-706", retry_lines[0])
+
+    def test_remove_waits_out_master_lease_live_model(self):
+        """The B37 live timing model: the lease from the R1 hit checks is
+        ~45s old at the first attempt and dies 60s after its grant — the
+        wait bridges to expiry well inside the 120s budget, then the fresh
+        put session lands (the round-trip census's put=commit=tp shape)."""
+        worker = self._make_worker()
+        worker.m_store.lease_failures[REGION_KEY] = 9
+        worker.record_hole_recovery_region(self._region())
+        sleep_patcher, monotonic_patcher, slept = self._fake_clock()
+        with sleep_patcher, monotonic_patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
+            results = worker.writeback_hole_recovery_regions()
+        self.assertEqual(results[0]["result"], 0)
+        self.assertEqual(results[0]["stage"], "commit")
+        self.assertEqual(worker.m_store.call_names().count("batch_remove"), 10)
+        self.assertEqual([round(ms) for ms in slept], [5000] * 9)
+        retry_lines = [line for line in logs.output if "HOLEMISS_WRITEBACK_REMOVE_RETRY" in line]
+        self.assertEqual(len(retry_lines), 9)
+        self.assertIn("elapsed_ms=40000", retry_lines[-1])
+        self.assertTrue(any("HOLEMISS_WRITEBACK_PUT" in line for line in logs.output))
 
     def test_lease_exhaustion_fails_loud_without_put(self):
+        """A lease that never ages within the budget exhausts the wait and
+        fails LOUD at stage=remove — the unchanged best-effort contract."""
         worker = self._make_worker()
         worker.m_store.lease_failures[REGION_KEY] = 99
+        worker.record_hole_recovery_region(self._region())
+        sleep_patcher, monotonic_patcher, slept = self._fake_clock()
+        with sleep_patcher, monotonic_patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
+            results = worker.writeback_hole_recovery_regions()
+        self.assertEqual(results, [{"key": REGION_KEY, "result": -706, "stage": "remove"}])
+        self.assertEqual(worker.m_store.call_names().count("batch_remove"), 25)
+        self.assertEqual([round(ms) for ms in slept], [5000] * 24)
+        retry_lines = [line for line in logs.output if "HOLEMISS_WRITEBACK_REMOVE_RETRY" in line]
+        self.assertEqual(len(retry_lines), 24)
+        self.assertNotIn("batch_put_start", worker.m_store.call_names())
+        self.assertTrue(any("HOLEMISS_WRITEBACK_FAILED" in line and "stage=remove" in line for line in logs.output))
+
+    def test_remove_first_attempt_success_zero_sleep(self):
+        """Zero added latency when the first attempt succeeds (the no-lease
+        teardown and the B35-released shape)."""
+        worker = self._make_worker()
         worker.record_hole_recovery_region(self._region())
         patcher, slept = self._no_sleep()
         with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
             results = worker.writeback_hole_recovery_regions()
-        self.assertEqual(results, [{"key": REGION_KEY, "result": -706, "stage": "remove"}])
-        self.assertEqual(worker.m_store.call_names().count("batch_remove"), 4)
-        self.assertEqual([round(ms) for ms in slept], [200, 400, 800])
+        self.assertEqual(results[0]["result"], 0)
+        self.assertEqual(worker.m_store.call_names().count("batch_remove"), 1)
+        self.assertEqual(slept, [])
+        self.assertEqual([line for line in logs.output if "HOLEMISS_WRITEBACK_REMOVE_RETRY" in line], [])
+
+    def test_remove_non_706_returns_immediately(self):
+        """The B27 -706-only law carried into the wait: any other negative
+        returns on the first attempt with no retry and no sleep."""
+        worker = self._make_worker()
+        worker.record_hole_recovery_region(self._region())
+        worker.m_store.batch_remove = lambda keys: [-707] * len(keys)
+        patcher, slept = self._no_sleep()
+        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
+            results = worker.writeback_hole_recovery_regions()
+        self.assertEqual(results, [{"key": REGION_KEY, "result": -707, "stage": "remove"}])
         self.assertNotIn("batch_put_start", worker.m_store.call_names())
-        self.assertTrue(any("HOLEMISS_WRITEBACK_FAILED" in line and "stage=remove" in line for line in logs.output))
+        self.assertEqual(slept, [])
+        self.assertEqual([line for line in logs.output if "HOLEMISS_WRITEBACK_REMOVE_RETRY" in line], [])
+        self.assertTrue(any("HOLEMISS_WRITEBACK_FAILED" in line and "reason=-707" in line for line in logs.output))
 
     def test_transient_copy_put_failure_retries_once(self):
         worker = self._make_worker()
@@ -737,13 +822,31 @@ class TestWritebackLiteralConstants(unittest.TestCase):
     """D-B20.10/F-1 class: the retry bounds are pinned literally."""
 
     def test_remove_lease_retry_constants(self):
+        """The F-1 load-path pins stay literal and untouched by B37 (they
+        are pinned at their home module, kv_transfer, where the load path
+        reads them; pool_worker no longer re-exports the two bounds)."""
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
+            kv_transfer,
+            pool_worker,
+        )
+
+        self.assertEqual(kv_transfer.LOAD_LEASE_RETRY_ERROR, -706)
+        self.assertEqual(kv_transfer.LOAD_LEASE_RETRY_MAX_ATTEMPTS, 3)
+        self.assertEqual(kv_transfer.LOAD_LEASE_RETRY_BACKOFF_MS, 200)
+        self.assertEqual(pool_worker.LOAD_LEASE_RETRY_ERROR, -706)
+
+    def test_writeback_remove_wait_constants(self):
+        """B37's OWN bound set (the bound-widening tripwire): the budget
+        carries >= 2x the 60000ms master lease TTL (default_kv_lease_ttl,
+        B28 — the calibration law) and the interval is the civil poll
+        cadence; widening or narrowing either trips this pin."""
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
             pool_worker,
         )
 
-        self.assertEqual(pool_worker.LOAD_LEASE_RETRY_ERROR, -706)
-        self.assertEqual(pool_worker.LOAD_LEASE_RETRY_MAX_ATTEMPTS, 3)
-        self.assertEqual(pool_worker.LOAD_LEASE_RETRY_BACKOFF_MS, 200)
+        self.assertEqual(pool_worker.WRITEBACK_REMOVE_LEASE_WAIT_BUDGET_MS, 120_000)
+        self.assertEqual(pool_worker.WRITEBACK_REMOVE_RETRY_INTERVAL_MS, 5_000)
+        self.assertGreaterEqual(pool_worker.WRITEBACK_REMOVE_LEASE_WAIT_BUDGET_MS, 2 * 60_000)
 
     def test_write_retry_constants(self):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
@@ -813,20 +916,25 @@ class TestBatchedLoadLeaseReleaseUnblocksWriteback(WritebackTestBase):
         self.assertIn("batch_remove_lease", store.call_names())
 
     def test_unreleased_lease_blocks_the_writeback_remove(self):
-        """The B35 live-signature twin: a lease the load never released
-        fails the remove with -706 at stage=remove — the loud, GT-safe
-        degradation (the original object stays; no put is attempted)."""
+        """The B35 live-signature twin under the B37 wait: a lease that
+        never ages (the pathological case — the master lease always ages
+        out live, TTL 60s) exhausts the budget and still fails the remove
+        with -706 at stage=remove — the loud, GT-safe degradation (the
+        original object stays; no put is attempted)."""
         worker = self._make_worker()
         store = worker.m_store
         store.leased.add(REGION_KEY)
         worker.record_hole_recovery_region(self._region())
-        patcher, _ = self._no_sleep()
-        with patcher:
+        sleep_patcher, monotonic_patcher, slept = self._fake_clock()
+        with sleep_patcher, monotonic_patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
             results = worker.writeback_hole_recovery_regions()
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["result"], -706)
         self.assertEqual(results[0]["stage"], "remove")
         self.assertNotIn("batch_put_start", store.call_names())
+        retry_lines = [line for line in logs.output if "HOLEMISS_WRITEBACK_REMOVE_RETRY" in line]
+        self.assertEqual(len(retry_lines), 24)
+        self.assertEqual([round(ms) for ms in slept], [5000] * 24)
 
 
 if __name__ == "__main__":
