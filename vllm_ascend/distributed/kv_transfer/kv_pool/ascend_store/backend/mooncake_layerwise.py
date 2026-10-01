@@ -377,7 +377,18 @@ def _prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> di
             if not request.can_save or not worker._is_layerwise_save_owner():
                 continue
             key_indices = [(key(index), index) for index in range(start, end) if selected(store_mask, index)]
+            # B39: the finish-time partial tail's GROUP-0 FA block persists
+            # under the cross-request boundary sub-hash key (T18) — the only
+            # new tail artifact (the GDN tail composes with the
+            # boundary-state channel, so groups 1-3 stay cleared). The tail
+            # key rides the SAME session machinery as the full blocks: the
+            # never-re-put law is load-bearing here because the key is
+            # cross-request-derivable — a second request sharing the boundary
+            # must not re-put the committed object.
+            finished_tail = worker._make_layerwise_finished_tail_key(request, group)
             names = [name for name, _ in key_indices]
+            if finished_tail is not None:
+                names.append(finished_tail[0])
             with worker._put_started_keys_lock:
                 started = set(names) & worker._put_started_keys
             new = [name for name in names if name not in started]
@@ -431,8 +442,18 @@ def _prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> di
             for name, index in key_indices:
                 if name in started:
                     view.save_block_keys[index - start] = name
-            tracker.register_put_keys(
-                request.req_id, ((name, index) for name, index in key_indices if name in started), group_id=group
-            )
+            put_entries = [(name, index) for name, index in key_indices if name in started]
+            if finished_tail is not None and finished_tail[0] in started:
+                # The tail row lands only when its session opened (or was
+                # already in flight): a rejected put_start leaves the key
+                # clear so the partial row is skipped — mirroring the
+                # full-block slot clearing above. The un-cleared
+                # partial_block_index is load-bearing: with layer reuse off,
+                # get_partial_block_index derives None and the range rides
+                # this field.
+                view.save_last_block_key = finished_tail[0]
+                view.partial_block_index = finished_tail[1]
+                put_entries.append(finished_tail)
+            tracker.register_put_keys(request.req_id, put_entries, group_id=group)
     worker._open_layerwise_get_sessions(get_slots)
     return result

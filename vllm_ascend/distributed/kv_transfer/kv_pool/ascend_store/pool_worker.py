@@ -1666,6 +1666,38 @@ class KVPoolWorker:
         assert self.layerwise_keys is not None
         return self.layerwise_keys.make_full_key(group_id, block_hash_hex, self.head_or_tp_rank, self.pp_rank)
 
+    def _make_layerwise_finished_tail_key(self, request: ReqMeta, group_id: int) -> tuple[str, int] | None:
+        """The finish-time partial-tail key for the hybrid group sessions (B39).
+
+        Returns ``(key, tail_block_index)`` for the GROUP-0 FA partial block of
+        a finish-time tail request, None for every other group or request.
+        The tail persists under the cross-request boundary sub-hash key (T18):
+        the chain element at ``boundary // hash_block_size - 1`` qualified by
+        the boundary position — the same derivation as the single-group
+        ``_prepare_layerwise_put_session`` and the bench's tail-key census —
+        NEVER the req-id ``{req_id}_lastblock`` key (intra-request only, the
+        false-gap trap). The positive signal is the same as the B38 mask
+        exemption: ``finished_tail_boundary == save_end_token`` (only
+        ``register_finished_partial_tail`` constructs such ReqMetas). Groups
+        1-3 get no tail artifact (the T18 law: the GDN tail state composes
+        with the boundary-state channel; only the FA partial block is new).
+        """
+        boundary = request.finished_tail_boundary
+        if group_id != 0 or boundary is None or boundary != request.save_end_token:
+            return None
+        tail_hash_index = boundary // self.hash_block_size - 1
+        if not 0 <= tail_hash_index < len(request.block_hashes):
+            return None
+        key = self._make_layerwise_full_key(
+            group_id,
+            partial_tail_key_suffix(
+                block_hash_to_str(request.block_hashes[tail_hash_index]),
+                boundary,
+            ),
+        )
+        tail_block_index = boundary // get_group_block_size(self.grouped_block_size, group_id)
+        return key, tail_block_index
+
     def _make_layerwise_partial_key(
         self,
         request: ReqMeta,
