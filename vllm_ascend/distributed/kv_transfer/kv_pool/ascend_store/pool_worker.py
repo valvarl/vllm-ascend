@@ -2541,8 +2541,31 @@ class KVPoolWorker:
         persisted, instead of the full sequence. Falls back to None (store
         everything) when the coordinator is unavailable or the save extent
         is not aligned.
+
+        The finish-time partial tail (T18, B38) is exempt from the
+        full-block alignment demand: its ReqMeta carries the boundary
+        itself (``finished_tail_boundary == save_end_token``, constructed
+        by ``register_finished_partial_tail``), and its only new artifact
+        is the group-0 FA partial block, which rides the partial-block
+        transfer path outside the full-block masks. The masks for it are
+        computed at the floor-aligned boundary — the same coordinator
+        reachable-state semantics as any aligned save (the coordinator's
+        ``_reachable_masks`` asserts alignment, so the floor is
+        load-bearing, not cosmetic) — and the tail block itself is
+        unaffected: ``masked_block_runs`` treats blocks at or beyond the
+        mask length as allowed. Genuine misalignment of non-tail hybrid
+        saves still raises: the exemption keys on the positive tail
+        signal, never on the unaligned value (``partial_block_index``
+        alone is not tail-specific — regular chunk saves carry it too).
         """
         if getattr(self, "block_key_hybrid", False) and request.can_save and request.save_end_token > 0:
+            finished_tail_boundary = request.finished_tail_boundary
+            is_finished_partial_tail = (
+                finished_tail_boundary is not None and finished_tail_boundary == request.save_end_token
+            )
+            if is_finished_partial_tail:
+                aligned_end = request.save_end_token - request.save_end_token % self.cache_transfer_granularity
+                return self.token_database.store_mask(aligned_end, request.num_prompt_tokens)
             if self.cache_coordinator is None or request.save_end_token % self.cache_transfer_granularity:
                 raise ValueError("Block-key hybrid saves require a coordinator-aligned full-block boundary")
             return self.token_database.store_mask(request.save_end_token, request.num_prompt_tokens)
