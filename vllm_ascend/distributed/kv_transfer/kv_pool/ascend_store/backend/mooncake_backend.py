@@ -427,6 +427,15 @@ class MooncakeBackend(Backend):
     def batch_commit(self, keys: list[str]) -> list[int]:
         return self._call_layerwise_batch("batch_put_session_end", keys, keys)
 
+    def batch_remove(self, keys: list[str]) -> list[int]:
+        """Non-force object removal (store_py.cpp pybind ``batch_remove``).
+
+        force stays the literal False: a truthy force would bypass exactly
+        the live-reader lease protection the master's Remove check exists
+        for. The tail-writeback's remove-precedes-put rides this (S1/S4).
+        """
+        return self._call_layerwise_batch("batch_remove", keys, keys, False)
+
     def batch_revoke(self, keys: list[str]) -> list[int]:
         return self._call_layerwise_batch("batch_put_session_revoke", keys, keys)
 

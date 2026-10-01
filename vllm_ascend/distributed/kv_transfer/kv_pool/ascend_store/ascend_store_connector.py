@@ -549,6 +549,23 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 logger.info("HOLEMISS get_hole_recovery_regions: %d regions", len(regions))
         return regions
 
+    def writeback_hole_recovery_kv(self) -> list:
+        """tail-writeback forward: heal the repaired blocks back to the store.
+
+        Called by the vLLM-side HR mixin teardown (duck-typed, env-gated by
+        the caller); the worker executor owns the loud best-effort contract
+        and returns the per-key result summary the mixin logs.
+        """
+        worker = getattr(self, "connector_worker", None)
+        writeback = getattr(worker, "writeback_hole_recovery_regions", None)
+        if not callable(writeback):
+            logger.error(
+                "HOLEMISS_WRITEBACK_SKIP reason=worker_lacks_writeback type=%s",
+                type(worker).__name__,
+            )
+            return []
+        return writeback()
+
     def get_kv_connector_kv_cache_events(self) -> AscendStoreKVEvents | None:
         """
         Get the KV connector kv cache events collected during the last interval.

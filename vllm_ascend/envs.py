@@ -142,6 +142,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Full Mooncake block-object key armed for disk-EIO injection. An empty
     # value means the injector is off (re-read live per call). Default: "".
     "EIO_TARGET_KEY": lambda: os.getenv("EIO_TARGET_KEY", ""),
+    # tail-writeback: write the HR-repaired KV back to the store (remove +
+    # fresh session put on the failed region keys) at the HR teardown, and
+    # verify the healed bytes on the next load (byte-exact sha census).
+    # Read live per call on both planes (the vLLM mixin gate and the load
+    # verifier). Default: 0 (the write-back never runs; the battery is
+    # byte-identical). Values "0"/"1". Not sensitive.
+    "HOLEMISS_KV_WRITEBACK": lambda: os.getenv("HOLEMISS_KV_WRITEBACK", "0"),
 }
 
 # end-env-vars-definition

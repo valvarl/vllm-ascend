@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import math
 import os
@@ -50,6 +51,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tr
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    LOAD_LEASE_RETRY_BACKOFF_MS,
+    LOAD_LEASE_RETRY_ERROR,
+    LOAD_LEASE_RETRY_MAX_ATTEMPTS,
+    RANGE_WRITE_MAX_RETRIES,
+    RANGE_WRITE_RETRY_BACKOFF_MS,
     KVCacheStoreBatch,
     KVCacheStoreKeyLayerRecvingThread,
     KVCacheStoreKeyLayerSendingThread,
@@ -80,6 +86,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LayerMultiBlockReqMeta,
     LayerTransferTask,
     ReqMeta,
+    SharedBlockData,
     block_hash_to_str,
     get_block_hashes,
     get_group_block_size,
@@ -551,6 +558,10 @@ class KVPoolWorker:
         self._hole_recovery_lock = threading.Lock()
         self._holemiss_armed_fault: dict | None = None
         self._holemiss_fa_layer_map: list[int] | None = None
+        # tail-writeback round-trip probe: healed key -> the sha256 the PUT
+        # wrote (the load-side verifier compares the next GET's bytes against
+        # it). GIL-atomic dict ops only; bounded by the fault-row count.
+        self._holemiss_writeback_keys: dict[str, str] = {}
         # GDN state-load ladder (T14): per-request results (G14's dynamic
         # rollback boundary), failed load keys (the drain's outcome record),
         # and the block ids the ladder already dispositioned (rung 2 keeps
@@ -3130,6 +3141,299 @@ class KVPoolWorker:
                 target_rc,
             )
         return results
+
+    # ------------------------------------------------------------------
+    # tail-writeback: remove + fresh session put for the healed blocks.
+    # ------------------------------------------------------------------
+
+    def writeback_hole_recovery_regions(self) -> list[dict]:
+        """Write the repaired KV of every failed-load region back to the store.
+
+        Invoked by the vLLM HR mixin teardown via the connector's
+        writeback_hole_recovery_kv (the env gate lives there). Per failed
+        region key: a non-force remove (the completed producer replica set
+        cannot be re-opened - PutStart returns OBJECT_ALREADY_EXISTS), then
+        a fresh put session whose Case-A allocation lands in this worker's
+        own registered segment (the B21 preferred_segment pin) and whose ONE
+        batch_copy_put carries every group-0 layer range (the per-call
+        staging law). Loud best-effort: every failure is census-logged and
+        returned, never raised - the generation is already GT-correct from
+        the local repair, and both degradation paths (remove fails -> the
+        original bytes stay; put fails -> the key is absent -> the next
+        load's hit check truncates before the block) recompute GT-safely.
+        """
+        results: list[dict] = []
+        if not getattr(self, "use_block_key_layerwise", False):
+            logger.error(
+                "HOLEMISS_WRITEBACK_SKIP tp=%d reason=not_block_key_layerwise",
+                self.tp_rank,
+            )
+            return results
+        builder = self._holemiss_writeback_builder()
+        if builder is None:
+            return results
+        object_size = self._layerwise_object_size_bytes()
+        by_key: dict[str, dict] = {}
+        for region in self.get_hole_recovery_regions():
+            if int(region.get("result", 0)) >= 0:
+                continue
+            key = region.get("key")
+            if not isinstance(key, str) or not key:
+                continue
+            by_key.setdefault(key, region)
+        for key, region in by_key.items():
+            results.append(self._holemiss_writeback_one(builder, region, key, object_size))
+        return results
+
+    def _holemiss_writeback_builder(self) -> LayerBatchBuilder | None:
+        """The live group-0 range builder (D5: group-0 objects only)."""
+        recv_thread = getattr(self, "kv_recv_thread", None)
+        builders = getattr(recv_thread, "group_builders", None)
+        if builders:
+            return builders[0]
+        if getattr(self, "token_database", None) is not None:
+            return self._build_group_layer_builders()[0]
+        logger.error(
+            "HOLEMISS_WRITEBACK_SKIP tp=%d reason=no_group_builder",
+            self.tp_rank,
+        )
+        return None
+
+    def _holemiss_writeback_one(
+        self,
+        builder: LayerBatchBuilder,
+        region: dict,
+        key: str,
+        object_size: int,
+    ) -> dict:
+        req_id = str(region.get("request_id", "?"))
+        block_id = int(region.get("physical_block_id", -1))
+        token_start = int(region.get("token_start", -1))
+        token_end = int(region.get("token_end", -1))
+        tp = self.tp_rank
+        try:
+            remove_rc = self._holemiss_writeback_remove(key)
+            if remove_rc != 0:
+                logger.info(
+                    "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=remove reason=%d",
+                    tp,
+                    req_id,
+                    key,
+                    remove_rc,
+                )
+                return {"key": key, "result": remove_rc, "stage": "remove"}
+            start_results = require_aligned_batch_results(
+                "batch_put_start",
+                [key],
+                self.m_store.batch_put_start([key], [object_size]),
+            )
+            if start_results[0] != 0:
+                logger.info(
+                    "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=put_start reason=%d",
+                    tp,
+                    req_id,
+                    key,
+                    start_results[0],
+                )
+                return {"key": key, "result": start_results[0], "stage": "put_start"}
+            buffers, sizes, offsets, layers = self._holemiss_writeback_ranges(
+                builder, key, block_id
+            )
+            write_rc = self._holemiss_writeback_copy_put(key, buffers, sizes, offsets)
+            if write_rc != 0:
+                self._holemiss_writeback_revoke(key)
+                logger.info(
+                    "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=copy_put reason=%d",
+                    tp,
+                    req_id,
+                    key,
+                    write_rc,
+                )
+                return {"key": key, "result": write_rc, "stage": "copy_put"}
+            sha = self.holemiss_writeback_object_sha(block_id)
+            logger.info(
+                "HOLEMISS_WRITEBACK_PUT tp=%d req=%s key=%s tokens=%d-%d block=%d layers=%d bytes=%d sha=%s",
+                tp,
+                req_id,
+                key,
+                token_start,
+                token_end,
+                block_id,
+                layers,
+                object_size,
+                sha or "none",
+            )
+            commit_results = require_aligned_batch_results(
+                "batch_commit",
+                [key],
+                self.m_store.batch_commit([key]),
+            )
+            if commit_results[0] != 0:
+                self._holemiss_writeback_revoke(key)
+                logger.info(
+                    "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=commit reason=%d",
+                    tp,
+                    req_id,
+                    key,
+                    commit_results[0],
+                )
+                return {"key": key, "result": commit_results[0], "stage": "commit"}
+            logger.info(
+                "HOLEMISS_WRITEBACK_COMMIT tp=%d req=%s key=%s result=%d",
+                tp,
+                req_id,
+                key,
+                commit_results[0],
+            )
+            if sha is not None:
+                self._holemiss_writeback_keys[key] = sha
+            return {"key": key, "result": 0, "stage": "commit", "sha": sha}
+        except Exception as exc:  # noqa: BLE001
+            # Loud best-effort: a broken write-back must never break the
+            # generation path (the GT is already served by the local repair).
+            with suppress(Exception):
+                self._holemiss_writeback_revoke(key)
+            logger.info(
+                "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=exception reason=%s",
+                tp,
+                req_id,
+                key,
+                str(exc)[:200],
+            )
+            return {"key": key, "result": -1, "stage": "exception"}
+
+    def _holemiss_writeback_remove(self, key: str) -> int:
+        """S4 non-force remove with the bounded OBJECT_HAS_LEASE retry.
+
+        The load-path leases are released at load end, so the sequential
+        flow's remove passes IsLeaseExpired; a straddling lease (the B25/B27
+        class) is retried with the pinned escalation before the loud
+        failure. force stays False at every attempt - force would bypass
+        exactly the live-reader protection the check exists for.
+        """
+        results = require_aligned_batch_results(
+            "batch_remove",
+            [key],
+            self.m_store.batch_remove([key]),
+        )
+        rc = results[0]
+        for attempt in range(1, LOAD_LEASE_RETRY_MAX_ATTEMPTS + 1):
+            if rc != LOAD_LEASE_RETRY_ERROR:
+                break
+            time.sleep(LOAD_LEASE_RETRY_BACKOFF_MS * 2 ** (attempt - 1) / 1000)
+            results = require_aligned_batch_results(
+                "batch_remove",
+                [key],
+                self.m_store.batch_remove([key]),
+            )
+            rc = results[0]
+        return rc
+
+    def _holemiss_writeback_copy_put(
+        self,
+        key: str,
+        buffers: list[int],
+        sizes: list[int],
+        offsets: list[int],
+    ) -> int:
+        """ONE multi-range put with the bounded write retry (B20 class).
+
+        The write is idempotent (device source buffers and destination
+        offsets are stable for the healed block), so re-issuing after a
+        transient negative is byte-identical to a single success; only the
+        pinned retry budget separates a transient from the loud revoke.
+        """
+        rc = self._holemiss_writeback_copy_put_once(key, buffers, sizes, offsets)
+        for attempt in range(1, RANGE_WRITE_MAX_RETRIES + 1):
+            if rc >= 0:
+                break
+            time.sleep(RANGE_WRITE_RETRY_BACKOFF_MS * 2 ** (attempt - 1) / 1000)
+            rc = self._holemiss_writeback_copy_put_once(key, buffers, sizes, offsets)
+        return rc
+
+    def _holemiss_writeback_copy_put_once(
+        self,
+        key: str,
+        buffers: list[int],
+        sizes: list[int],
+        offsets: list[int],
+    ) -> int:
+        results = require_aligned_batch_results(
+            "batch_copy_put",
+            [key],
+            self.m_store.batch_copy_put([key], [buffers], [sizes], [offsets]),
+        )
+        return results[0]
+
+    def _holemiss_writeback_revoke(self, key: str) -> None:
+        try:
+            self.m_store.batch_revoke([key])
+        except Exception as exc:  # noqa: BLE001
+            logger.error("HOLEMISS writeback revoke failed key=%s error=%s", key, exc)
+
+    def _holemiss_writeback_ranges(
+        self, builder: LayerBatchBuilder, key: str, block_id: int
+    ) -> tuple[list[int], list[int], list[int], int]:
+        """Merge every group-0 layer range of one block into a single call.
+
+        The real build_addrs math (the same builder the save/load planes
+        ride) produces each layer's (buffers, sizes, offsets); a key belongs
+        to exactly one group, so the per-layer segment lists concatenate
+        cleanly - the write-side twin of the batched load's merge-by-key.
+        """
+        shared = SharedBlockData(
+            block_ids_arr=np.asarray([block_id], dtype=np.int64),
+            block_gvas_arr=None,
+            req_ids=[""],
+            is_last_chunks=[None],
+            block_keys=[key],
+        )
+        buffers: list[int] = []
+        sizes: list[int] = []
+        offsets: list[int] = []
+        for layer in range(builder.num_layers):
+            req_meta = builder.build_addrs(shared, layer)
+            buffers.extend(req_meta.all_buffers[0])
+            sizes.extend(req_meta.all_sizes[0])
+            offsets.extend(req_meta.all_offsets[0])
+        return buffers, sizes, offsets, builder.num_layers
+
+    def _holemiss_group0_cache_entries(self) -> list[torch.Tensor]:
+        """Group-0 cache entries in the object-layout order (the builder's)."""
+        if self.kv_cache_config is not None and self.use_hybrid:
+            layer_names = list(self.kv_cache_config.kv_cache_groups[0].layer_names)
+        else:
+            layer_names = list(self.kv_caches.keys())
+        layer_names_by_physical: dict[int, list[str]] = {}
+        for layer_name in layer_names:
+            phys = self._extract_physical_layer_index(layer_name)
+            phys = self._global_to_local_layer.get(phys, phys)
+            layer_names_by_physical.setdefault(phys, []).append(layer_name)
+        entries: list[torch.Tensor] = []
+        for phys in sorted(layer_names_by_physical):
+            for layer_name in sorted(layer_names_by_physical[phys]):
+                entries.extend(self._as_cache_tuple(self.kv_caches[layer_name]))
+        return entries
+
+    def holemiss_writeback_object_sha(self, block_id: int) -> str | None:
+        """sha256 over one block's group-0 object bytes, in layout order.
+
+        The PUT side hashes the healed device bytes after its copy_put; the
+        load side re-walks the same entries after the next GET lands them,
+        so the pair is a byte-exact round-trip probe (LEG A). Per-entry D2H
+        copies only run under the write-back env gate.
+        """
+        if block_id < 0:
+            return None
+        try:
+            digest = hashlib.sha256()
+            for cache in self._holemiss_group0_cache_entries():
+                block = cache[block_id]
+                digest.update(block.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+            return digest.hexdigest()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("HOLEMISS writeback sha failed block=%d error=%s", block_id, exc)
+            return None
 
     def _holemiss_sync_layerwise_drain(self, load_requests: list[ReqMeta]) -> None:
         """Serialized pre-forward completion of the block-key session load.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import queue
 import threading
 import time
@@ -2163,6 +2164,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         merged_sizes: list[list[int]] = []
         merged_offsets: list[list[int]] = []
         merged_block_ids: list[int] = []
+        merged_req_ids: list[str | None] = []
         final_req_ids: list[str] = []
         armed_layer_id: int | None = None
         try:
@@ -2206,6 +2208,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                             merged_sizes.append([])
                             merged_offsets.append([])
                             merged_block_ids.append(req_meta.block_ids[index])
+                            merged_req_ids.append(req_meta.req_ids[0] if req_meta.req_ids else None)
                         merged_buffers[slot].extend(req_meta.all_buffers[index])
                         merged_sizes[slot].extend(req_meta.all_sizes[index])
                         merged_offsets[slot].extend(req_meta.all_offsets[index])
@@ -2301,6 +2304,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     len(lease_straddled),
                 )
             _emit_range_debug_event("load", layer_ids[0], active_sizes, active_offsets, results)
+            self._holemiss_verify_writeback_loads(active_keys, merged_block_ids, merged_req_ids, results)
             failed_indices = [index for index, result in zip(active_indices, results, strict=True) if result < 0]
             if failed_indices:
                 with self._invalid_block_ids_lock:
@@ -2319,6 +2323,47 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     self.layer_load_finished_events[layer_id].set()
             self.request_queue.task_done()
             self.get_event.set()
+
+    def _holemiss_verify_writeback_loads(
+        self,
+        keys: list[str],
+        block_ids: list[int],
+        req_ids: list[str | None],
+        results: list[int],
+    ) -> None:
+        """tail-writeback LEG A: byte-exact round-trip probe on healed keys.
+
+        Under HOLEMISS_KV_WRITEBACK (the same live env gate the mixin's
+        write-back rides), every merged key the worker's write-back healed
+        and this load served with result==0 gets a post-load sha over the
+        same ordered group-0 cache-entry walk the PUT hashed. A mismatch is
+        a loud census line, never a load failure.
+        """
+        if os.getenv("HOLEMISS_KV_WRITEBACK", "0") != "1":
+            return
+        worker = self.worker
+        tracked = getattr(worker, "_holemiss_writeback_keys", None)
+        if not tracked:
+            return
+        sha_fn = getattr(worker, "holemiss_writeback_object_sha", None)
+        if not callable(sha_fn):
+            return
+        tp = getattr(worker, "tp_rank", -1)
+        for key, block_id, req_id, result in zip(keys, block_ids, req_ids, results, strict=True):
+            if result != 0 or key not in tracked:
+                continue
+            loaded_sha = sha_fn(block_id)
+            if loaded_sha is None:
+                continue
+            match = loaded_sha == tracked[key]
+            logger.info(
+                "HOLEMISS_WRITEBACK_VERIFIED tp=%d req=%s key=%s sha=%s match=%s",
+                tp,
+                req_id or "?",
+                key,
+                loaded_sha,
+                match,
+            )
 
     def _handle_range_layer_task(self, data: LayerLoadTask) -> None:
         layer_id = data.layer_id
