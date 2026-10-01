@@ -543,3 +543,68 @@ class TestLoadLeaseRetryLiteralPins(unittest.TestCase):
             for attempt in range(kv_transfer.LOAD_LEASE_RETRY_MAX_ATTEMPTS)
         )
         self.assertEqual(total_ms, 1400)
+
+
+class TestBatchedLoadLeaseRelease(unittest.TestCase):
+    """B35: the completed batched load releases the session leases it took.
+
+    The write-back's non-force remove requires the load's leases gone (the
+    master's Remove checks IsLeaseExpired); the batched handler is the
+    executed load path on every bench mode, so its completion point must
+    mirror the legacy per-layer path's final-layer batch_remove_lease. The
+    release must NOT fire on the failure paths where a lease may still be
+    needed (the abort early-return and the exception path feed the retry
+    machinery)."""
+
+    def test_completion_releases_the_merged_keys_leases(self):
+        task, build_map = _batched_task(_per_layer_metas())
+        thread = _stub_recv_thread(build_map)
+        thread._handle_batched_range_layer_task(task)
+        thread.m_store.batch_remove_lease.assert_called_once_with([f"m@h{i}@0" for i in range(NUM_KEYS)])
+
+    def test_release_covers_failed_keys(self):
+        """The keys whose load FAILED are released too — the tail-writeback's
+        remove targets exactly those keys (the EIO'd block), so a
+        success-only release would leave the write-back blocked."""
+        task, build_map = _batched_task(_per_layer_metas())
+        thread = _stub_recv_thread(build_map)
+        thread.m_store.batch_copy_get.side_effect = lambda keys, buffers, sizes, offsets: [
+            -1102 if key == "m@h1@0" else sum(sizes_k) for key, sizes_k in zip(keys, sizes)
+        ]
+        thread._handle_batched_range_layer_task(task)
+        self.assertEqual(thread._invalid_block_ids, {101})
+        thread.m_store.batch_remove_lease.assert_called_once_with([f"m@h{i}@0" for i in range(NUM_KEYS)])
+
+    def test_exception_path_retains_the_leases(self):
+        """A load that raises never completes; its sessions must stay live
+        for the retry machinery (the abort-and-reissue path)."""
+        task, build_map = _batched_task(_per_layer_metas())
+        thread = _stub_recv_thread(build_map)
+        thread.m_store.batch_copy_get.side_effect = RuntimeError("store read failed")
+        with self.assertRaises(RuntimeError):
+            thread._handle_batched_range_layer_task(task)
+        thread.m_store.batch_remove_lease.assert_not_called()
+
+    def test_abort_path_retains_the_leases(self):
+        """The pre-load abort early-return issued no load; nothing to
+        release, and a release would drop sessions the retry still owns."""
+        task, build_map = _batched_task(_per_layer_metas())
+        thread = _stub_recv_thread(build_map)
+        thread._load_abort_event.set()
+        thread._handle_batched_range_layer_task(task)
+        thread.m_store.batch_copy_get.assert_not_called()
+        thread.m_store.batch_remove_lease.assert_not_called()
+
+    def test_release_rides_the_backend_lease_api_not_the_session_tracker(self):
+        """The handler calls the BACKEND lease-release API directly (the
+        legacy :2541 call shape), independent of the worker-side session
+        tracker's terminal release."""
+        import inspect
+
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
+            kv_transfer as kv_transfer_module,
+        )
+
+        source = inspect.getsource(kv_transfer_module.KVCacheStoreLayerRecvingThread._handle_batched_range_layer_task)
+        self.assertIn("self.m_store.batch_remove_lease(unique_load_keys)", source)
+        self.assertNotIn("_end_layerwise_load_keys", source)

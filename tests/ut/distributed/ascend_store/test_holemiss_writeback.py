@@ -85,6 +85,7 @@ class WritebackStore:
         self.copy_put_failures: dict[str, int] = {}
         self.calls: list[tuple] = []
         self.lock = threading.Lock()
+        self.leased: set[str] = set()
 
     def _read(self, address: int, size: int) -> bytes:
         for start, length in self.regions:
@@ -92,10 +93,29 @@ class WritebackStore:
                 return (ctypes.c_char * size).from_address(address).raw
         raise AssertionError(f"address 0x{address:x}+{size} outside registered regions")
 
+    def batch_copy_get(self, keys, all_buffers, all_sizes, all_offsets):
+        """The load-side ranged read (B35's lease model): the session get
+        takes a lease on every key it reads — the master grants the read
+        lease at query time (GetReplicaList/ExistKey)."""
+        self.calls.append(("batch_copy_get", tuple(keys)))
+        self.leased.update(keys)
+        return [0] * len(keys)
+
+    def batch_remove_lease(self, keys):
+        """The load-end lease release (B35): the completed load drops the
+        session leases it took; the master's non-force Remove then passes
+        its IsLeaseExpired check."""
+        self.calls.append(("batch_remove_lease", tuple(keys)))
+        self.leased.difference_update(keys)
+        return 0
+
     def batch_remove(self, keys):
         self.calls.append(("batch_remove", tuple(keys)))
         results = []
         for key in keys:
+            if key in self.leased:
+                results.append(-706)
+                continue
             if self.lease_failures.get(key, 0) > 0:
                 self.lease_failures[key] -= 1
                 results.append(-706)
@@ -306,6 +326,24 @@ class TestBackendBatchRemoveShape(unittest.TestCase):
 
         with self.assertRaises(BatchResultShapeError):
             self._backend(_BadStore()).batch_remove(["k1"])
+
+    def test_batch_remove_lease_delegates_to_get_session_end(self):
+        """B35: the mooncake client has no lease-named API — the backend's
+        lease release maps onto the GET session end (real_client.cpp
+        batch_get_session_end drops the client-held sessions)."""
+
+        class _LeaseStore:
+            def __init__(self):
+                self.calls = []
+
+            def batch_get_session_end(self, keys):
+                self.calls.append(list(keys))
+                return 0
+
+        store = _LeaseStore()
+        rc = self._backend(store).batch_remove_lease(["k1", "k2"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(store.calls, [["k1", "k2"]])
 
 
 class TestConnectorWritebackForward(unittest.TestCase):
@@ -719,6 +757,76 @@ class TestWritebackLiteralConstants(unittest.TestCase):
         from vllm_ascend import envs
 
         self.assertIn("HOLEMISS_KV_WRITEBACK", envs.env_variables)
+
+
+class TestBatchedLoadLeaseReleaseUnblocksWriteback(WritebackTestBase):
+    """B35's S1-class pin: the chain from the batched load's completion-time
+    lease release to the write-back's non-force remove passing.
+
+    The live B35 signature was stage=remove reason=-706 on both ranks and
+    both geometries: the batched load leases the keys and never releases
+    them, so the master's IsLeaseExpired check refuses the remove. These
+    tests pin (a) the load-end release empties the lease surface, (b) the
+    write-back then removes+puts+commits, and (c) the unreleased twin fails
+    exactly at stage=remove — removing the handler's release line breaks
+    (a) and therefore (b)."""
+
+    def _drive_batched_load(self, store) -> None:
+        from tests.ut.kv_transfer.test_range_load_batching import (
+            _batched_task,
+            _stub_recv_thread,
+        )
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+            LayerRangeReqMeta,
+        )
+
+        def _meta(layer_id: int) -> LayerRangeReqMeta:
+            return LayerRangeReqMeta(
+                req_ids=["req-B"],
+                layer_id=layer_id,
+                block_ids=[BLOCK_ID],
+                keys=[REGION_KEY],
+                all_buffers=[[1000 + layer_id]],
+                all_sizes=[[256]],
+                all_offsets=[[layer_id * 1024]],
+                load_keys=[],
+            )
+
+        task, build_map = _batched_task({layer: [_meta(layer)] for layer in range(NUM_LAYERS)})
+        thread = _stub_recv_thread(build_map)
+        thread.m_store = store
+        thread._handle_batched_range_layer_task(task)
+
+    def test_load_end_release_lets_the_writeback_remove_pass(self):
+        worker = self._make_worker()
+        store = worker.m_store
+        self._drive_batched_load(store)
+        self.assertEqual(store.leased, set(), "the load-end release must drop every lease it took")
+        worker.record_hole_recovery_region(self._region())
+        patcher, _ = self._no_sleep()
+        with patcher:
+            results = worker.writeback_hole_recovery_regions()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["result"], 0)
+        self.assertEqual(results[0]["stage"], "commit")
+        self.assertIn(REGION_KEY, store.complete)
+        self.assertIn("batch_remove_lease", store.call_names())
+
+    def test_unreleased_lease_blocks_the_writeback_remove(self):
+        """The B35 live-signature twin: a lease the load never released
+        fails the remove with -706 at stage=remove — the loud, GT-safe
+        degradation (the original object stays; no put is attempted)."""
+        worker = self._make_worker()
+        store = worker.m_store
+        store.leased.add(REGION_KEY)
+        worker.record_hole_recovery_region(self._region())
+        patcher, _ = self._no_sleep()
+        with patcher:
+            results = worker.writeback_hole_recovery_regions()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["result"], -706)
+        self.assertEqual(results[0]["stage"], "remove")
+        self.assertNotIn("batch_put_start", store.call_names())
 
 
 if __name__ == "__main__":

@@ -467,6 +467,20 @@ class MooncakeBackend(Backend):
             raise RuntimeError("Mooncake client does not support batch_get_session_end")
         return int(method(keys))
 
+    def batch_remove_lease(self, keys: list[str]) -> int:
+        """Release the GET-session leases a completed load took (B35).
+
+        The mooncake 0.3.13 client exposes the session-lease release as the
+        GET session end: ``batch_get_session_end`` drops the client-held
+        sessions for these keys (real_client.cpp:6196), after which no
+        further ranged read or lease refresh can ride them — the data is in
+        the local cache, so the load-end release mirrors the legacy per-layer
+        path's ``batch_remove_lease`` (kv_transfer.py, the memcache backend's
+        lease API; the mooncake pybind has no lease-named method). The
+        master-side read lease granted at query time ages out on its own TTL.
+        """
+        return self.batch_get_end(keys)
+
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         self.ensure_initialized()
         assert self.store is not None

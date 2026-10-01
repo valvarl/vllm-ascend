@@ -2311,6 +2311,25 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     self._invalid_block_ids.update(merged_block_ids[index] for index in failed_indices)
             for req_id in final_req_ids:
                 self.set_finished_request(req_id)
+            # B35: the completed load releases the session leases it took.
+            # The batched call has returned and every result is processed —
+            # the data (or the per-key failure) is in the local cache, so the
+            # leases serve no further reader. The failed keys are included
+            # deliberately: the tail-writeback's non-force remove targets
+            # exactly the keys whose load failed, and the master's Remove
+            # requires the lease gone (master_service.cpp IsLeaseExpired).
+            # NOT released on the failure paths where a lease may still be
+            # needed: the abort early-return above (no load was issued) and
+            # the exception path below (the load did not complete; the retry
+            # machinery re-issues it) — mirroring the legacy per-layer path's
+            # final-layer release (batch_remove_lease at its load end).
+            unique_load_keys = list(dict.fromkeys(merged_keys))
+            self.m_store.batch_remove_lease(unique_load_keys)
+            logger.debug(
+                "[KVPOOL] batched load released %d leases after %d layers",
+                len(unique_load_keys),
+                len(layer_ids),
+            )
         except Exception as exc:
             self._fatal_error = exc
             for layer_task in data.layer_tasks:
