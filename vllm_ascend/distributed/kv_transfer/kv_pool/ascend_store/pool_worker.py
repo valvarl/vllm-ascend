@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import importlib
 import math
@@ -141,6 +142,19 @@ HOLEMISS_EIO_TARGET_ENV = "EIO_TARGET_KEY"  # empty/unset == injector off
 # OWN bounds: the F-1-pinned LOAD_LEASE_RETRY_* stay load-path only.
 WRITEBACK_REMOVE_LEASE_WAIT_BUDGET_MS = 120_000
 WRITEBACK_REMOVE_RETRY_INTERVAL_MS = 5_000
+
+# B42: REPLICA_IS_NOT_READY (-703) — the aborted-restore replica class. The
+# consumer's EIO-aborted owner-side restore leaves a non-COMPLETE replica on
+# the armed key (its staging completion is rejected as an illegal client: the
+# key's metadata still belongs to the producer, master_service.cpp PutEnd),
+# and the master's remove gate ``AllReplicas(&Replica::fn_is_completed)``
+# refuses until every replica is complete. The recovery ladder (this
+# constant's consumers): the best-effort client-side session revoke, ONE
+# bounded remove re-attempt, then the upsert takeover — the master's
+# UpsertStart preempts PROCESSING replicas IMMEDIATELY (unlike PutStart,
+# which only preempts after put_start_discard_timeout_sec), so the healed
+# bytes can still land under the armed key.
+WRITEBACK_REMOVE_REPLICA_NOT_READY_RC = -703
 
 
 def _hm_profile() -> str:
@@ -3325,7 +3339,13 @@ class KVPoolWorker:
         tp = self.tp_rank
         try:
             remove_rc = self._holemiss_writeback_remove(key)
-            if remove_rc != 0:
+            if remove_rc == WRITEBACK_REMOVE_REPLICA_NOT_READY_RC:
+                recovery = self._holemiss_writeback_recover_stale_replica(
+                    key, req_id, token_start, token_end, block_id, object_size
+                )
+                if recovery is not None:
+                    return recovery
+            elif remove_rc != 0:
                 logger.info(
                     "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=remove reason=%d",
                     tp,
@@ -3463,6 +3483,270 @@ class KVPoolWorker:
                 rc,
             )
             time.sleep(WRITEBACK_REMOVE_RETRY_INTERVAL_MS / 1000)
+
+    def _holemiss_writeback_recover_stale_replica(
+        self,
+        key: str,
+        req_id: str,
+        token_start: int,
+        token_end: int,
+        block_id: int,
+        object_size: int,
+    ) -> dict | None:
+        """The B42 recovery ladder for REPLICA_IS_NOT_READY (-703).
+
+        The master's remove gate ``AllReplicas(&Replica::fn_is_completed)``
+        refuses the armed key because the consumer's EIO-aborted owner-side
+        restore left a non-COMPLETE replica behind (its staging completion is
+        rejected as an illegal client — the key's metadata still belongs to
+        the producer — so the replica lingers). The ladder: (1) the
+        best-effort client-side put-session revoke (for topologies where the
+        stale session is this client's own — ``batch_put_session_start``
+        refuses a key with an existing session — the revoke clears it and the
+        re-attempt passes); (2) ONE bounded remove re-attempt (not a wait
+        window: -703 is not lease-dependent); (3) the UPSERT takeover — the
+        master's UpsertStart preempts PROCESSING replicas IMMEDIATELY (unlike
+        PutStart, which only preempts after put_start_discard_timeout_sec),
+        so the healed bytes still land under the armed key from a staged host
+        buffer. Every stage is loud; a failed recovery returns the unchanged
+        FAILED(remove) shape (the GT-safe degradation stands). Returns None
+        when the re-attempted remove succeeded (the normal put chain
+        proceeds).
+        """
+        tp = self.tp_rank
+        logger.info(
+            "HOLEMISS_WRITEBACK_REMOVE_STALE tp=%d req=%s key=%s reason=%d",
+            tp,
+            req_id,
+            key,
+            WRITEBACK_REMOVE_REPLICA_NOT_READY_RC,
+        )
+        self._holemiss_writeback_revoke(key)
+        retry_results = require_aligned_batch_results(
+            "batch_remove",
+            [key],
+            self.m_store.batch_remove([key]),
+        )
+        if retry_results[0] == 0:
+            return None
+        staged = self._holemiss_writeback_stage_object_bytes(block_id, object_size)
+        if staged is None:
+            logger.info(
+                "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=remove reason=%d",
+                tp,
+                req_id,
+                key,
+                WRITEBACK_REMOVE_REPLICA_NOT_READY_RC,
+            )
+            return {"key": key, "result": WRITEBACK_REMOVE_REPLICA_NOT_READY_RC, "stage": "remove"}
+        buffer, address, sha = staged
+        try:
+            upsert_results = require_aligned_batch_results(
+                "batch_upsert_from",
+                [key],
+                self.m_store.batch_upsert_from([key], [address], [object_size]),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=upsert reason=%s",
+                tp,
+                req_id,
+                key,
+                str(exc)[:200],
+            )
+            return {"key": key, "result": -1, "stage": "upsert"}
+        if upsert_results[0] != 0:
+            logger.info(
+                "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=upsert reason=%d",
+                tp,
+                req_id,
+                key,
+                upsert_results[0],
+            )
+            return {"key": key, "result": upsert_results[0], "stage": "upsert"}
+        logger.info(
+            "HOLEMISS_WRITEBACK_UPSERT tp=%d req=%s key=%s tokens=%d-%d block=%d bytes=%d sha=%s",
+            tp,
+            req_id,
+            key,
+            token_start,
+            token_end,
+            block_id,
+            object_size,
+            sha,
+        )
+        self._holemiss_writeback_keys[key] = sha
+        return {"key": key, "result": 0, "stage": "upsert", "sha": sha}
+
+    def _holemiss_writeback_stage_object_bytes(self, block_id: int, object_size: int):
+        """Stage one block's group-0 object bytes into a host buffer (B42).
+
+        The same entry walk the sha probe and the ranged copy_put ride (the
+        layout-order concatenation of the healed block's group-0 cache
+        entries), so the upsert writes byte-identical bytes to the put path
+        and the LEG-A sha pair stays valid. Returns
+        ``(buffer, address, sha)`` or None when the walk fails or the staged
+        size disagrees with the object size (never guess the layout).
+        """
+        if block_id < 0:
+            return None
+        try:
+            buffer = ctypes.create_string_buffer(object_size)
+            digest = hashlib.sha256()
+            staged = 0
+            for cache in self._holemiss_group0_cache_entries():
+                chunk = cache[block_id].contiguous().view(torch.uint8).cpu().numpy().tobytes()
+                if staged + len(chunk) > object_size:
+                    return None
+                buffer[staged : staged + len(chunk)] = chunk
+                digest.update(chunk)
+                staged += len(chunk)
+            if staged != object_size:
+                return None
+            return buffer, ctypes.addressof(buffer), digest.hexdigest()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("HOLEMISS writeback staging failed block=%d error=%s", block_id, exc)
+            return None
+
+    def _holemiss_writeback_recover_stale_replica(
+        self,
+        key: str,
+        req_id: str,
+        token_start: int,
+        token_end: int,
+        block_id: int,
+        object_size: int,
+    ) -> dict | None:
+        """B42: the REPLICA_IS_NOT_READY recovery ladder.
+
+        Returns None when the bounded recovery re-opened the normal path
+        (the revoke cleared a writer-owned stale session and the single
+        remove re-attempt succeeded — the caller proceeds with the standard
+        put chain); otherwise the terminal result dict. The ladder: the
+        best-effort client-side session revoke, ONE remove re-attempt (NOT
+        a wait window — -703 is a state gate, not a TTL), then the one-shot
+        upsert takeover for the still-blocked class. Live-pinned context:
+        the aborted restore's staging PutEnd is rejected as Illegal client
+        (the key's metadata.client_id is the gone producer), so on the bench
+        topology the revoke fails, the retry stays -703, and the upsert
+        fallback is the path that lands the healed bytes; the REMOVE_STALE
+        and revoke lines carry the measurement either way.
+        """
+        logger.info(
+            "HOLEMISS_WRITEBACK_REMOVE_STALE tp=%d req=%s key=%s reason=%d",
+            self.tp_rank,
+            req_id,
+            key,
+            WRITEBACK_REMOVE_REPLICA_NOT_READY_RC,
+        )
+        self._holemiss_writeback_revoke(key)
+        results = require_aligned_batch_results(
+            "batch_remove",
+            [key],
+            self.m_store.batch_remove([key]),
+        )
+        retry_rc = results[0]
+        if retry_rc == 0:
+            return None
+        if retry_rc != WRITEBACK_REMOVE_REPLICA_NOT_READY_RC:
+            logger.info(
+                "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=remove reason=%d",
+                self.tp_rank,
+                req_id,
+                key,
+                retry_rc,
+            )
+            return {"key": key, "result": retry_rc, "stage": "remove"}
+        return self._holemiss_writeback_upsert_fallback(key, req_id, token_start, token_end, block_id, object_size)
+
+    def _holemiss_writeback_stage_object_bytes(self, block_id: int) -> tuple[ctypes.Array, int] | None:
+        """Stage one block's group-0 object bytes into a host buffer (B42).
+
+        The same entry walk the sha probe and the ranged copy_put ride (the
+        LEG-A byte-exact layout order), gathered into ONE contiguous buffer
+        for the one-shot upsert fallback. Per-entry D2H copies only run
+        under the write-back env gate.
+        """
+        if block_id < 0:
+            return None
+        try:
+            payload = bytearray()
+            for cache in self._holemiss_group0_cache_entries():
+                block = cache[block_id]
+                payload += block.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+            buffer = (ctypes.c_ubyte * len(payload)).from_buffer(payload)
+            return buffer, len(payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("HOLEMISS writeback staging failed block=%d error=%s", block_id, exc)
+            return None
+
+    def _holemiss_writeback_upsert_fallback(
+        self,
+        key: str,
+        req_id: str,
+        token_start: int,
+        token_end: int,
+        block_id: int,
+        object_size: int,
+    ) -> dict:
+        """B42: land the healed bytes via the one-shot upsert takeover.
+
+        The master's UpsertStart PREEMPTS a lingering PROCESSING replica
+        immediately (unlike PutStart, which only reclaims past the discard
+        timeout and only when no complete replica exists) — the only
+        client-reachable takeover for the aborted-restore replica class.
+        The healed object bytes stage host-side (the LEG-A layout walk) and
+        land in one call; the ranged put chain stays the primary path (this
+        fallback only runs after the remove failed -703 through the
+        revoke-and-retry). Loud best-effort: every failure returns the
+        FAILED marker with stage=upsert, never raises.
+        """
+        staged = self._holemiss_writeback_stage_object_bytes(block_id)
+        if staged is None or staged[1] != object_size:
+            logger.info(
+                "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=upsert reason=staging",
+                self.tp_rank,
+                req_id,
+                key,
+            )
+            return {"key": key, "result": -1, "stage": "upsert"}
+        buffer, size = staged
+        try:
+            results = self.m_store.batch_upsert_from([key], [ctypes.addressof(buffer)], [size])
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=upsert reason=%s",
+                self.tp_rank,
+                req_id,
+                key,
+                str(exc)[:200],
+            )
+            return {"key": key, "result": -1, "stage": "upsert"}
+        rc = results[0]
+        if rc != 0:
+            logger.info(
+                "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=upsert reason=%d",
+                self.tp_rank,
+                req_id,
+                key,
+                rc,
+            )
+            return {"key": key, "result": rc, "stage": "upsert"}
+        sha = self.holemiss_writeback_object_sha(block_id)
+        logger.info(
+            "HOLEMISS_WRITEBACK_UPSERT tp=%d req=%s key=%s tokens=%d-%d block=%d bytes=%d sha=%s",
+            self.tp_rank,
+            req_id,
+            key,
+            token_start,
+            token_end,
+            block_id,
+            size,
+            sha or "none",
+        )
+        if sha is not None:
+            self._holemiss_writeback_keys[key] = sha
+        return {"key": key, "result": 0, "stage": "upsert", "sha": sha}
 
     def _holemiss_writeback_copy_put(
         self,

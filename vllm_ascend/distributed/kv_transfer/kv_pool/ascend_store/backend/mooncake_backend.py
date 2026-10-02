@@ -439,6 +439,30 @@ class MooncakeBackend(Backend):
     def batch_revoke(self, keys: list[str]) -> list[int]:
         return self._call_layerwise_batch("batch_put_session_revoke", keys, keys)
 
+    def batch_upsert_from(self, keys: list[str], buffer_ptrs: list[int], sizes: list[int]) -> list[int]:
+        """One-shot upsert from staged host buffers (store_py.cpp pybind
+        ``batch_upsert_from``) — the B42 stale-replica takeover.
+
+        The master's UpsertStart preempts PROCESSING replicas IMMEDIATELY
+        (unlike PutStart, which only preempts after the discard timeout), so
+        this is the only client-side primitive that can replace an object
+        blocked by an aborted restore's lingering non-complete replica. The
+        replicate config reuses the session-put builder (the B21
+        preferred_segment pin: the Case-A allocation lands in this client's
+        own registered segment).
+        """
+        self.ensure_initialized()
+        if self.store is None:
+            raise RuntimeError("Mooncake store is unavailable for batch_upsert_from")
+        method = getattr(self.store, "batch_upsert_from", None)
+        if not callable(method):
+            raise RuntimeError("Mooncake client does not support batch_upsert_from")
+        return require_aligned_batch_results(
+            "batch_upsert_from",
+            keys,
+            method(keys, buffer_ptrs, sizes, self._build_replicate_config()),
+        )
+
     def batch_get_start(self, keys: list[str]) -> list[int]:
         return self._call_layerwise_batch("batch_get_session_start", keys, keys)
 

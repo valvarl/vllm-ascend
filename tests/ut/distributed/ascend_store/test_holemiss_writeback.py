@@ -82,8 +82,10 @@ class WritebackStore:
         self.complete: set[str] = set()
         self.open_puts: set[str] = set()
         self.lease_failures: dict[str, int] = {}
+        self.stale_replica_failures: dict[str, int] = {}
         self.copy_put_failures: dict[str, int] = {}
         self.calls: list[tuple] = []
+        self.upserts: list[tuple] = []
         self.lock = threading.Lock()
         self.leased: set[str] = set()
 
@@ -120,8 +122,25 @@ class WritebackStore:
                 self.lease_failures[key] -= 1
                 results.append(-706)
                 continue
+            if self.stale_replica_failures.get(key, 0) > 0:
+                self.stale_replica_failures[key] -= 1
+                results.append(-703)
+                continue
             self.objects.pop(key, None)
             self.complete.discard(key)
+            results.append(0)
+        return results
+
+    def batch_upsert_from(self, keys, buffer_ptrs, sizes, config=None):
+        """The B42 one-shot upsert seam: lands the staged host buffer bytes
+        under the key (the master's UpsertStart preempts the stale PROCESSING
+        replica — modeled here as an unconditional replace)."""
+        self.calls.append(("batch_upsert_from", tuple(keys)))
+        self.upserts.append((tuple(keys), tuple(sizes)))
+        results = []
+        for key, ptr, size in zip(keys, buffer_ptrs, sizes, strict=True):
+            self.objects[key] = bytearray(ctypes.string_at(ptr, size))
+            self.complete.add(key)
             results.append(0)
         return results
 
@@ -554,6 +573,95 @@ class TestWritebackExecutor(WritebackTestBase):
         self.assertEqual(slept, [])
         self.assertEqual([line for line in logs.output if "HOLEMISS_WRITEBACK_REMOVE_RETRY" in line], [])
         self.assertTrue(any("HOLEMISS_WRITEBACK_FAILED" in line and "reason=-707" in line for line in logs.output))
+
+    def test_remove_703_upsert_recovery_lands_healed_bytes(self):
+        """B42: the aborted-restore replica class. The remove fails -703
+        (REPLICA_IS_NOT_READY — returned immediately by the B37 wait, which
+        only loops on -706); the recovery ladder revokes the stale session,
+        retries the remove ONCE, and — still blocked — lands the healed bytes
+        via the one-shot upsert (the master's UpsertStart preempts the stale
+        PROCESSING replica). The staged bytes are byte-identical to the put
+        path's object (the LEG-A layout walk)."""
+        worker = self._make_worker()
+        worker.m_store.stale_replica_failures[REGION_KEY] = 99
+        worker.record_hole_recovery_region(self._region())
+        patcher, _ = self._no_sleep()
+        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
+            results = worker.writeback_hole_recovery_regions()
+        store = worker.m_store
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["result"], 0)
+        self.assertEqual(results[0]["stage"], "upsert")
+        # The ladder: remove (-703) -> revoke -> remove (-703) -> upsert.
+        self.assertEqual(store.call_names().count("batch_remove"), 2)
+        self.assertEqual(store.call_names().count("batch_revoke"), 1)
+        self.assertEqual(store.call_names().count("batch_upsert_from"), 1)
+        self.assertNotIn("batch_put_start", store.call_names())
+        self.assertNotIn("batch_copy_put", store.call_names())
+        # The landed bytes are the healed block's object bytes (byte-exact).
+        expected = _expected_object_bytes(worker.kv_caches, BLOCK_ID)
+        self.assertEqual(bytes(store.objects[REGION_KEY]), expected)
+        self.assertEqual(worker._holemiss_writeback_keys[REGION_KEY], hashlib.sha256(expected).hexdigest())
+        self.assertTrue(any("HOLEMISS_WRITEBACK_REMOVE_STALE" in line for line in logs.output))
+        self.assertTrue(any("HOLEMISS_WRITEBACK_UPSERT" in line for line in logs.output))
+
+    def test_remove_703_retry_recovery_reopens_the_normal_chain(self):
+        """B42: when the revoke clears a writer-owned stale session and the
+        single re-attempt succeeds, the recovery returns None and the
+        standard put chain proceeds (put_start -> copy_put -> commit)."""
+        worker = self._make_worker()
+        worker.m_store.stale_replica_failures[REGION_KEY] = 1
+        worker.record_hole_recovery_region(self._region())
+        patcher, _ = self._no_sleep()
+        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
+            results = worker.writeback_hole_recovery_regions()
+        store = worker.m_store
+        self.assertEqual(results[0]["result"], 0)
+        self.assertEqual(results[0]["stage"], "commit")
+        self.assertEqual(store.call_names().count("batch_remove"), 2)
+        self.assertEqual(store.call_names().count("batch_revoke"), 1)
+        self.assertEqual(store.call_names().count("batch_upsert_from"), 0)
+        self.assertEqual(store.call_names().count("batch_put_start"), 1)
+        self.assertEqual(store.call_names().count("batch_commit"), 1)
+        self.assertTrue(any("HOLEMISS_WRITEBACK_REMOVE_STALE" in line for line in logs.output))
+
+    def test_remove_703_upsert_failure_is_loud(self):
+        worker = self._make_worker()
+        worker.m_store.stale_replica_failures[REGION_KEY] = 99
+        worker.m_store.batch_upsert_from = lambda keys, ptrs, sizes, config=None: [-1] * len(keys)
+        worker.record_hole_recovery_region(self._region())
+        patcher, _ = self._no_sleep()
+        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
+            results = worker.writeback_hole_recovery_regions()
+        self.assertEqual(results, [{"key": REGION_KEY, "result": -1, "stage": "upsert"}])
+        self.assertTrue(any("HOLEMISS_WRITEBACK_FAILED" in line and "stage=upsert" in line for line in logs.output))
+
+    def test_remove_703_upsert_exception_is_loud(self):
+        def _boom(keys, ptrs, sizes, config=None):
+            raise RuntimeError("upsert exploded")
+
+        worker = self._make_worker()
+        worker.m_store.stale_replica_failures[REGION_KEY] = 99
+        worker.m_store.batch_upsert_from = _boom
+        worker.record_hole_recovery_region(self._region())
+        patcher, _ = self._no_sleep()
+        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
+            results = worker.writeback_hole_recovery_regions()
+        self.assertEqual(results, [{"key": REGION_KEY, "result": -1, "stage": "upsert"}])
+        self.assertTrue(any("stage=upsert" in line and "upsert exploded" in line for line in logs.output))
+
+    def test_remove_703_staging_shortfall_fails_loud_at_remove(self):
+        """A staging failure (or a size disagreement) fails loud at the
+        upsert stage — never a guessed layout, never a silent skip."""
+        worker = self._make_worker()
+        worker.m_store.stale_replica_failures[REGION_KEY] = 99
+        worker._holemiss_writeback_stage_object_bytes = lambda block_id: None
+        worker.record_hole_recovery_region(self._region())
+        patcher, _ = self._no_sleep()
+        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
+            results = worker.writeback_hole_recovery_regions()
+        self.assertEqual(results, [{"key": REGION_KEY, "result": -1, "stage": "upsert"}])
+        self.assertTrue(any("stage=upsert" in line and "reason=staging" in line for line in logs.output))
 
     def test_transient_copy_put_failure_retries_once(self):
         worker = self._make_worker()
