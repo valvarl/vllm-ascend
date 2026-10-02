@@ -366,33 +366,6 @@ def _prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> di
             # B41: the exact-end hit's GROUP-0 partial tail block (T18) — the
             # load-side mirror of the B39 save key. The scheduler claimed the
             # boundary (kvpool_cached = boundary - 1); without this fetch the
-            # claimed tokens ride ZEROED pool pages (the zero-tail hazard:
-            # 9471 cached with only 9216 fetched). The tail slot extends the
-            # populated key range, so the block-key load path (the
-            # populated-slots range + the key-major shared zip) fetches the
-            # tail block as a standard block row under the tail key — the
-            # same key the scheduler's probe hit. The full-block load mask is
-            # deliberately NOT consulted: the tail block rides outside the
-            # full-block masks (the B38 at-or-beyond-length law; selected()
-            # would reject a beyond-mask index). Groups 1-3 never fetch a
-            # tail artifact (the T18 law).
-            tail_entry = worker._make_layerwise_tail_load_key(request, group)
-            if tail_entry is not None:
-                tail_key, tail_index = tail_entry
-                if tail_index >= len(view.load_block_keys):
-                    view.load_block_keys.extend([None] * (tail_index + 1 - len(view.load_block_keys)))
-                view.load_block_keys[tail_index] = tail_key
-                get_slots.append((view, tail_key, ids[tail_index], tail_index))
-                logger.info(
-                    "HOLEMISS_TAIL_KEY_LOAD tp=%d req=%s boundary=%d tail_block=%d",
-                    getattr(worker, "tp_rank", 0),
-                    request.req_id,
-                    request.load_spec.tail_boundary_tokens,
-                    tail_index,
-                )
-            # B41: the exact-end hit's GROUP-0 partial tail block (T18) — the
-            # load-side mirror of the B39 save key. The scheduler claimed the
-            # boundary (kvpool_cached = boundary - 1); without this fetch the
             # claimed tokens ride ZEROED pool pages (the zero-tail hazard).
             # The tail slot extends the populated range, so the block-key load
             # path (the populated-slots range + the key-major shared zip)

@@ -579,7 +579,8 @@ class TestHybridTailLoadFetch(unittest.TestCase):
         self.assertTrue(all(view0.load_block_keys[i] is not None for i in range(7)))
         # The get session opened for the tail key.
         self.assertIn(tail[0], [key for keys in store.get_starts for key in keys])
-        self.assertTrue(any("HOLEMISS_TAIL_KEY_LOAD" in line for line in logs.output))
+        marker_lines = [line for line in logs.output if "HOLEMISS_TAIL_KEY_LOAD" in line]
+        self.assertEqual(len(marker_lines), 1)
 
     def test_tail_load_key_equals_the_save_key(self):
         """The mirror pin: the load fetches byte-exactly the key the B39 save
