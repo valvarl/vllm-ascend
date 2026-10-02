@@ -61,6 +61,17 @@ BLOCK_ID = 7
 ENTRY_BYTES = BLOCK_SIZE * HEADS * HEAD_DIM * 4
 OBJECT_SIZE = NUM_LAYERS * 2 * ENTRY_BYTES
 REGION_KEY = "testmodel@abcd1234@0"
+# The master's store-side handle-selection failure as the pybind surfaces it
+# (mooncake-store include/types.h: NO_AVAILABLE_HANDLE = -200; the emitting
+# site for this class is client_service.cpp's HasExpectedReplicaAllocation
+# check inside StartBatchUpsert — the store namespace, never the TE one).
+STORE_NO_AVAILABLE_HANDLE_RC = -200
+# REPLICA_IS_NOT_READY (types.h): what a reader observes on a key whose only
+# replica is stuck PROCESSING — the degraded state the removed upsert could
+# leave behind (Case B marks the LOCAL_DISK survivor COMPLETE->PROCESSING and
+# the failure path's UpsertRevoke(ALL) -> PutRevoke covers memory/NOF/DFS
+# only, so nothing ever marks it back).
+STORE_REPLICA_IS_NOT_READY_RC = -703
 
 HOLEMISS_ENVS = [
     "HOLEMISS_KV_WRITEBACK",
@@ -88,6 +99,8 @@ class WritebackStore:
         self.upserts: list[tuple] = []
         self.lock = threading.Lock()
         self.leased: set[str] = set()
+        self.local_disk_complete: set[str] = set()
+        self.local_disk_processing: set[str] = set()
 
     def _read(self, address: int, size: int) -> bytes:
         for start, length in self.regions:
@@ -98,10 +111,18 @@ class WritebackStore:
     def batch_copy_get(self, keys, all_buffers, all_sizes, all_offsets):
         """The load-side ranged read (B35's lease model): the session get
         takes a lease on every key it reads — the master grants the read
-        lease at query time (GetReplicaList/ExistKey)."""
+        lease at query time (GetReplicaList/ExistKey). A key whose only
+        replica is stuck PROCESSING reads REPLICA_IS_NOT_READY (the state
+        the removed upsert's Case-B hazard could leave behind)."""
         self.calls.append(("batch_copy_get", tuple(keys)))
         self.leased.update(keys)
-        return [0] * len(keys)
+        results = []
+        for key in keys:
+            if key in self.local_disk_processing:
+                results.append(STORE_REPLICA_IS_NOT_READY_RC)
+            else:
+                results.append(0)
+        return results
 
     def batch_remove_lease(self, keys):
         """The load-end lease release (B35): the completed load drops the
@@ -132,16 +153,35 @@ class WritebackStore:
         return results
 
     def batch_upsert_from(self, keys, buffer_ptrs, sizes, config=None):
-        """The B42 one-shot upsert seam: lands the staged host buffer bytes
-        under the key (the master's UpsertStart preempts the stale PROCESSING
-        replica — modeled here as an unconditional replace)."""
+        """The Case-B-faithful upsert seam — the master's dispatch, modeled
+        from the Mooncake source at eeb1ce39 (closing the N11 gap: the
+        pre-B42 fake modeled the takeover as an unconditional replace, which
+        is exactly what the master refuses to do).
+
+        The W2R2C topology: the armed key carries a COMPLETE adopted
+        LOCAL_DISK bucket replica + a stale non-complete replica. The
+        master's UpsertStart preempts the stale replica immediately, but the
+        COMPLETE LOCAL_DISK survivor forces Case B (master_service.cpp
+        UpsertStart, the same-size in-place branch): it marks the survivor
+        COMPLETE->PROCESSING, takes over metadata.client_id, and returns the
+        existing LOCAL_DISK-only descriptors. The client's allocation check
+        (client_service.cpp HasExpectedReplicaAllocation, reached via
+        RecordAllocatedReplicas which counts only memory/NOF/DFS) then fails
+        NO_AVAILABLE_HANDLE before any transfer — every ReplicateConfig
+        branch demands a nonzero memory/NOF/DFS allocation — and the failure
+        path's UpsertRevoke(ALL) -> PutRevoke covers only memory/NOF/DFS,
+        leaving the LOCAL_DISK replica stuck PROCESSING (the key unreadable
+        until an UpsertEnd that never comes).
+        """
         self.calls.append(("batch_upsert_from", tuple(keys)))
-        self.upserts.append((tuple(keys), tuple(sizes)))
         results = []
-        for key, ptr, size in zip(keys, buffer_ptrs, sizes, strict=True):
-            self.objects[key] = bytearray(ctypes.string_at(ptr, size))
-            self.complete.add(key)
-            results.append(0)
+        for key in keys:
+            if key in self.local_disk_complete:
+                self.local_disk_processing.add(key)
+                results.append(STORE_NO_AVAILABLE_HANDLE_RC)
+            else:
+                self.upserts.append((tuple(keys), tuple(sizes)))
+                results.append(0)
         return results
 
     def batch_put_start(self, keys, sizes):
@@ -574,36 +614,62 @@ class TestWritebackExecutor(WritebackTestBase):
         self.assertEqual([line for line in logs.output if "HOLEMISS_WRITEBACK_REMOVE_RETRY" in line], [])
         self.assertTrue(any("HOLEMISS_WRITEBACK_FAILED" in line and "reason=-707" in line for line in logs.output))
 
-    def test_remove_703_upsert_recovery_lands_healed_bytes(self):
-        """B42: the aborted-restore replica class. The remove fails -703
-        (REPLICA_IS_NOT_READY — returned immediately by the B37 wait, which
-        only loops on -706); the recovery ladder revokes the stale session,
-        retries the remove ONCE, and — still blocked — lands the healed bytes
-        via the one-shot upsert (the master's UpsertStart preempts the stale
-        PROCESSING replica). The staged bytes are byte-identical to the put
-        path's object (the LEG-A layout walk)."""
+    def test_remove_703_honest_degradation_never_upserts(self):
+        """B42 (the honest degradation): the remove fails -703 through the
+        B37 wait (which only loops on -706), the recovery ladder revokes and
+        retries the remove ONCE, and — still blocked — returns the LOUD
+        FAILED. THE SAFETY INVARIANT: on the live topology (the armed key
+        carrying a COMPLETE adopted LOCAL_DISK bucket replica — modeled by
+        local_disk_complete) the store client NEVER receives an upsert call:
+        the master's UpsertStart would force Case B, the client-side
+        allocation check would fail NO_AVAILABLE_HANDLE before any transfer,
+        and the failure path would leave the LOCAL_DISK replica stuck
+        PROCESSING — degrading a readable key to unreadable. A loud FAILED is
+        recoverable; an unreadable key is not."""
         worker = self._make_worker()
         worker.m_store.stale_replica_failures[REGION_KEY] = 99
+        worker.m_store.local_disk_complete = {REGION_KEY}
         worker.record_hole_recovery_region(self._region())
         patcher, _ = self._no_sleep()
         with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
             results = worker.writeback_hole_recovery_regions()
         store = worker.m_store
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["result"], 0)
-        self.assertEqual(results[0]["stage"], "upsert")
-        # The ladder: remove (-703) -> revoke -> remove (-703) -> upsert.
+        # The ladder: remove (-703) -> revoke -> remove (-703) -> FAILED.
+        self.assertEqual(results, [{"key": REGION_KEY, "result": -703, "stage": "remove"}])
         self.assertEqual(store.call_names().count("batch_remove"), 2)
         self.assertEqual(store.call_names().count("batch_revoke"), 1)
-        self.assertEqual(store.call_names().count("batch_upsert_from"), 1)
+        self.assertNotIn("batch_upsert_from", store.call_names())
         self.assertNotIn("batch_put_start", store.call_names())
         self.assertNotIn("batch_copy_put", store.call_names())
-        # The landed bytes are the healed block's object bytes (byte-exact).
-        expected = _expected_object_bytes(worker.kv_caches, BLOCK_ID)
-        self.assertEqual(bytes(store.objects[REGION_KEY]), expected)
-        self.assertEqual(worker._holemiss_writeback_keys[REGION_KEY], hashlib.sha256(expected).hexdigest())
         self.assertTrue(any("HOLEMISS_WRITEBACK_REMOVE_STALE" in line for line in logs.output))
-        self.assertTrue(any("HOLEMISS_WRITEBACK_UPSERT" in line for line in logs.output))
+        self.assertTrue(any("HOLEMISS_WRITEBACK_FAILED" in line and "reason=-703" in line for line in logs.output))
+        # The store is NOT degraded: the key's LOCAL_DISK replica was never
+        # marked PROCESSING and the key stays readable.
+        self.assertEqual(store.local_disk_processing, set())
+        self.assertEqual(store.batch_copy_get([REGION_KEY], [], [], []), [0])
+
+    def test_upsert_on_local_disk_topology_cannot_land_and_degrades_the_store(self):
+        """The Case-B hazard, modeled from the master source (N11 closed):
+        IF any code path drove an upsert on the W2R2C topology (a COMPLETE
+        adopted LOCAL_DISK replica + a stale non-complete one), the master's
+        UpsertStart dispatch would mark the LOCAL_DISK survivor
+        COMPLETE->PROCESSING and return a LOCAL_DISK-only descriptor set; the
+        client's HasExpectedReplicaAllocation check counts only
+        memory/NOF/DFS (client_service.cpp RecordAllocatedReplicas) and
+        demands a nonzero memory allocation for every nof=0/dfs=0 config
+        (regardless of replica_num), so the call resolves NO_AVAILABLE_HANDLE
+        before any transfer — and the failure path's UpsertRevoke(ALL) ->
+        PutRevoke covers only memory/NOF/DFS, leaving the survivor stuck
+        PROCESSING. This test pins WHY the ladder must never issue the call;
+        M-B42 (re-introducing the upsert into the ladder) makes the
+        honest-degradation test above fail on exactly this model."""
+        worker = self._make_worker()
+        store = worker.m_store
+        store.local_disk_complete = {REGION_KEY}
+        results = store.batch_upsert_from([REGION_KEY], [], [])
+        self.assertEqual(results, [STORE_NO_AVAILABLE_HANDLE_RC])
+        self.assertEqual(store.local_disk_processing, {REGION_KEY})
+        self.assertEqual(store.batch_copy_get([REGION_KEY], [], [], []), [STORE_REPLICA_IS_NOT_READY_RC])
 
     def test_remove_703_retry_recovery_reopens_the_normal_chain(self):
         """B42: when the revoke clears a writer-owned stale session and the
@@ -620,48 +686,10 @@ class TestWritebackExecutor(WritebackTestBase):
         self.assertEqual(results[0]["stage"], "commit")
         self.assertEqual(store.call_names().count("batch_remove"), 2)
         self.assertEqual(store.call_names().count("batch_revoke"), 1)
-        self.assertEqual(store.call_names().count("batch_upsert_from"), 0)
+        self.assertNotIn("batch_upsert_from", store.call_names())
         self.assertEqual(store.call_names().count("batch_put_start"), 1)
         self.assertEqual(store.call_names().count("batch_commit"), 1)
         self.assertTrue(any("HOLEMISS_WRITEBACK_REMOVE_STALE" in line for line in logs.output))
-
-    def test_remove_703_upsert_failure_is_loud(self):
-        worker = self._make_worker()
-        worker.m_store.stale_replica_failures[REGION_KEY] = 99
-        worker.m_store.batch_upsert_from = lambda keys, ptrs, sizes, config=None: [-1] * len(keys)
-        worker.record_hole_recovery_region(self._region())
-        patcher, _ = self._no_sleep()
-        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
-            results = worker.writeback_hole_recovery_regions()
-        self.assertEqual(results, [{"key": REGION_KEY, "result": -1, "stage": "upsert"}])
-        self.assertTrue(any("HOLEMISS_WRITEBACK_FAILED" in line and "stage=upsert" in line for line in logs.output))
-
-    def test_remove_703_upsert_exception_is_loud(self):
-        def _boom(keys, ptrs, sizes, config=None):
-            raise RuntimeError("upsert exploded")
-
-        worker = self._make_worker()
-        worker.m_store.stale_replica_failures[REGION_KEY] = 99
-        worker.m_store.batch_upsert_from = _boom
-        worker.record_hole_recovery_region(self._region())
-        patcher, _ = self._no_sleep()
-        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
-            results = worker.writeback_hole_recovery_regions()
-        self.assertEqual(results, [{"key": REGION_KEY, "result": -1, "stage": "upsert"}])
-        self.assertTrue(any("stage=upsert" in line and "upsert exploded" in line for line in logs.output))
-
-    def test_remove_703_staging_shortfall_fails_loud_at_remove(self):
-        """A staging failure (or a size disagreement) fails loud at the
-        upsert stage — never a guessed layout, never a silent skip."""
-        worker = self._make_worker()
-        worker.m_store.stale_replica_failures[REGION_KEY] = 99
-        worker._holemiss_writeback_stage_object_bytes = lambda block_id: None
-        worker.record_hole_recovery_region(self._region())
-        patcher, _ = self._no_sleep()
-        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
-            results = worker.writeback_hole_recovery_regions()
-        self.assertEqual(results, [{"key": REGION_KEY, "result": -1, "stage": "upsert"}])
-        self.assertTrue(any("stage=upsert" in line and "reason=staging" in line for line in logs.output))
 
     def test_transient_copy_put_failure_retries_once(self):
         worker = self._make_worker()
