@@ -865,6 +865,7 @@ class KVPoolWorker:
                     put_started_keys=self._put_started_keys,
                     put_started_keys_lock=self._put_started_keys_lock,
                     session_tracker=self._layerwise_session_tracker if self.use_block_key_layerwise else None,
+                    worker=self,
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()

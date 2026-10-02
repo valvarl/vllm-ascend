@@ -28,9 +28,11 @@ floor-aligned boundary instead.
 """
 
 import hashlib
+import inspect
 import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 from vllm.logger import logger as vllm_logger
@@ -52,6 +54,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     LayerRangeReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    ChunkedTokenDatabase,
+    KeyMetadata,
     LoadSpec,
     ReqMeta,
 )
@@ -859,6 +863,79 @@ class TestHybridTailContentProbe(unittest.TestCase):
         worker = self._probe_worker(self._fa_caches())
         with self.assertNoLogs(vllm_logger, level="INFO"):
             worker.holemiss_tail_save_content_sha("model@x@group:0@block:1536@sub_tail_9999@0", 3)
+
+
+class TestTailSaveProbeWiring(unittest.TestCase):
+    """The B43 follow-up: the save-side probe's worker wiring. The W2R2C
+    live run proved the gap — the side=save marker never emitted because the
+    block-key sending thread was constructed WITHOUT a worker reference (the
+    base class defaults worker=None, so _probe_tail_save_content silently
+    no-ops); the earlier UTs attached a fake worker to a __new__ thread stub
+    so the suite could not catch it. These tests exercise the REAL binding
+    surfaces: the constructor accepts-and-stores the worker, and the
+    construction site (KVPoolWorker._start_kv_transfer_threads) passes
+    worker=self."""
+
+    @staticmethod
+    def _token_database():
+        database = ChunkedTokenDatabase([KeyMetadata("model", 0, 0, 0)], [16], None)
+        database.set_group_buffers(
+            {0: [1000, 2000, 3000]},
+            {0: [10, 20, 30]},
+            {0: [100, 200, 300]},
+            group_num_layers={0: 2},
+            group_layer_cache_entry_offsets={0: [0, 2, 3]},
+        )
+        return database
+
+    def test_real_construction_binds_the_worker(self):
+        """The REAL thread class (not a __new__ stub): the constructor binds
+        the passed worker, and the bound worker carries the probe end-to-end
+        — a registered tail key reached through the thread's probe hook
+        emits the save-side marker."""
+        worker = TestHybridTailContentProbe()._probe_worker(
+            TestHybridTailContentProbe()._fa_caches(populate_block=TestHybridTailContentProbe.SAVE_BLOCK)
+        )
+        key, _ = TestHybridTailContentProbe()._tail_key(worker)
+        thread = KVCacheStoreLayerSendingThread(
+            m_store=None,
+            token_database=self._token_database(),
+            block_size=16,
+            tp_rank=0,
+            tp_size=1,
+            dcp_size=1,
+            page_size_bytes=60,
+            ready_event=threading.Event(),
+            num_layers=2,
+            layer_save_finished_events=[threading.Event(), threading.Event()],
+            sync_save_events=[MagicMock(), MagicMock()],
+            worker=worker,
+        )
+        self.assertIs(thread.worker, worker)
+        req_meta = LayerRangeReqMeta(
+            req_ids=["req-tail"],
+            layer_id=3,
+            block_ids=[TestHybridTailContentProbe.SAVE_BLOCK],
+            keys=[key],
+            all_buffers=[[0]],
+            all_sizes=[[1]],
+            all_offsets=[[0]],
+        )
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            thread._probe_tail_save_content(req_meta)
+        marker_lines = [line for line in logs.output if "HOLEMISS_TAIL_CONTENT_SHA" in line]
+        self.assertEqual(len(marker_lines), 1)
+        self.assertIn("side=save", marker_lines[0])
+
+    def test_construction_site_passes_worker_self(self):
+        """The source pin (the inspect.getsource precedent): the block-key
+        sending thread's construction inside KVPoolWorker's thread start
+        passes worker=self — the exact omission the W2R2C run exposed."""
+        source = inspect.getsource(KVPoolWorker._start_kv_transfer_threads)
+        start = source.index("KVCacheStoreLayerSendingThread(")
+        end = source.index("self.kv_send_thread.start()", start)
+        construction_block = source[start:end]
+        self.assertIn("worker=self", construction_block)
 
 
 if __name__ == "__main__":

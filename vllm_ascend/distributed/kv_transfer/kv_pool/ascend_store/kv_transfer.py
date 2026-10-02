@@ -1701,6 +1701,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         put_started_keys: set[str] | None = None,
         put_started_keys_lock: threading.Lock | None = None,
         session_tracker: LayerwiseSessionTracker | None = None,
+        worker: Any = None,
     ):
         super().__init__(
             m_store,
@@ -1724,6 +1725,10 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self._active_put_keys: set[str] | None = None
         self._group_put_keys: dict[int, set[str] | None] = {}
         self.group_builders: list[LayerBatchBuilder] | None = group_builders
+        # The worker reference carries the B43 save-side content probe (and
+        # the HR region hand-off): the sibling recving thread binds it the
+        # same way at its construction site.
+        self.worker = worker
         if group_builders is not None:
             self.layer_batch_builder = group_builders[0]
         else:
