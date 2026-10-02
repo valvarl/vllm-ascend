@@ -3648,43 +3648,66 @@ class KVPoolWorker:
                 entries.extend(self._as_cache_tuple(self.kv_caches[layer_name]))
         return entries
 
+    def _holemiss_group0_page_view(self, cache: torch.Tensor, block_id: int) -> torch.Tensor:
+        """One POOL page's cache rows, addressed by the pool block id.
+
+        The dual-block-space law (B13): the pool allocates 1536-token pages
+        while the kernel-granularity caches carry one 128-token row per
+        kernel block — a hybrid page spans ``scale = cache.shape[0] //
+        num_blocks`` consecutive rows, so indexing the cache by the pool
+        block id reads the WRONG rows (page 0's kernel blocks). Text models
+        have scale == 1 (the page IS the kernel row) and stay byte-identical.
+        """
+        num_blocks = getattr(self, "num_blocks", 0) or 0
+        if num_blocks <= 0 or cache.shape[0] <= num_blocks:
+            return cache[block_id]
+        scale = cache.shape[0] // num_blocks
+        if scale <= 1:
+            return cache[block_id]
+        return cache[block_id * scale : (block_id + 1) * scale]
+
     def holemiss_writeback_object_sha(self, block_id: int) -> str | None:
         """sha256 over one block's group-0 object bytes, in layout order.
 
         The PUT side hashes the healed device bytes after its copy_put; the
         load side re-walks the same entries after the next GET lands them,
         so the pair is a byte-exact round-trip probe (LEG A). Per-entry D2H
-        copies only run under the write-back env gate.
+        copies only run under the write-back env gate. The walk addresses
+        the POOL page (all its kernel rows) — the same bytes the ranged
+        copy_put carries for the block.
         """
         if block_id < 0:
             return None
         try:
             digest = hashlib.sha256()
             for cache in self._holemiss_group0_cache_entries():
-                block = cache[block_id]
-                digest.update(block.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+                page = self._holemiss_group0_page_view(cache, block_id)
+                digest.update(page.contiguous().view(torch.uint8).cpu().numpy().tobytes())
             return digest.hexdigest()
         except Exception as exc:  # noqa: BLE001
             logger.error("HOLEMISS writeback sha failed block=%d error=%s", block_id, exc)
             return None
 
     def _holemiss_tail_content_fingerprint(self, block_id: int, tail_tokens: int) -> tuple[str, bool] | None:
-        """The whole-block sha plus the attended-window nonzero flag.
+        """The whole-page sha plus the attended-window nonzero flag.
 
-        The tail block's first ``tail_tokens`` slots are the positions the
-        computation attends (block-local [0, boundary - floor)); the rest of
-        the block carries allocation zeros by construction. The whole-block
+        The tail page's first ``tail_tokens`` token slots are the positions
+        the computation attends (page-local [0, boundary - floor)); the rest
+        of the page carries allocation zeros by construction. The whole-page
         sha pairs with the save-side marker for the round-trip byte check;
-        the attended-window flag is the zero-class discriminator.
+        the attended-window flag is the zero-class discriminator. Both walk
+        the POOL page (all its kernel rows, token-major) — never the single
+        kernel row the raw block id would index.
         """
         if block_id < 0 or tail_tokens <= 0:
             return None
         digest = hashlib.sha256()
         window_nonzero = False
         for cache in self._holemiss_group0_cache_entries():
-            block = cache[block_id]
-            digest.update(block.contiguous().view(torch.uint8).cpu().numpy().tobytes())
-            window = block[:tail_tokens].contiguous().view(torch.uint8)
+            page = self._holemiss_group0_page_view(cache, block_id)
+            digest.update(page.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+            tokens = page.flatten(0, 1) if page.dim() > 1 else page
+            window = tokens[:tail_tokens].contiguous().view(torch.uint8)
             window_nonzero = window_nonzero or bool(window.cpu().any())
         return digest.hexdigest(), window_nonzero
 

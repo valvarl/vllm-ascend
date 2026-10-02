@@ -669,52 +669,77 @@ class TestHybridTailLoadFetch(unittest.TestCase):
 
 
 class TestHybridTailContentProbe(unittest.TestCase):
-    """B43: the tail content probes pin the zero-class arithmetic exactly.
+    """B43: the tail content probes pin the zero-class arithmetic exactly,
+    against the LIVE kernel-granularity cache layout.
 
-    The W2R2C-A1 live evidence: the fetch mechanics green (the TAIL_KEY_LOAD
-    markers, the 10-key LOAD census, all per-range results full-size) while
-    the T2 sequence stayed BIT-IDENTICAL to the zero-tail run — the bytes
-    the computation attended were zeros. The static derivation cleared the
-    va plumbing on both sides (the save reads and the load writes the SAME
-    block table entry under the SAME full-block segment math), so the
-    remaining discrimination needs the content fingerprints at both ends:
-    ``side=save`` at the drain (what the producer persisted) and
-    ``side=load`` post-drain (what the consumer's pages hold). This class
-    models the LIVE geometry — block 1536, hash block 256, boundary 9472 =
-    9216 + 256, tail block 6, the group-0 object 50331648 = 16 FA layers x
-    3145728 (32 entries x 1572864 = 1536 tokens x 1024 bytes) — so the
-    probes are pinned against the exact live numbers.
+    The W2R2C run's content probes delivered a verdict on falsified
+    instruments (the fourth fake-vs-live gap): the caches are
+    KERNEL-granular — the live boot log shows ``num_blocks: 510`` pages with
+    ``block_shape: [128, 2, 256]`` rows — so ``cache[block_id]`` with a POOL
+    block id reads kernel row ``block_id`` (page 0's content on the hybrid;
+    the load-side ``tail_nonzero=True`` was measured on page 0's kernel
+    block, not the tail page), and the save-side marker never emitted (the
+    sending thread was constructed without a worker reference). This class
+    models the TRUE live geometry — 128-token kernel rows, 12 rows per
+    1536-token pool page, block 1536, hash block 256, boundary 9472 = 9216 +
+    256, tail block 6, the group-0 object 50331648 = 16 FA layers x 3145728
+    (32 entries x 12 rows x 128 tokens x 1024 bytes) — so the probes are
+    pinned against the exact live numbers AND the page addressing.
     """
 
     NUM_FA_LAYERS = 16
     KV_HEADS = 4
     HEAD_DIM = 128
+    KERNEL_BLOCK = 128
+    BPKB = GRANULARITY // KERNEL_BLOCK  # 12 kernel rows per pool page
     TOKEN_BYTES = KV_HEADS * HEAD_DIM * 2  # bf16
-    ENTRY_BLOCK_BYTES = GRANULARITY * TOKEN_BYTES  # 1572864
+    ENTRY_BLOCK_BYTES = GRANULARITY * TOKEN_BYTES  # 1572864 per entry per page
     GROUP0_OBJECT_BYTES = NUM_FA_LAYERS * 2 * ENTRY_BLOCK_BYTES  # 50331648
-    NUM_BLOCKS = 12
+    NUM_BLOCKS = 12  # pool pages
     SAVE_BLOCK = 6
     TAIL_TOKENS = BOUNDARY - FLOOR  # 256
 
-    def _fa_caches(self, populate_block=None, real_from=0):
-        """The group-0 FA caches in the live layout: 16 attention layers at
-        physical indices 3+4k, each a (K, V) pair over 1536-token blocks."""
+    def _fa_caches(self, populate_block=None):
+        """The group-0 FA caches in the TRUE live layout: 16 attention layers
+        at physical indices 3+4k, each a (K, V) pair over 128-token KERNEL
+        rows (12 rows per 1536-token pool page — the dual-block-space law)."""
         caches = {}
         for layer_idx in range(self.NUM_FA_LAYERS):
             physical = 3 + 4 * layer_idx
-            k = torch.zeros(self.NUM_BLOCKS, GRANULARITY, self.KV_HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
-            v = torch.zeros(self.NUM_BLOCKS, GRANULARITY, self.KV_HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
+            k = torch.zeros(
+                self.NUM_BLOCKS * self.BPKB,
+                self.KERNEL_BLOCK,
+                self.KV_HEADS,
+                self.HEAD_DIM,
+                dtype=torch.bfloat16,
+            )
+            v = torch.zeros(
+                self.NUM_BLOCKS * self.BPKB,
+                self.KERNEL_BLOCK,
+                self.KV_HEADS,
+                self.HEAD_DIM,
+                dtype=torch.bfloat16,
+            )
             if populate_block is not None:
                 gen = torch.Generator().manual_seed(physical)
-                k[populate_block, : self.TAIL_TOKENS] = torch.randn(
-                    self.TAIL_TOKENS, self.KV_HEADS, self.HEAD_DIM, generator=gen, dtype=torch.bfloat16
+                row0 = populate_block * self.BPKB
+                rows = -(-self.TAIL_TOKENS // self.KERNEL_BLOCK)  # the attended window's rows
+                k[row0 : row0 + rows] = torch.randn(
+                    rows,
+                    self.KERNEL_BLOCK,
+                    self.KV_HEADS,
+                    self.HEAD_DIM,
+                    generator=gen,
+                    dtype=torch.bfloat16,
                 )
-                v[populate_block, : self.TAIL_TOKENS] = torch.randn(
-                    self.TAIL_TOKENS, self.KV_HEADS, self.HEAD_DIM, generator=gen, dtype=torch.bfloat16
+                v[row0 : row0 + rows] = torch.randn(
+                    rows,
+                    self.KERNEL_BLOCK,
+                    self.KV_HEADS,
+                    self.HEAD_DIM,
+                    generator=gen,
+                    dtype=torch.bfloat16,
                 )
-                if real_from:
-                    k[populate_block, self.TAIL_TOKENS :] = 0
-                    v[populate_block, self.TAIL_TOKENS :] = 0
             caches[f"model.layers.{physical}.self_attn"] = (k, v)
         return caches
 
@@ -732,6 +757,7 @@ class TestHybridTailContentProbe(unittest.TestCase):
         worker.use_hybrid = True
         worker.kv_cache_config = None
         worker.kv_caches = caches
+        worker.num_blocks = self.NUM_BLOCKS
         worker._global_to_local_layer = {}
         worker.grouped_block_size = list(GROUPED_BLOCK_SIZE)
         worker.hash_block_size = HASH_BLOCK_SIZE
@@ -747,20 +773,35 @@ class TestHybridTailContentProbe(unittest.TestCase):
 
     def test_group0_object_bytes_match_the_live_geometry(self):
         """The entry walk covers exactly the live group-0 object: 32 entries
-        (16 layers x K,V) x 1572864 bytes = 50331648 per block."""
+        (16 layers x K,V) x 12 kernel rows x 128 tokens = 50331648 bytes per
+        pool page; the caches carry num_pages * 12 kernel rows."""
         worker = self._probe_worker(self._fa_caches())
         entries = worker._holemiss_group0_cache_entries()
         self.assertEqual(len(entries), self.NUM_FA_LAYERS * 2)
-        per_block = sum(cache[0].numel() * cache.element_size() for cache in entries)
-        self.assertEqual(per_block, self.GROUP0_OBJECT_BYTES)
-        self.assertEqual(entries[0].shape, (self.NUM_BLOCKS, GRANULARITY, self.KV_HEADS, self.HEAD_DIM))
+        per_page = sum(cache[0].numel() * cache.element_size() * self.BPKB for cache in entries)
+        self.assertEqual(per_page, self.GROUP0_OBJECT_BYTES)
+        self.assertEqual(
+            entries[0].shape,
+            (self.NUM_BLOCKS * self.BPKB, self.KERNEL_BLOCK, self.KV_HEADS, self.HEAD_DIM),
+        )
+
+    def test_page_view_addresses_the_pool_page_not_one_kernel_row(self):
+        """The B13 pin: the page view for pool block 6 spans kernel rows
+        [72, 84) — 12 rows — while the raw block id would read kernel row 6
+        (page 0's content, the W2R2C instrument bug)."""
+        worker = self._probe_worker(self._fa_caches())
+        cache = worker._holemiss_group0_cache_entries()[0]
+        page = worker._holemiss_group0_page_view(cache, self.SAVE_BLOCK)
+        self.assertEqual(page.shape[0], self.BPKB)
+        self.assertEqual(page.data_ptr(), cache[self.SAVE_BLOCK * self.BPKB].data_ptr())
 
     def test_save_probe_emits_the_attended_window_fingerprint(self):
-        """The save-side probe at the drain: block 6 carries real KV in the
-        attended window (rows [0, 256)) and allocation zeros beyond — the
-        marker carries the whole-block sha, tail_tokens=256, and
-        tail_nonzero=True; the once-per-key guard suppresses the 15 later
-        layer visits."""
+        """The save-side probe at the drain: pool page 6 carries real KV in
+        the attended window (kernel rows [72, 74) — the first 256 tokens) and
+        allocation zeros beyond — the marker carries the whole-PAGE sha (all
+        12 kernel rows, independently recomputed here via the direct row
+        slice), tail_tokens=256, and tail_nonzero=True; the once-per-key
+        guard suppresses the 15 later layer visits."""
         worker = self._probe_worker(self._fa_caches(populate_block=self.SAVE_BLOCK))
         key, tail_index = self._tail_key(worker)
         self.assertEqual(tail_index, TAIL_BLOCK_INDEX)
@@ -776,10 +817,20 @@ class TestHybridTailContentProbe(unittest.TestCase):
         self.assertIn(f"tail_tokens={self.TAIL_TOKENS}", line)
         self.assertIn(f"block={self.SAVE_BLOCK}", line)
         self.assertIn("tail_nonzero=True", line)
+        row0 = self.SAVE_BLOCK * self.BPKB
         expected = hashlib.sha256()
         for cache in worker._holemiss_group0_cache_entries():
-            expected.update(cache[self.SAVE_BLOCK].contiguous().view(torch.uint8).cpu().numpy().tobytes())
+            page_rows = cache[row0 : row0 + self.BPKB]
+            expected.update(page_rows.contiguous().view(torch.uint8).cpu().numpy().tobytes())
         self.assertIn(f"sha={expected.hexdigest()}", line)
+        # The page's unattended rows (beyond the window) carry allocation
+        # zeros — the whole-page sha still differs from a zero page.
+        zero_worker = self._probe_worker(self._fa_caches())
+        zero_key, _ = self._tail_key(zero_worker)
+        with self.assertLogs(vllm_logger, level="INFO") as zero_logs:
+            zero_worker.holemiss_tail_save_content_sha(zero_key, self.SAVE_BLOCK)
+        zero_line = [ln for ln in zero_logs.output if "HOLEMISS_TAIL_CONTENT_SHA" in ln][0]
+        self.assertNotIn(f"sha={expected.hexdigest()}", zero_line)
 
     def test_save_probe_zero_pages_report_the_zero_class(self):
         """The discrimination's save-side pin: block 6 all zeros (the pages
