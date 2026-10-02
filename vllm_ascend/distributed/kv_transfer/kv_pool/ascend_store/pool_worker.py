@@ -596,6 +596,11 @@ class KVPoolWorker:
         self._holemiss_state_markers: dict[str, list[str]] = {}
         self._holemiss_failed_load_keys: dict[str, set[str]] = {}
         self._holemiss_state_dispositioned_blocks: set[int] = set()
+        # B43 content probes: the tail key -> its persisted boundary (the
+        # save-side probe derives the attended window from it) and the keys
+        # already probed (the per-layer save drain fires once per key).
+        self._holemiss_tail_key_boundaries: dict[str, int] = {}
+        self._holemiss_tail_save_probed: set[str] = set()
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -1709,6 +1714,9 @@ class KVPoolWorker:
             ),
         )
         tail_block_index = boundary // get_group_block_size(self.grouped_block_size, group_id)
+        # B43: the save-side content probe derives its attended window from
+        # this registration (the send thread sees only the key + block id).
+        self._holemiss_tail_key_boundaries[key] = (request.req_id, boundary)
         return key, tail_block_index
 
     def _make_layerwise_tail_load_key(self, request: ReqMeta, group_id: int) -> tuple[str, int] | None:
@@ -3659,6 +3667,108 @@ class KVPoolWorker:
             logger.error("HOLEMISS writeback sha failed block=%d error=%s", block_id, exc)
             return None
 
+    def _holemiss_tail_content_fingerprint(self, block_id: int, tail_tokens: int) -> tuple[str, bool] | None:
+        """The whole-block sha plus the attended-window nonzero flag.
+
+        The tail block's first ``tail_tokens`` slots are the positions the
+        computation attends (block-local [0, boundary - floor)); the rest of
+        the block carries allocation zeros by construction. The whole-block
+        sha pairs with the save-side marker for the round-trip byte check;
+        the attended-window flag is the zero-class discriminator.
+        """
+        if block_id < 0 or tail_tokens <= 0:
+            return None
+        digest = hashlib.sha256()
+        window_nonzero = False
+        for cache in self._holemiss_group0_cache_entries():
+            block = cache[block_id]
+            digest.update(block.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+            window = block[:tail_tokens].contiguous().view(torch.uint8)
+            window_nonzero = window_nonzero or bool(window.cpu().any())
+        return digest.hexdigest(), window_nonzero
+
+    def holemiss_tail_save_content_sha(self, key: str, block_id: int) -> None:
+        """B43's save-side content probe: the tail block's pages AT the drain.
+
+        The send thread calls this right before the first layer's ranged
+        read of a finish-time tail key, so the fingerprint is the bytes the
+        save actually persists. Emitted once per key (the per-layer drain
+        revisits the key num_layers times). INFORMATIONAL (grep-measured,
+        the SKIP precedent — no bench registration). The live
+        discrimination: ``tail_nonzero=False`` pins the SAVE-side seam (the
+        producer's pages were zeros at the drain); ``tail_nonzero=True`` on
+        the save side with ``False`` on the load side pins the LOAD-side
+        destination; both real with a zero-class sequence pins the
+        compute-side mapping.
+        """
+        registered = self._holemiss_tail_key_boundaries.get(key)
+        if registered is None or key in self._holemiss_tail_save_probed:
+            return
+        req_id, boundary = registered
+        self._holemiss_tail_save_probed.add(key)
+        block_size = get_group_block_size(self.grouped_block_size, 0)
+        tail_tokens = boundary - (boundary // block_size) * block_size
+        try:
+            fingerprint = self._holemiss_tail_content_fingerprint(block_id, tail_tokens)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("HOLEMISS tail save sha failed key=%s block=%d error=%s", key, block_id, exc)
+            return
+        if fingerprint is None:
+            return
+        sha, window_nonzero = fingerprint
+        logger.info(
+            "HOLEMISS_TAIL_CONTENT_SHA side=save tp=%d req=%s key=%s block=%d "
+            "boundary=%d tail_tokens=%d sha=%s tail_nonzero=%s",
+            self.tp_rank,
+            req_id,
+            key,
+            block_id,
+            boundary,
+            tail_tokens,
+            sha,
+            window_nonzero,
+        )
+
+    def _holemiss_probe_tail_content_sha(self, request: ReqMeta) -> None:
+        """B43's load-side content probe: the tail block's pages POST-LOAD.
+
+        Runs after the sync drain's device synchronize, so the fingerprint
+        is the bytes the computation will attend. The save-side marker plus
+        this one discriminate the zero-class tail in a single run (see
+        ``holemiss_tail_save_content_sha``).
+        """
+        tail_load = self._make_layerwise_tail_load_key(request, 0)
+        if tail_load is None:
+            return
+        tail_key, tail_index = tail_load
+        block_size = get_group_block_size(self.grouped_block_size, 0)
+        boundary = request.load_spec.tail_boundary_tokens
+        tail_tokens = boundary - (boundary // block_size) * block_size
+        fa_blocks = request.block_ids_by_group[0] if request.block_ids_by_group else []
+        if not 0 <= tail_index < len(fa_blocks):
+            return
+        block_id = fa_blocks[tail_index]
+        try:
+            fingerprint = self._holemiss_tail_content_fingerprint(block_id, tail_tokens)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("HOLEMISS tail load sha failed key=%s block=%d error=%s", tail_key, block_id, exc)
+            return
+        if fingerprint is None:
+            return
+        sha, window_nonzero = fingerprint
+        logger.info(
+            "HOLEMISS_TAIL_CONTENT_SHA side=load tp=%d req=%s key=%s block=%d "
+            "boundary=%d tail_tokens=%d sha=%s tail_nonzero=%s",
+            self.tp_rank,
+            request.req_id,
+            tail_key,
+            block_id,
+            boundary,
+            tail_tokens,
+            sha,
+            window_nonzero,
+        )
+
     def _holemiss_sync_layerwise_drain(self, load_requests: list[ReqMeta]) -> None:
         """Serialized pre-forward completion of the block-key session load.
 
@@ -3718,6 +3828,7 @@ class KVPoolWorker:
             self._holemiss_emit_load_duration(request.req_id, self.num_layers, holemiss_t0)
             if _hm_is_evidence():
                 logger.info("HOLEMISS_ALL_LAYER_GETS_COMPLETE tp=%d req=%s", self.tp_rank, request.req_id)
+            self._holemiss_probe_tail_content_sha(request)
 
     def _holemiss_emit_load_duration(self, req_id: str, layers: int, t0: float) -> None:
         if not _hm_kv_load_timing_enabled():

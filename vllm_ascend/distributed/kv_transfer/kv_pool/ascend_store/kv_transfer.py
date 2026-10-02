@@ -1864,6 +1864,26 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self._remove_started_keys(active_keys)
         self._active_put_keys = None
 
+    def _probe_tail_save_content(self, req_meta: LayerRangeReqMeta) -> None:
+        """B43: fingerprint the finish-time tail block's pages AT the drain.
+
+        The partial-tail keys carry the ``_tail_`` suffix (the T18 boundary
+        sub-hash form, shared by the hybrid group path and the single-group
+        path); the worker-side probe emits once per key right before the
+        first layer's ranged read, so the fingerprint is exactly the bytes
+        the save persists. Every failure is loud-logged and never raises —
+        an informational probe must not take down the save path.
+        """
+        worker = self.worker
+        if worker is None:
+            return
+        try:
+            for index, key in enumerate(req_meta.keys):
+                if "_tail_" in key:
+                    worker.holemiss_tail_save_content_sha(key, req_meta.block_ids[index])
+        except Exception as exc:  # noqa: BLE001
+            logger.error("HOLEMISS tail save probe failed error=%s", exc)
+
     def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
         layer_id = transfer_tasks[0].layer_id
         try:
@@ -1876,6 +1896,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 if not isinstance(req_meta, LayerRangeReqMeta):
                     raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
                 req_meta.layer_id = layer_id
+                self._probe_tail_save_content(req_meta)
                 self._active_put_keys = self._group_put_keys.get(task.group_id)
                 try:
                     self._handle_range_request(req_meta, task.final_group_layer or layer_id == self.final_layer_id)

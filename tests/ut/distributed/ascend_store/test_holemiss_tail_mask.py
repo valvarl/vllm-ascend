@@ -27,10 +27,12 @@ masks — so the mask computation exempts it and composes at the
 floor-aligned boundary instead.
 """
 
+import hashlib
 import threading
 import unittest
 from types import SimpleNamespace
 
+import torch
 from vllm.logger import logger as vllm_logger
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -45,7 +47,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tr
     LayerwiseSessionTracker,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+    KVCacheStoreLayerSendingThread,
     LayerBatchBuilder,
+    LayerRangeReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LoadSpec,
@@ -362,6 +366,8 @@ def _make_tail_session_worker(store):
     worker._put_started_keys_lock = threading.Lock()
     worker._layerwise_session_tracker = LayerwiseSessionTracker()
     worker._holemiss_failed_load_keys = {}
+    worker._holemiss_tail_key_boundaries = {}
+    worker._holemiss_tail_save_probed = set()
     worker._record_layerwise_invalid_blocks = lambda block_ids: None
     worker.layer_load_tasks = [[] for _ in range(worker.num_layers)]
     worker.m_store = store
@@ -656,6 +662,203 @@ class TestHybridTailLoadFetch(unittest.TestCase):
         claimed_blocks = -(-request.load_spec.kvpool_cached_tokens // GRANULARITY)
         self.assertEqual(claimed_blocks, TAIL_BLOCK_INDEX + 1)
         self.assertEqual(max(r.end_block for r in ranges), claimed_blocks)
+
+
+class TestHybridTailContentProbe(unittest.TestCase):
+    """B43: the tail content probes pin the zero-class arithmetic exactly.
+
+    The W2R2C-A1 live evidence: the fetch mechanics green (the TAIL_KEY_LOAD
+    markers, the 10-key LOAD census, all per-range results full-size) while
+    the T2 sequence stayed BIT-IDENTICAL to the zero-tail run — the bytes
+    the computation attended were zeros. The static derivation cleared the
+    va plumbing on both sides (the save reads and the load writes the SAME
+    block table entry under the SAME full-block segment math), so the
+    remaining discrimination needs the content fingerprints at both ends:
+    ``side=save`` at the drain (what the producer persisted) and
+    ``side=load`` post-drain (what the consumer's pages hold). This class
+    models the LIVE geometry — block 1536, hash block 256, boundary 9472 =
+    9216 + 256, tail block 6, the group-0 object 50331648 = 16 FA layers x
+    3145728 (32 entries x 1572864 = 1536 tokens x 1024 bytes) — so the
+    probes are pinned against the exact live numbers.
+    """
+
+    NUM_FA_LAYERS = 16
+    KV_HEADS = 4
+    HEAD_DIM = 128
+    TOKEN_BYTES = KV_HEADS * HEAD_DIM * 2  # bf16
+    ENTRY_BLOCK_BYTES = GRANULARITY * TOKEN_BYTES  # 1572864
+    GROUP0_OBJECT_BYTES = NUM_FA_LAYERS * 2 * ENTRY_BLOCK_BYTES  # 50331648
+    NUM_BLOCKS = 12
+    SAVE_BLOCK = 6
+    TAIL_TOKENS = BOUNDARY - FLOOR  # 256
+
+    def _fa_caches(self, populate_block=None, real_from=0):
+        """The group-0 FA caches in the live layout: 16 attention layers at
+        physical indices 3+4k, each a (K, V) pair over 1536-token blocks."""
+        caches = {}
+        for layer_idx in range(self.NUM_FA_LAYERS):
+            physical = 3 + 4 * layer_idx
+            k = torch.zeros(self.NUM_BLOCKS, GRANULARITY, self.KV_HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
+            v = torch.zeros(self.NUM_BLOCKS, GRANULARITY, self.KV_HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
+            if populate_block is not None:
+                gen = torch.Generator().manual_seed(physical)
+                k[populate_block, : self.TAIL_TOKENS] = torch.randn(
+                    self.TAIL_TOKENS, self.KV_HEADS, self.HEAD_DIM, generator=gen, dtype=torch.bfloat16
+                )
+                v[populate_block, : self.TAIL_TOKENS] = torch.randn(
+                    self.TAIL_TOKENS, self.KV_HEADS, self.HEAD_DIM, generator=gen, dtype=torch.bfloat16
+                )
+                if real_from:
+                    k[populate_block, self.TAIL_TOKENS :] = 0
+                    v[populate_block, self.TAIL_TOKENS :] = 0
+            caches[f"model.layers.{physical}.self_attn"] = (k, v)
+        return caches
+
+    def _probe_worker(self, caches):
+        def make_key(group, block_hash, head, stage):
+            return hybrid_block_key(MODEL, LAYOUT, group, GROUPED_BLOCK_SIZE[group], block_hash, head)
+
+        worker = KVPoolWorker.__new__(KVPoolWorker)
+        worker.tp_rank = 0
+        worker.head_or_tp_rank = 0
+        worker.pp_rank = 0
+        worker.pp_size = 1
+        worker.num_layers = 64
+        worker.hf_config = None
+        worker.use_hybrid = True
+        worker.kv_cache_config = None
+        worker.kv_caches = caches
+        worker._global_to_local_layer = {}
+        worker.grouped_block_size = list(GROUPED_BLOCK_SIZE)
+        worker.hash_block_size = HASH_BLOCK_SIZE
+        worker.use_eagle = False
+        worker.layerwise_keys = LayerwiseKeyBuilder(make_key, 1)
+        worker._holemiss_tail_key_boundaries = {}
+        worker._holemiss_tail_save_probed = set()
+        return worker
+
+    def _tail_key(self, worker):
+        request = _tail_save_request()
+        return worker._make_layerwise_finished_tail_key(request, 0)
+
+    def test_group0_object_bytes_match_the_live_geometry(self):
+        """The entry walk covers exactly the live group-0 object: 32 entries
+        (16 layers x K,V) x 1572864 bytes = 50331648 per block."""
+        worker = self._probe_worker(self._fa_caches())
+        entries = worker._holemiss_group0_cache_entries()
+        self.assertEqual(len(entries), self.NUM_FA_LAYERS * 2)
+        per_block = sum(cache[0].numel() * cache.element_size() for cache in entries)
+        self.assertEqual(per_block, self.GROUP0_OBJECT_BYTES)
+        self.assertEqual(entries[0].shape, (self.NUM_BLOCKS, GRANULARITY, self.KV_HEADS, self.HEAD_DIM))
+
+    def test_save_probe_emits_the_attended_window_fingerprint(self):
+        """The save-side probe at the drain: block 6 carries real KV in the
+        attended window (rows [0, 256)) and allocation zeros beyond — the
+        marker carries the whole-block sha, tail_tokens=256, and
+        tail_nonzero=True; the once-per-key guard suppresses the 15 later
+        layer visits."""
+        worker = self._probe_worker(self._fa_caches(populate_block=self.SAVE_BLOCK))
+        key, tail_index = self._tail_key(worker)
+        self.assertEqual(tail_index, TAIL_BLOCK_INDEX)
+        self.assertEqual(self.TAIL_TOKENS, 256)
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            worker.holemiss_tail_save_content_sha(key, self.SAVE_BLOCK)
+            worker.holemiss_tail_save_content_sha(key, self.SAVE_BLOCK)
+        marker_lines = [line for line in logs.output if "HOLEMISS_TAIL_CONTENT_SHA" in line]
+        self.assertEqual(len(marker_lines), 1)
+        line = marker_lines[0]
+        self.assertIn("side=save", line)
+        self.assertIn(f"boundary={BOUNDARY}", line)
+        self.assertIn(f"tail_tokens={self.TAIL_TOKENS}", line)
+        self.assertIn(f"block={self.SAVE_BLOCK}", line)
+        self.assertIn("tail_nonzero=True", line)
+        expected = hashlib.sha256()
+        for cache in worker._holemiss_group0_cache_entries():
+            expected.update(cache[self.SAVE_BLOCK].contiguous().view(torch.uint8).cpu().numpy().tobytes())
+        self.assertIn(f"sha={expected.hexdigest()}", line)
+
+    def test_save_probe_zero_pages_report_the_zero_class(self):
+        """The discrimination's save-side pin: block 6 all zeros (the pages
+        the producer's drain would read if the prefill never landed there)
+        -> tail_nonzero=False, the SAVE-side seam verdict."""
+        worker = self._probe_worker(self._fa_caches())
+        key, _ = self._tail_key(worker)
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            worker.holemiss_tail_save_content_sha(key, self.SAVE_BLOCK)
+        marker_lines = [line for line in logs.output if "HOLEMISS_TAIL_CONTENT_SHA" in line]
+        self.assertEqual(len(marker_lines), 1)
+        self.assertIn("tail_nonzero=False", marker_lines[0])
+
+    def test_load_probe_fingerprints_the_destination_block(self):
+        """The load-side probe post-drain: the same attended-window arithmetic
+        over the consumer's block-table entry 6 under the tail key the B41
+        fetch opened."""
+        worker = self._probe_worker(self._fa_caches(populate_block=self.SAVE_BLOCK))
+        request = TestHybridTailLoadFetch._tail_load_request()
+        request.block_ids_by_group = [[100, 101, 102, 103, 104, 105, self.SAVE_BLOCK], [200] * 7]
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            worker._holemiss_probe_tail_content_sha(request)
+        marker_lines = [line for line in logs.output if "HOLEMISS_TAIL_CONTENT_SHA" in line]
+        self.assertEqual(len(marker_lines), 1)
+        line = marker_lines[0]
+        self.assertIn("side=load", line)
+        self.assertIn(f"boundary={BOUNDARY}", line)
+        self.assertIn(f"tail_tokens={self.TAIL_TOKENS}", line)
+        self.assertIn(f"block={self.SAVE_BLOCK}", line)
+        self.assertIn("tail_nonzero=True", line)
+
+    def test_save_and_load_probes_agree_on_the_same_bytes(self):
+        """The round-trip pair: the save-side and load-side whole-block shas
+        are byte-identical over the same content (the LEG-A walk both ends
+        ride)."""
+        caches = self._fa_caches(populate_block=self.SAVE_BLOCK)
+        save_worker = self._probe_worker(caches)
+        load_worker = self._probe_worker(caches)
+        key, _ = self._tail_key(save_worker)
+        request = TestHybridTailLoadFetch._tail_load_request()
+        request.block_ids_by_group = [[100, 101, 102, 103, 104, 105, self.SAVE_BLOCK], [200] * 7]
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            save_worker.holemiss_tail_save_content_sha(key, self.SAVE_BLOCK)
+            load_worker._holemiss_probe_tail_content_sha(request)
+        marker_lines = [line for line in logs.output if "HOLEMISS_TAIL_CONTENT_SHA" in line]
+        self.assertEqual(len(marker_lines), 2)
+        shas = {line.split("sha=")[1].split()[0] for line in marker_lines}
+        self.assertEqual(len(shas), 1)
+
+    def test_send_thread_hook_probes_registered_tail_keys_once(self):
+        """The send-thread hook: a LayerRangeReqMeta carrying a tail key
+        fingerprints its block through the worker before the ranged read; a
+        plain full-block key never triggers the worker hook."""
+        probed = []
+
+        class _HookWorker:
+            def holemiss_tail_save_content_sha(self, key, block_id):
+                probed.append((key, block_id))
+
+        thread = KVCacheStoreLayerSendingThread.__new__(KVCacheStoreLayerSendingThread)
+        thread.worker = _HookWorker()
+        tail_key = f"model@layout@group:0@block:1536@sub_tail_{BOUNDARY}@0"
+        plain_key = "model@layout@group:0@block:1536@fullhash@0"
+        req_meta = LayerRangeReqMeta(
+            req_ids=["req-tail"],
+            layer_id=3,
+            block_ids=[41, self.SAVE_BLOCK],
+            keys=[plain_key, tail_key],
+            all_buffers=[[0], [0]],
+            all_sizes=[[1], [1]],
+            all_offsets=[[0], [0]],
+        )
+        thread._probe_tail_save_content(req_meta)
+        self.assertEqual(probed, [(tail_key, self.SAVE_BLOCK)])
+        self.assertNotIn(plain_key, [key for key, _ in probed])
+
+    def test_unregistered_tail_key_probes_nothing(self):
+        """A foreign _tail_ key (no registration — e.g. a key derived by
+        another worker instance) emits no marker: the probe never guesses
+        the boundary."""
+        worker = self._probe_worker(self._fa_caches())
+        with self.assertNoLogs(vllm_logger, level="INFO"):
+            worker.holemiss_tail_save_content_sha("model@x@group:0@block:1536@sub_tail_9999@0", 3)
 
 
 if __name__ == "__main__":
