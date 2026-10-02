@@ -1698,6 +1698,50 @@ class KVPoolWorker:
         tail_block_index = boundary // get_group_block_size(self.grouped_block_size, group_id)
         return key, tail_block_index
 
+    def _make_layerwise_tail_load_key(self, request: ReqMeta, group_id: int) -> tuple[str, int] | None:
+        """The group-0 partial-tail GET key for an exact-end hit (B41).
+
+        The load-side mirror of ``_make_layerwise_finished_tail_key`` (B39):
+        the SAME D7 tail key — the raw-chain sub-hash at
+        ``boundary // hash_block_size - 1`` qualified by the boundary —
+        derived from the load spec's positive tail signal
+        (``tail_boundary_tokens``, set by the scheduler's exact-end probe)
+        instead of the save-side ``finished_tail_boundary``. Group-0 only
+        (the T18 law: the GDN tail state rides the last full boundary's
+        state objects — groups 1-3 never fetch a tail artifact). Returns
+        ``(key, partial_block_index)`` only when the boundary extends the
+        cached extent's OWN partial block and the group-0 block table covers
+        it — the load then claims exactly what it fetches (never
+        9471-cached-with-9216-fetched, the zero-tail hazard); None otherwise
+        (no signal, an aligned extent, a mismatched boundary, or a
+        block-table shortfall — the full-block entries alone decide the
+        claim).
+        """
+        load_spec = request.load_spec
+        boundary = getattr(load_spec, "tail_boundary_tokens", None) if load_spec is not None else None
+        if group_id != 0 or boundary is None or not load_spec.can_load:
+            return None
+        block_size = get_group_block_size(self.grouped_block_size, group_id)
+        cached_tokens = load_spec.kvpool_cached_tokens
+        if not self.use_eagle and load_spec.kvpool_store_skip_tokens is not None:
+            cached_tokens = load_spec.kvpool_store_skip_tokens
+        partial_block_index = cached_tokens // block_size
+        if cached_tokens % block_size == 0 or partial_block_index != boundary // block_size:
+            return None
+        if partial_block_index >= len(request.block_ids_by_group[group_id]):
+            return None
+        tail_hash_index = boundary // self.hash_block_size - 1
+        if not 0 <= tail_hash_index < len(request.block_hashes):
+            return None
+        key = self._make_layerwise_full_key(
+            group_id,
+            partial_tail_key_suffix(
+                block_hash_to_str(request.block_hashes[tail_hash_index]),
+                boundary,
+            ),
+        )
+        return key, partial_block_index
+
     def _make_layerwise_partial_key(
         self,
         request: ReqMeta,

@@ -48,6 +48,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     LayerBatchBuilder,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+    LoadSpec,
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
@@ -282,7 +283,7 @@ class TestHybridTailSaveBatchComposition(unittest.TestCase):
 
 
 class _SessionStore:
-    """Backend-seam fake for the hybrid group put-session machinery."""
+    """Backend-seam fake for the hybrid group put/get session machinery."""
 
     requires_exists_before_put = True
 
@@ -290,6 +291,7 @@ class _SessionStore:
         self.exists = dict(exists or {})
         self.put_start_rc = put_start_rc
         self.put_starts: list[tuple[tuple, tuple]] = []
+        self.get_starts: list[tuple] = []
 
     def batch_is_exist(self, keys):
         return [self.exists.get(key, 0) for key in keys]
@@ -298,6 +300,10 @@ class _SessionStore:
         self.put_starts.append((tuple(keys), tuple(sizes)))
         if self.put_start_rc is not None:
             return [self.put_start_rc] * len(keys)
+        return [0] * len(keys)
+
+    def batch_get_start(self, keys):
+        self.get_starts.append(tuple(keys))
         return [0] * len(keys)
 
 
@@ -317,67 +323,78 @@ def _tail_chain_hashes(token_count: int, hbs: int):
     return chain
 
 
+def _make_tail_session_worker(store):
+    """The shared B39/B41 fake worker: the hybrid group-session machinery on
+    a __new__ stub (the real _prepare_group_sessions drives it)."""
+
+    def make_key(group, block_hash, head, stage):
+        return hybrid_block_key(MODEL, LAYOUT, group, GROUPED_BLOCK_SIZE[group], block_hash, head)
+
+    worker = KVPoolWorker.__new__(KVPoolWorker)
+    worker.block_key_hybrid = True
+    worker.cache_coordinator = "coordinator"
+    worker.cache_transfer_granularity = GRANULARITY
+    worker.token_database = SimpleNamespace(
+        load_mask=lambda hashes, tokens: None,
+        store_mask=lambda aligned_token_len, num_prompt_tokens=None: ([True] * 6, [True] * 6),
+    )
+    worker.num_kv_cache_groups = 2
+    worker.grouped_block_size = list(GROUPED_BLOCK_SIZE)
+    worker.hash_block_size = HASH_BLOCK_SIZE
+    worker.head_or_tp_rank = 0
+    worker.pp_rank = 0
+    worker.layerwise_keys = LayerwiseKeyBuilder(make_key, 1)
+    worker.kv_role = "kv_producer"
+    worker.consumer_is_to_put = False
+    worker.tp_rank = 0
+    worker.put_step = 1
+    worker.dcp_size = 1
+    worker.layerwise_max_transfer_blocks = 0
+    worker.group_block_len = {0: [3145728] * 16, 1: [534528] * 48}
+    worker.group_num_layers = {0: 2, 1: 2}
+    worker.num_layers = 4
+    worker.use_block_key_layerwise = True
+    worker.use_eagle = False
+    worker.layerwise_offload = False
+    worker.layer_save_tasks = [[] for _ in range(worker.num_layers)]
+    worker._layer_load_aborted = threading.Event()
+    worker._put_started_keys = set()
+    worker._put_started_keys_lock = threading.Lock()
+    worker._layerwise_session_tracker = LayerwiseSessionTracker()
+    worker._holemiss_failed_load_keys = {}
+    worker._record_layerwise_invalid_blocks = lambda block_ids: None
+    worker.layer_load_tasks = [[] for _ in range(worker.num_layers)]
+    worker.m_store = store
+    return worker
+
+
+def _tail_save_request(req_id="req-tail", block_hashes=None, **overrides):
+    params = dict(
+        req_id=req_id,
+        token_len_chunk=0,
+        save_end_token=BOUNDARY,
+        save_start_token=BOUNDARY,
+        target_token_len=BOUNDARY,
+        block_ids_by_group=[[10, 11, 12, 13, 14, 15, 16], [20, 21, 22, 23, 24, 25, 26]],
+        block_hashes=block_hashes
+        if block_hashes is not None
+        else [f"h{i:02d}" for i in range(7 * (GRANULARITY // HASH_BLOCK_SIZE))],
+        can_save=True,
+        is_last_chunk=True,
+        partial_block_index=TAIL_BLOCK_INDEX,
+        finished_tail_boundary=BOUNDARY,
+        num_prompt_tokens=9728,
+    )
+    params.update(overrides)
+    return ReqMeta(**params)
+
+
 class TestHybridFinishedTailKeyConstruction(unittest.TestCase):
     """B39: the group-0 view of a finish-time tail request carries the hybrid
     tail key and its put session; groups 1-3 keep clearing (the T18 law)."""
 
-    def _make_session_worker(self, store):
-        def make_key(group, block_hash, head, stage):
-            return hybrid_block_key(MODEL, LAYOUT, group, GROUPED_BLOCK_SIZE[group], block_hash, head)
-
-        worker = KVPoolWorker.__new__(KVPoolWorker)
-        worker.block_key_hybrid = True
-        worker.cache_coordinator = "coordinator"
-        worker.cache_transfer_granularity = GRANULARITY
-        worker.token_database = SimpleNamespace(
-            load_mask=lambda hashes, tokens: None,
-            store_mask=lambda aligned_token_len, num_prompt_tokens=None: ([True] * 6, [True] * 6),
-        )
-        worker.num_kv_cache_groups = 2
-        worker.grouped_block_size = list(GROUPED_BLOCK_SIZE)
-        worker.hash_block_size = HASH_BLOCK_SIZE
-        worker.head_or_tp_rank = 0
-        worker.pp_rank = 0
-        worker.layerwise_keys = LayerwiseKeyBuilder(make_key, 1)
-        worker.kv_role = "kv_producer"
-        worker.consumer_is_to_put = False
-        worker.tp_rank = 0
-        worker.put_step = 1
-        worker.dcp_size = 1
-        worker.layerwise_max_transfer_blocks = 0
-        worker.group_block_len = {0: [3145728] * 16, 1: [534528] * 48}
-        worker.group_num_layers = {0: 2, 1: 2}
-        worker.num_layers = 4
-        worker.use_block_key_layerwise = True
-        worker.layerwise_offload = False
-        worker.layer_save_tasks = [[] for _ in range(worker.num_layers)]
-        worker._layer_load_aborted = threading.Event()
-        worker._put_started_keys = set()
-        worker._put_started_keys_lock = threading.Lock()
-        worker._layerwise_session_tracker = LayerwiseSessionTracker()
-        worker.m_store = store
-        return worker
-
-    @staticmethod
-    def _tail_request(req_id="req-tail", block_hashes=None, **overrides):
-        params = dict(
-            req_id=req_id,
-            token_len_chunk=0,
-            save_end_token=BOUNDARY,
-            save_start_token=BOUNDARY,
-            target_token_len=BOUNDARY,
-            block_ids_by_group=[[10, 11, 12, 13, 14, 15, 16], [20, 21, 22, 23, 24, 25, 26]],
-            block_hashes=block_hashes
-            if block_hashes is not None
-            else [f"h{i:02d}" for i in range(7 * (GRANULARITY // HASH_BLOCK_SIZE))],
-            can_save=True,
-            is_last_chunk=True,
-            partial_block_index=TAIL_BLOCK_INDEX,
-            finished_tail_boundary=BOUNDARY,
-            num_prompt_tokens=9728,
-        )
-        params.update(overrides)
-        return ReqMeta(**params)
+    _make_session_worker = staticmethod(_make_tail_session_worker)
+    _tail_request = staticmethod(_tail_save_request)
 
     def test_group0_view_carries_the_tail_key_and_opens_the_put_session(self):
         store = _SessionStore()
@@ -508,6 +525,136 @@ class TestHybridFinishedTailKeyConstruction(unittest.TestCase):
         self.assertIsNone(views[0][0].save_last_block_key)
         self.assertIsNone(views[0][0].partial_block_index)
         self.assertTrue(any("put_start rejected" in line and "group 0" in line for line in logs.output))
+
+
+class TestHybridTailLoadFetch(unittest.TestCase):
+    """B41: the exact-end hit's group-0 partial tail block is FETCHED — the
+    load-side mirror of the B39 save key. The live W2R2B evidence: the probe
+    HIT (exact_end=9472) but the LOAD census fetched blocks 0-5 only — the
+    scheduler had claimed 9471 cached tokens over 256 ZEROED pool pages (the
+    zero-tail hazard: the T2 sequence was the zero class, not the anchor's)."""
+
+    _make_session_worker = staticmethod(_make_tail_session_worker)
+    _tail_request = staticmethod(_tail_save_request)
+
+    @staticmethod
+    def _tail_load_request(req_id="req-load", block_hashes=None, **load_overrides):
+        load_params = dict(
+            vllm_cached_tokens=0,
+            kvpool_cached_tokens=BOUNDARY - 1,
+            can_load=True,
+            kvpool_store_skip_tokens=BOUNDARY,
+            tail_boundary_tokens=BOUNDARY,
+        )
+        load_params.update(load_overrides)
+        return ReqMeta(
+            req_id=req_id,
+            token_len_chunk=0,
+            save_end_token=BOUNDARY,
+            save_start_token=BOUNDARY,
+            target_token_len=BOUNDARY,
+            block_ids_by_group=[[10, 11, 12, 13, 14, 15, 16], [20, 21, 22, 23, 24, 25, 26]],
+            block_hashes=block_hashes
+            if block_hashes is not None
+            else [f"h{i:02d}" for i in range(7 * (GRANULARITY // HASH_BLOCK_SIZE))],
+            can_save=False,
+            is_last_chunk=True,
+            num_prompt_tokens=BOUNDARY,
+            load_spec=LoadSpec(**load_params),
+        )
+
+    def test_group0_view_fetches_the_tail_key(self):
+        store = _SessionStore()
+        worker = self._make_session_worker(store)
+        request = self._tail_load_request()
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            views = _prepare_group_sessions(worker, [request])
+        view0 = views[0][0]
+        tail = worker._make_layerwise_tail_load_key(request, 0)
+        self.assertIsNotNone(tail)
+        self.assertEqual(view0.load_block_keys[TAIL_BLOCK_INDEX], tail[0])
+        # The full-block entries are unchanged: slots 0-5 carry the full keys,
+        # the tail extends (never replaces) the populated range.
+        self.assertEqual(len(view0.load_block_keys), 7)
+        self.assertTrue(all(view0.load_block_keys[i] is not None for i in range(7)))
+        # The get session opened for the tail key.
+        self.assertIn(tail[0], [key for keys in store.get_starts for key in keys])
+        self.assertTrue(any("HOLEMISS_TAIL_KEY_LOAD" in line for line in logs.output))
+
+    def test_tail_load_key_equals_the_save_key(self):
+        """The mirror pin: the load fetches byte-exactly the key the B39 save
+        path persisted (the same raw-chain sub-hash, the same D7 form)."""
+        store = _SessionStore()
+        worker = self._make_session_worker(store)
+        request = self._tail_load_request()
+        load_tail = worker._make_layerwise_tail_load_key(request, 0)
+        save_request = self._tail_request()
+        save_tail = worker._make_layerwise_finished_tail_key(save_request, 0)
+        self.assertEqual(load_tail[0], save_tail[0])
+        self.assertEqual(load_tail[1], save_tail[1])
+        self.assertIn(f"_tail_{BOUNDARY}", load_tail[0])
+
+    def test_group1_never_fetches_a_tail_artifact(self):
+        store = _SessionStore()
+        worker = self._make_session_worker(store)
+        request = self._tail_load_request()
+        self.assertIsNone(worker._make_layerwise_tail_load_key(request, 1))
+        views = _prepare_group_sessions(worker, [request])
+        view1 = views[1][0]
+        self.assertEqual(len(view1.load_block_keys), 6)
+        self.assertNotIn(f"_tail_{BOUNDARY}", [k for k in view1.load_block_keys if k])
+
+    def test_no_tail_signal_leaves_the_full_block_entries_unchanged(self):
+        """The regression guard: without the load spec's tail signal the get
+        entries are exactly the pre-B41 full-block set."""
+        store = _SessionStore()
+        worker = self._make_session_worker(store)
+        request = self._tail_load_request(tail_boundary_tokens=None)
+        self.assertIsNone(worker._make_layerwise_tail_load_key(request, 0))
+        with self.assertNoLogs(vllm_logger, level="INFO"):
+            views = _prepare_group_sessions(worker, [request])
+        self.assertEqual(len(views[0][0].load_block_keys), 6)
+        self.assertEqual(len(views[1][0].load_block_keys), 6)
+
+    def test_aligned_extent_fetches_no_tail(self):
+        store = _SessionStore()
+        worker = self._make_session_worker(store)
+        request = self._tail_load_request(
+            kvpool_cached_tokens=FLOOR,
+            kvpool_store_skip_tokens=FLOOR,
+        )
+        self.assertIsNone(worker._make_layerwise_tail_load_key(request, 0))
+
+    def test_mismatched_boundary_fetches_no_tail(self):
+        """A boundary that does not extend the cached extent's own partial
+        block degrades to the full-block fetch — never a claimed-but-unfetched
+        tail (the correctness invariant). The mismatch must floor to a
+        DIFFERENT block than the claim's partial block (BOUNDARY-256 floors
+        to the same block 6 — not a mismatch)."""
+        store = _SessionStore()
+        worker = self._make_session_worker(store)
+        request = self._tail_load_request(tail_boundary_tokens=BOUNDARY - GRANULARITY)
+        self.assertIsNone(worker._make_layerwise_tail_load_key(request, 0))
+
+    def test_claimed_equals_fetched_composition(self):
+        """The populated-slot range covers the claim: the scheduler claimed
+        9471 tokens (7 blocks); the loaded key set covers blocks 0-6."""
+        store = _SessionStore()
+        worker = self._make_session_worker(store)
+        request = self._tail_load_request()
+        views = _prepare_group_sessions(worker, [request])
+        view0 = views[0][0]
+        worker._process_load_for_layer_batch([view0], 0, group_id=0, layer_idx_in_group=0)
+        tasks = worker.layer_load_tasks[0]
+        self.assertEqual(len(tasks), 1)
+        ranges = tasks[0].block_ranges
+        self.assertEqual(
+            [(r.start_block, r.end_block) for r in ranges],
+            [(0, TAIL_BLOCK_INDEX + 1)],
+        )
+        claimed_blocks = -(-request.load_spec.kvpool_cached_tokens // GRANULARITY)
+        self.assertEqual(claimed_blocks, TAIL_BLOCK_INDEX + 1)
+        self.assertEqual(max(r.end_block for r in ranges), claimed_blocks)
 
 
 if __name__ == "__main__":
