@@ -119,7 +119,11 @@ from vllm.v1.worker.utils import AttentionGroup, raise_if_nan_logits, select_com
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.attention_v1 import (
+    AscendAttentionBackend,
+    AscendAttentionState,
+    AscendMetadata,
+)
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
@@ -2171,6 +2175,156 @@ class NPUModelRunner(GPUModelRunner):
         )
         return cut_tokens
 
+    def _holemiss_take_tail_meta_records(self) -> list[dict]:
+        """Pop the tail-hit registrations from the store worker, if any.
+
+        Duck-types the connector->worker chain like the other worker hooks;
+        an empty list (no tail-hit request, a non-AscendStore connector, or
+        no sync drain) makes the probe a no-op.
+        """
+        if not has_kv_transfer_group():
+            return []
+        connector = get_kv_transfer_group()
+        worker = getattr(connector, "connector_worker", None)
+        take = getattr(worker, "holemiss_take_tail_meta_records", None)
+        if not callable(take):
+            return []
+        records = take()
+        return records if isinstance(records, list) else []
+
+    def _holemiss_probe_tail_attention_metadata(self, attn_metadata) -> None:
+        """B43 pin: dump the kernel-consumed tail metadata at the forward.
+
+        THE SITE: called at the top of the forward-context/connector block,
+        after the sync load drain (``start_load_kv`` + the device
+        synchronize have returned) and before ``_model_forward`` — the last
+        point where every write that could stale the attention metadata has
+        landed. The tensors read here are the FINAL ones the FIA kernel
+        consumes: ``AscendMetadata.block_tables`` feeds ``_get_fia_params``'
+        ``block_table`` and ``seq_lens_list`` feeds ``actual_seq_lengths_kv``
+        verbatim (every paged attention state).
+
+        THE EXPECTED VALUES: derived from the request's OWN allocation (the
+        load drain's record: the tail page = the group-0 block table entry
+        at the tail block — the destination the load just wrote). Positions
+        [floor, boundary) map to table entries
+        [floor // kernel_bs, ceil(boundary / kernel_bs)); each entry's value
+        must be the tail page's kernel row ``tail_page * bpkb + sub`` (the
+        ``_convert_physical_to_logical_blocks`` expansion); the expected KV
+        length is the boundary itself (seq_lens = num_computed + scheduled).
+
+        THE VERDICT: ``META_CORRECT`` — the runtime metadata reflects the
+        verified derivation, so a zero-attendance output localizes to the
+        KERNEL side (the owner escalation evidence); any mismatch — the
+        va-side metadata-refresh bug (the stale/not-refreshed runtime
+        tensor is the next fix cycle's target). INFORMATIONAL (the
+        SKIP/CONTENT_SHA precedent — no bench registration).
+        """
+        if not isinstance(attn_metadata, dict) or not attn_metadata:
+            return
+        records = self._holemiss_take_tail_meta_records()
+        if not records:
+            return
+        fa_metadata = None
+        fa_block_table = None
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if not group.layer_names:
+                continue
+            metadata = attn_metadata.get(group.layer_names[0])
+            if isinstance(metadata, AscendMetadata) and metadata.block_tables is not None:
+                fa_metadata = metadata
+                fa_block_table = self.input_batch.block_table[gid]
+                break
+        if fa_metadata is None or fa_block_table is None:
+            logger.warning(
+                "HOLEMISS tail meta dump skipped: no FA attention metadata with a block table "
+                "(records=%d)",
+                len(records),
+            )
+            return
+        kernel_bs = fa_block_table.block_size
+        bpkb = fa_block_table.blocks_per_phys_block
+        physical_bs = fa_block_table.physical_block_size
+        cpu_table = fa_block_table.get_numpy_array()
+        for record in records:
+            try:
+                req_id = str(record.get("req_id"))
+                tp = record.get("tp", -1)
+                boundary = int(record.get("boundary", 0))
+                tail_block = int(record.get("tail_block", -1))
+                tail_page = int(record.get("tail_page", -1))
+                if boundary <= 0 or tail_block < 0 or tail_page < 0:
+                    logger.info(
+                        "HOLEMISS_TAIL_META_DUMP tp=%s req=%s verdict=BAD_RECORD record=%s",
+                        tp,
+                        req_id,
+                        record,
+                    )
+                    continue
+                row = self.input_batch.req_id_to_index.get(req_id)
+                if row is None:
+                    logger.info(
+                        "HOLEMISS_TAIL_META_DUMP tp=%s req=%s boundary=%d tail_block=%d "
+                        "tail_page=%d verdict=REQ_LEFT_BATCH",
+                        tp,
+                        req_id,
+                        boundary,
+                        tail_block,
+                        tail_page,
+                    )
+                    continue
+                floor = tail_block * physical_bs
+                first_row = floor // kernel_bs
+                end_row = -(-boundary // kernel_bs)
+                sub = first_row % bpkb
+                expected_values = [
+                    tail_page * bpkb + sub + j for j in range(end_row - first_row)
+                ]
+                values = fa_metadata.block_tables[row, first_row:end_row].tolist()
+                cpu_values = [int(v) for v in cpu_table[row, first_row:end_row]]
+                seq_kv = (
+                    fa_metadata.seq_lens_list[row]
+                    if row < len(fa_metadata.seq_lens_list)
+                    else None
+                )
+                expected_kv = boundary
+                table_ok = values == expected_values
+                seq_ok = seq_kv == expected_kv
+                if table_ok and seq_ok:
+                    verdict = "META_CORRECT"
+                elif table_ok:
+                    verdict = "SEQ_LEN_MISMATCH"
+                elif seq_ok:
+                    verdict = "TABLE_MISMATCH"
+                else:
+                    verdict = "TABLE_AND_SEQ_MISMATCH"
+                logger.info(
+                    "HOLEMISS_TAIL_META_DUMP tp=%s req=%s rows=%d-%d values=%s seq_kv=%s "
+                    "expected_values=%s expected_kv=%s verdict=%s cpu_values=%s "
+                    "tail_page=%d tail_block=%d kernel_bs=%d bpkb=%d state=%s",
+                    tp,
+                    req_id,
+                    first_row,
+                    end_row - 1,
+                    values,
+                    seq_kv,
+                    expected_values,
+                    expected_kv,
+                    verdict,
+                    cpu_values,
+                    tail_page,
+                    tail_block,
+                    kernel_bs,
+                    bpkb,
+                    fa_metadata.attn_state.name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "HOLEMISS tail meta dump failed req=%s error=%s",
+                    record.get("req_id"),
+                    exc,
+                )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2519,6 +2673,11 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            # B43 pin: the last pre-kernel point — the sync load drain has
+            # landed and the attention metadata is final. Dump the
+            # kernel-consumed tensors for the tail-hit requests the drain
+            # registered (a no-op without registrations).
+            self._holemiss_probe_tail_attention_metadata(attn_metadata)
             # Mamba state copy must run AFTER the KV transfer load finishes,
             # otherwise the copy would race with in-flight layerwise loads and
             # read half-loaded state. With a layerwise-capable connector we

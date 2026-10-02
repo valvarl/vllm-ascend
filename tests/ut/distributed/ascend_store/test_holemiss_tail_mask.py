@@ -989,5 +989,68 @@ class TestTailSaveProbeWiring(unittest.TestCase):
         self.assertIn("worker=self", construction_block)
 
 
+class TestTailMetaProbeRegistration(unittest.TestCase):
+    """B43 pin: the runner-side metadata dump's worker half.
+
+    The W2R2C2-A1 adjudication localized B43 to the compute-side FIA
+    consumption (the save/load sha pair proves the bytes; the table
+    construction chain is verified at source; the sequence is still the
+    zero-attendance class). The sync load drain registers each tail-hit
+    request's ALLOCATION — the request's own group-0 block table entry for
+    the tail block, never a hardcoded page id — so the model runner can
+    compare the kernel-consumed attention metadata against it at the
+    forward's last pre-kernel point (the (a)-vs-(b) discrimination's
+    expected-values half)."""
+
+    def _worker(self):
+        worker = TestHybridTailContentProbe()._probe_worker(TestHybridTailContentProbe()._fa_caches())
+        worker._holemiss_tail_meta_records = {}
+        return worker
+
+    def test_tail_hit_request_registers_its_own_allocation(self):
+        worker = self._worker()
+        request = TestHybridTailLoadFetch._tail_load_request(req_id="req-meta")
+        worker._holemiss_register_tail_meta_probe(request)
+        self.assertEqual(
+            worker._holemiss_tail_meta_records,
+            {
+                "req-meta": {
+                    "tp": 0,
+                    "boundary": BOUNDARY,
+                    "tail_block": TAIL_BLOCK_INDEX,
+                    "tail_page": 16,
+                }
+            },
+        )
+
+    def test_non_tail_request_registers_nothing(self):
+        worker = self._worker()
+        request = TestHybridTailLoadFetch._tail_load_request(tail_boundary_tokens=None)
+        worker._holemiss_register_tail_meta_probe(request)
+        self.assertEqual(worker._holemiss_tail_meta_records, {})
+
+    def test_take_pops_the_records_once(self):
+        worker = self._worker()
+        worker._holemiss_register_tail_meta_probe(TestHybridTailLoadFetch._tail_load_request(req_id="req-meta"))
+        records = worker.holemiss_take_tail_meta_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["req_id"], "req-meta")
+        self.assertEqual(records[0]["tail_page"], 16)
+        self.assertEqual(worker.holemiss_take_tail_meta_records(), [])
+        self.assertEqual(worker._holemiss_tail_meta_records, {})
+
+    def test_drain_registers_after_the_content_probe_post_sync(self):
+        """The source pin: the registration lives in the sync drain's
+        post-synchronize per-request loop, after the content probe — the
+        record must reflect the post-drain allocation and precede the
+        forward that consumes it."""
+        source = inspect.getsource(KVPoolWorker._holemiss_sync_layerwise_drain)
+        sync_idx = source.index("_holemiss_device_synchronize()")
+        probe_idx = source.index("_holemiss_probe_tail_content_sha(request)")
+        register_idx = source.index("_holemiss_register_tail_meta_probe(request)")
+        self.assertLess(sync_idx, probe_idx)
+        self.assertLess(probe_idx, register_idx)
+
+
 if __name__ == "__main__":
     unittest.main()

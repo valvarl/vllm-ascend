@@ -601,6 +601,11 @@ class KVPoolWorker:
         # already probed (the per-layer save drain fires once per key).
         self._holemiss_tail_key_boundaries: dict[str, int] = {}
         self._holemiss_tail_save_probed: set[str] = set()
+        # B43 tail metadata dump: the tail-hit requests the load drain saw.
+        # The runner-side probe pops these at the forward's last pre-kernel
+        # point and compares the kernel-consumed attention metadata against
+        # the allocation recorded here (the request's own FA block table).
+        self._holemiss_tail_meta_records: dict[str, dict[str, int]] = {}
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -3793,6 +3798,40 @@ class KVPoolWorker:
             window_nonzero,
         )
 
+    def _holemiss_register_tail_meta_probe(self, request: ReqMeta) -> None:
+        """Register a tail-hit request for the runner-side metadata dump.
+
+        Runs in the sync load drain (post device synchronize, pre forward)
+        right after the content probe, so the record reflects the allocation
+        the load just wrote through: the request's OWN group-0 block table
+        entry for the tail block (never a hardcoded page id — the consumer's
+        page varies per run). The model runner pops the record at the
+        forward's last pre-kernel point
+        (``_holemiss_probe_tail_attention_metadata``) and compares the
+        kernel-consumed attention metadata against it.
+        """
+        tail_load = self._make_layerwise_tail_load_key(request, 0)
+        if tail_load is None:
+            return
+        _, tail_index = tail_load
+        fa_blocks = request.block_ids_by_group[0] if request.block_ids_by_group else []
+        if not 0 <= tail_index < len(fa_blocks):
+            return
+        self._holemiss_tail_meta_records[request.req_id] = {
+            "tp": self.tp_rank,
+            "boundary": request.load_spec.tail_boundary_tokens,
+            "tail_block": tail_index,
+            "tail_page": fa_blocks[tail_index],
+        }
+
+    def holemiss_take_tail_meta_records(self) -> list[dict]:
+        """Pop the pending tail-metadata registrations (fire-once)."""
+        if not self._holemiss_tail_meta_records:
+            return []
+        records = [{"req_id": req_id, **fields} for req_id, fields in self._holemiss_tail_meta_records.items()]
+        self._holemiss_tail_meta_records.clear()
+        return records
+
     def _holemiss_sync_layerwise_drain(self, load_requests: list[ReqMeta]) -> None:
         """Serialized pre-forward completion of the block-key session load.
 
@@ -3853,6 +3892,7 @@ class KVPoolWorker:
             if _hm_is_evidence():
                 logger.info("HOLEMISS_ALL_LAYER_GETS_COMPLETE tp=%d req=%s", self.tp_rank, request.req_id)
             self._holemiss_probe_tail_content_sha(request)
+            self._holemiss_register_tail_meta_probe(request)
 
     def _holemiss_emit_load_duration(self, req_id: str, layers: int, t0: float) -> None:
         if not _hm_kv_load_timing_enabled():
