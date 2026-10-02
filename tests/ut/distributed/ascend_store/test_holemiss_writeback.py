@@ -113,15 +113,21 @@ class WritebackStore:
         takes a lease on every key it reads — the master grants the read
         lease at query time (GetReplicaList/ExistKey). A key whose only
         replica is stuck PROCESSING reads REPLICA_IS_NOT_READY (the state
-        the removed upsert's Case-B hazard could leave behind)."""
+        the removed upsert's Case-B hazard could leave behind). Each key's
+        success result is the TRANSFERRED BYTE COUNT (the real
+        batch_get_into_multi_buffer_ranges -> BatchTransferReadRanges
+        returns `transferred` per key, client_service.cpp:4384), NOT 0 — the
+        B45 load-side half of the N18 return-convention law, mirroring the
+        B44 batch_copy_put update."""
         self.calls.append(("batch_copy_get", tuple(keys)))
         self.leased.update(keys)
         results = []
-        for key in keys:
+        for index, key in enumerate(keys):
             if key in self.local_disk_processing:
                 results.append(STORE_REPLICA_IS_NOT_READY_RC)
             else:
-                results.append(0)
+                sizes = all_sizes[index] if index < len(all_sizes) else []
+                results.append(sum(sizes))
         return results
 
     def batch_remove_lease(self, keys):
@@ -969,11 +975,40 @@ class TestWritebackLoadVerify(WritebackTestBase):
         worker = self._make_worker()
         self._heal(worker)
         with self.assertLogs(vllm_logger, level="INFO") as logs:
-            self._recv_thread(worker)._holemiss_verify_writeback_loads([REGION_KEY], [BLOCK_ID], ["req-B"], [0])
+            self._recv_thread(worker)._holemiss_verify_writeback_loads(
+                [REGION_KEY], [BLOCK_ID], ["req-B"], [OBJECT_SIZE]
+            )
         verified = [line for line in logs.output if "HOLEMISS_WRITEBACK_VERIFIED" in line]
         self.assertEqual(len(verified), 1)
         self.assertIn("match=True", verified[0])
         self.assertIn("req=req-B", verified[0])
+
+    def test_positive_byte_count_load_result_fires_verified(self):
+        """B45: the load results the verify gate consumes are the
+        TRANSFERRED BYTE COUNTS (the real batch_get_into_multi_buffer_ranges
+        -> BatchTransferReadRanges returns `transferred` per key on success,
+        client_service.cpp:4384 — the same B44 return class), so a POSITIVE
+        count is a COMPLETE transfer, not a failure. The pre-B45 gate read
+        `result != 0` and skipped every successful load, so the VERIFIED
+        marker never fired and roundtrip_ok (verified >= landings) stayed
+        False on the live W2R2E run. A positive byte count -> the VERIFIED
+        marker fires and the content match is computed. The mutation M-B45
+        (reverting the gate to `result != 0`) makes this test fail."""
+        import os
+
+        os.environ["HOLEMISS_KV_WRITEBACK"] = "1"
+        worker = self._make_worker()
+        self._heal(worker)
+        # The full-object transferred byte count (all group-0 layer ranges).
+        self.assertGreater(OBJECT_SIZE, 0)
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            self._recv_thread(worker)._holemiss_verify_writeback_loads(
+                [REGION_KEY], [BLOCK_ID], ["req-B"], [OBJECT_SIZE]
+            )
+        verified = [line for line in logs.output if "HOLEMISS_WRITEBACK_VERIFIED" in line]
+        self.assertEqual(len(verified), 1)
+        self.assertIn("match=True", verified[0])
+        self.assertIn("sha=", verified[0])
 
     def test_verified_match_false_after_mutation(self):
         import os
@@ -984,7 +1019,9 @@ class TestWritebackLoadVerify(WritebackTestBase):
         k_cache = worker.kv_caches["model.layers.0.self_attn"][0]
         k_cache[BLOCK_ID] += 1.0
         with self.assertLogs(vllm_logger, level="INFO") as logs:
-            self._recv_thread(worker)._holemiss_verify_writeback_loads([REGION_KEY], [BLOCK_ID], ["req-B"], [0])
+            self._recv_thread(worker)._holemiss_verify_writeback_loads(
+                [REGION_KEY], [BLOCK_ID], ["req-B"], [OBJECT_SIZE]
+            )
         verified = [line for line in logs.output if "HOLEMISS_WRITEBACK_VERIFIED" in line]
         self.assertEqual(len(verified), 1)
         self.assertIn("match=False", verified[0])
@@ -994,7 +1031,7 @@ class TestWritebackLoadVerify(WritebackTestBase):
         self._heal(worker)
         thread = self._recv_thread(worker)
         with self.assertNoLogs(vllm_logger, level="INFO"):
-            thread._holemiss_verify_writeback_loads([REGION_KEY], [BLOCK_ID], ["req-B"], [0])
+            thread._holemiss_verify_writeback_loads([REGION_KEY], [BLOCK_ID], ["req-B"], [OBJECT_SIZE])
 
     def test_untracked_keys_and_failed_loads_skipped(self):
         import os
@@ -1004,7 +1041,7 @@ class TestWritebackLoadVerify(WritebackTestBase):
         self._heal(worker)
         thread = self._recv_thread(worker)
         with self.assertNoLogs(vllm_logger, level="INFO"):
-            thread._holemiss_verify_writeback_loads(["other@key@0"], [BLOCK_ID], ["req-B"], [0])
+            thread._holemiss_verify_writeback_loads(["other@key@0"], [BLOCK_ID], ["req-B"], [OBJECT_SIZE])
             thread._holemiss_verify_writeback_loads([REGION_KEY], [BLOCK_ID], ["req-B"], [-1102])
 
 

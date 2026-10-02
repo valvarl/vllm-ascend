@@ -2380,9 +2380,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
 
         Under HOLEMISS_KV_WRITEBACK (the same live env gate the mixin's
         write-back rides), every merged key the worker's write-back healed
-        and this load served with result==0 gets a post-load sha over the
-        same ordered group-0 cache-entry walk the PUT hashed. A mismatch is
-        a loud census line, never a load failure.
+        and this load served with a NON-NEGATIVE result (the transferred
+        byte count — the batch_copy_get success convention, the B44 class;
+        only a negative ErrorCode is a load failure) gets a post-load sha
+        over the same ordered group-0 cache-entry walk the PUT hashed. A
+        mismatch is a loud census line, never a load failure.
         """
         if os.getenv("HOLEMISS_KV_WRITEBACK", "0") != "1":
             return
@@ -2395,7 +2397,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             return
         tp = getattr(worker, "tp_rank", -1)
         for key, block_id, req_id, result in zip(keys, block_ids, req_ids, results, strict=True):
-            if result != 0 or key not in tracked:
+            if result < 0 or key not in tracked:
                 continue
             loaded_sha = sha_fn(block_id)
             if loaded_sha is None:
