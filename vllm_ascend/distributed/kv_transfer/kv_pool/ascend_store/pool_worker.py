@@ -606,6 +606,11 @@ class KVPoolWorker:
         # point and compares the kernel-consumed attention metadata against
         # the allocation recorded here (the request's own FA block table).
         self._holemiss_tail_meta_records: dict[str, dict[str, int]] = {}
+        # B43 b2 closure: the pre-forward stable-prefix sha per request (the
+        # baseline the post-forward checksum compares against — the stable
+        # region excludes the re-added slots the forward legitimately
+        # rewrites, so an unchanged sha excludes any other in-window writer).
+        self._holemiss_tail_stable_pre: dict[str, str] = {}
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -3808,7 +3813,10 @@ class KVPoolWorker:
         page varies per run). The model runner pops the record at the
         forward's last pre-kernel point
         (``_holemiss_probe_tail_attention_metadata``) and compares the
-        kernel-consumed attention metadata against it.
+        kernel-consumed attention metadata against it. ``claim`` carries the
+        scheduler's hit-token count (``kvpool_cached_tokens`` — the token
+        index where the re-added/scheduled tokens begin); the b2 closure's
+        stable region is the loaded attended window MINUS those slots.
         """
         tail_load = self._make_layerwise_tail_load_key(request, 0)
         if tail_load is None:
@@ -3822,6 +3830,7 @@ class KVPoolWorker:
             "boundary": request.load_spec.tail_boundary_tokens,
             "tail_block": tail_index,
             "tail_page": fa_blocks[tail_index],
+            "claim": request.load_spec.kvpool_cached_tokens,
         }
 
     def holemiss_take_tail_meta_records(self) -> list[dict]:
@@ -3831,6 +3840,101 @@ class KVPoolWorker:
         records = [{"req_id": req_id, **fields} for req_id, fields in self._holemiss_tail_meta_records.items()]
         self._holemiss_tail_meta_records.clear()
         return records
+
+    def _holemiss_tail_stable_prefix_sha(self, block_id: int, stable_tokens: int) -> str | None:
+        """The sha over the tail page's loaded-and-stable prefix.
+
+        The stable region is the attended window MINUS the re-added slots
+        (the scheduled tokens the forward legitimately rewrites through
+        ``reshape_and_cache`` — the last ``boundary - claim`` token slots of
+        the window): page-local token slots [0, claim - floor). No
+        legitimate in-window writer touches it, so a pre/post sha equality
+        excludes any clobber of the bytes the kernel reads.
+        """
+        if block_id < 0 or stable_tokens <= 0:
+            return None
+        digest = hashlib.sha256()
+        for cache in self._holemiss_group0_cache_entries():
+            page = self._holemiss_group0_page_view(cache, block_id)
+            tokens = page.flatten(0, 1) if page.dim() > 1 else page
+            digest.update(tokens[:stable_tokens].contiguous().view(torch.uint8).cpu().numpy().tobytes())
+        return digest.hexdigest()
+
+    def holemiss_tail_snapshot_stable_sha(self, req_id: str, block_id: int, boundary: int, claim: int) -> None:
+        """The pre-forward stable-prefix snapshot (the b2 closure's baseline).
+
+        The model runner calls this at the metadata dump point (post drain,
+        pre forward) — the page cannot change between the drain and there,
+        so this equals the load-side bytes of the stable region. The
+        post-forward probe compares against it. Loud-log-never-raise.
+        """
+        block_size = get_group_block_size(self.grouped_block_size, 0)
+        stable_tokens = claim - (boundary // block_size) * block_size
+        try:
+            sha = self._holemiss_tail_stable_prefix_sha(block_id, stable_tokens)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "HOLEMISS tail stable snapshot failed req=%s block=%d error=%s",
+                req_id,
+                block_id,
+                exc,
+            )
+            return
+        if sha is not None:
+            self._holemiss_tail_stable_pre[req_id] = sha
+
+    def holemiss_tail_post_forward_sha(self, req_id: str, block_id: int, boundary: int, claim: int) -> None:
+        """B43 b2 closure: the post-forward content probe (the third side).
+
+        The model runner calls this immediately after ``_model_forward``
+        returns (the D2H walk synchronizes behind the forward's kernels).
+        THE CLOBBER-EXCLUSION LOGIC: the only legitimate in-window writer to
+        the FA tail page is ``reshape_and_cache`` for the re-added token(s) —
+        the page-local slots [claim - floor, boundary - floor) — so the
+        stable prefix [0, claim - floor) must be byte-identical before and
+        after the forward. ``CLOBBER_EXCLUDED`` ⇒ the kernel read the real
+        bytes and produced the zero-class output (the kernel-side defect
+        airtight); ``CLOBBER_DETECTED`` ⇒ a real in-window writer touched
+        the stable region (a new va-side fix target); ``NO_PRE_SNAPSHOT`` ⇒
+        the baseline is missing (the wiring gap, honestly reported). The
+        whole-page ``sha`` pairs with the save/load sides for the three-side
+        grep (it is EXPECTED to differ from the load sha by the re-added
+        slot's recompute; a bit-identical equality would indicate the
+        healthy recompute, not the clobber exclusion). INFORMATIONAL (the
+        SKIP/CONTENT_SHA precedent — no bench registration).
+        """
+        block_size = get_group_block_size(self.grouped_block_size, 0)
+        floor = (boundary // block_size) * block_size
+        tail_tokens = boundary - floor
+        stable_tokens = claim - floor
+        try:
+            fingerprint = self._holemiss_tail_content_fingerprint(block_id, tail_tokens)
+            post_stable = self._holemiss_tail_stable_prefix_sha(block_id, stable_tokens)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("HOLEMISS tail post sha failed req=%s block=%d error=%s", req_id, block_id, exc)
+            return
+        if fingerprint is None:
+            return
+        sha, window_nonzero = fingerprint
+        pre_stable = self._holemiss_tail_stable_pre.pop(req_id, None)
+        if pre_stable is not None and post_stable is not None:
+            verdict = "CLOBBER_EXCLUDED" if pre_stable == post_stable else "CLOBBER_DETECTED"
+        else:
+            verdict = "NO_PRE_SNAPSHOT"
+        logger.info(
+            "HOLEMISS_TAIL_CONTENT_SHA side=post tp=%d req=%s block=%d boundary=%d "
+            "tail_tokens=%d sha=%s tail_nonzero=%s stable_sha=%s pre_stable_sha=%s verdict=%s",
+            self.tp_rank,
+            req_id,
+            block_id,
+            boundary,
+            tail_tokens,
+            sha,
+            window_nonzero,
+            post_stable,
+            pre_stable,
+            verdict,
+        )
 
     def _holemiss_sync_layerwise_drain(self, load_requests: list[ReqMeta]) -> None:
         """Serialized pre-forward completion of the block-key session load.

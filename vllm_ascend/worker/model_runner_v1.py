@@ -2175,6 +2175,14 @@ class NPUModelRunner(GPUModelRunner):
         )
         return cut_tokens
 
+    def _holemiss_store_worker(self):
+        """The store worker behind the kv connector, if any (duck-typed —
+        the B33a mixin precedent: the connector owns connector_worker)."""
+        if not has_kv_transfer_group():
+            return None
+        connector = get_kv_transfer_group()
+        return getattr(connector, "connector_worker", None)
+
     def _holemiss_take_tail_meta_records(self) -> list[dict]:
         """Pop the tail-hit registrations from the store worker, if any.
 
@@ -2182,17 +2190,14 @@ class NPUModelRunner(GPUModelRunner):
         an empty list (no tail-hit request, a non-AscendStore connector, or
         no sync drain) makes the probe a no-op.
         """
-        if not has_kv_transfer_group():
-            return []
-        connector = get_kv_transfer_group()
-        worker = getattr(connector, "connector_worker", None)
+        worker = self._holemiss_store_worker()
         take = getattr(worker, "holemiss_take_tail_meta_records", None)
         if not callable(take):
             return []
         records = take()
         return records if isinstance(records, list) else []
 
-    def _holemiss_probe_tail_attention_metadata(self, attn_metadata) -> None:
+    def _holemiss_probe_tail_attention_metadata(self, attn_metadata) -> list[dict]:
         """B43 pin: dump the kernel-consumed tail metadata at the forward.
 
         THE SITE: called at the top of the forward-context/connector block,
@@ -2219,12 +2224,21 @@ class NPUModelRunner(GPUModelRunner):
         va-side metadata-refresh bug (the stale/not-refreshed runtime
         tensor is the next fix cycle's target). INFORMATIONAL (the
         SKIP/CONTENT_SHA precedent — no bench registration).
+
+        THE B2 BASELINE: after the dump, the stable-prefix snapshot is taken
+        (the page's loaded attended window minus the re-added slots — the
+        bytes the forward may NOT touch); the post-forward checksum compares
+        against it. Returns the consumed records so the caller can pass them
+        to the post-forward probe (the record survives the pop in the
+        caller's frame).
         """
         if not isinstance(attn_metadata, dict) or not attn_metadata:
-            return
+            return []
         records = self._holemiss_take_tail_meta_records()
         if not records:
-            return
+            return []
+        worker = self._holemiss_store_worker()
+        snapshot = getattr(worker, "holemiss_tail_snapshot_stable_sha", None)
         fa_metadata = None
         fa_block_table = None
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
@@ -2241,7 +2255,7 @@ class NPUModelRunner(GPUModelRunner):
                 "(records=%d)",
                 len(records),
             )
-            return
+            return records
         kernel_bs = fa_block_table.block_size
         bpkb = fa_block_table.blocks_per_phys_block
         physical_bs = fa_block_table.physical_block_size
@@ -2318,9 +2332,70 @@ class NPUModelRunner(GPUModelRunner):
                     bpkb,
                     fa_metadata.attn_state.name,
                 )
+                # The b2 baseline: the stable-prefix snapshot (the page's
+                # loaded attended window minus the re-added slots) — the
+                # post-forward checksum compares against it.
+                if callable(snapshot):
+                    try:
+                        snapshot(req_id, tail_page, boundary, int(record.get("claim", -1)))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "HOLEMISS tail stable snapshot failed req=%s error=%s",
+                            req_id,
+                            exc,
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "HOLEMISS tail meta dump failed req=%s error=%s",
+                    record.get("req_id"),
+                    exc,
+                )
+        return records
+
+    def _holemiss_probe_tail_page_checksum(self, records) -> None:
+        """B43 b2 closure: the post-forward tail page checksum.
+
+        THE SITE: called immediately after ``_model_forward`` returns, still
+        inside the forward-context/connector block — the D2H page walk
+        synchronizes behind the forward's kernels, so this reads the page as
+        the kernels left it. THE CLOBBER-EXCLUSION LOGIC: the only
+        legitimate in-window writer to the FA tail page is
+        ``reshape_and_cache`` for the re-added token(s) (the scheduled
+        positions [claim, boundary) — the page-local slots
+        [claim - floor, boundary - floor)); the mamba state copy touches the
+        GDN tensors, not the FA pages. So the stable prefix
+        [0, claim - floor) must be byte-identical to the pre-forward
+        snapshot: ``CLOBBER_EXCLUDED`` ⇒ the kernel read the real bytes and
+        produced the zero-class output (the kernel-side defect airtight);
+        ``CLOBBER_DETECTED`` ⇒ a real in-window writer touched the stable
+        region (a new va-side fix target); ``NO_PRE_SNAPSHOT`` ⇒ the
+        baseline is missing (the wiring gap, honestly reported). A request
+        that left the batch is skipped (its page may already be reallocated
+        — reading it would be misleading). INFORMATIONAL; a no-op without
+        records.
+        """
+        if not records:
+            return
+        worker = self._holemiss_store_worker()
+        if worker is None:
+            return
+        checksum = getattr(worker, "holemiss_tail_post_forward_sha", None)
+        if not callable(checksum):
+            return
+        for record in records:
+            try:
+                req_id = str(record.get("req_id"))
+                if req_id not in self.input_batch.req_id_to_index:
+                    continue
+                boundary = int(record.get("boundary", 0))
+                tail_page = int(record.get("tail_page", -1))
+                claim = int(record.get("claim", -1))
+                if boundary <= 0 or tail_page < 0 or claim < 0:
+                    continue
+                checksum(req_id, tail_page, boundary, claim)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "HOLEMISS tail post checksum failed req=%s error=%s",
                     record.get("req_id"),
                     exc,
                 )
@@ -2676,8 +2751,9 @@ class NPUModelRunner(GPUModelRunner):
             # B43 pin: the last pre-kernel point — the sync load drain has
             # landed and the attention metadata is final. Dump the
             # kernel-consumed tensors for the tail-hit requests the drain
-            # registered (a no-op without registrations).
-            self._holemiss_probe_tail_attention_metadata(attn_metadata)
+            # registered (a no-op without registrations); the consumed
+            # records ride through the forward to the post-checksum.
+            tail_meta_records = self._holemiss_probe_tail_attention_metadata(attn_metadata)
             # Mamba state copy must run AFTER the KV transfer load finishes,
             # otherwise the copy would race with in-flight layerwise loads and
             # read half-loaded state. With a layerwise-capable connector we
@@ -2702,6 +2778,11 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            # B43 b2 closure: the post-forward checksum — the tail page's
+            # stable region re-read immediately after the forward returns
+            # (the D2H walk synchronizes behind the forward's kernels); the
+            # verdict compares against the pre-forward snapshot.
+            self._holemiss_probe_tail_page_checksum(tail_meta_records)
             self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
                 profiling_chunk_config,
                 execution_start_time,

@@ -1019,6 +1019,7 @@ class TestTailMetaProbeRegistration(unittest.TestCase):
                     "boundary": BOUNDARY,
                     "tail_block": TAIL_BLOCK_INDEX,
                     "tail_page": 16,
+                    "claim": BOUNDARY - 1,
                 }
             },
         )
@@ -1050,6 +1051,110 @@ class TestTailMetaProbeRegistration(unittest.TestCase):
         register_idx = source.index("_holemiss_register_tail_meta_probe(request)")
         self.assertLess(sync_idx, probe_idx)
         self.assertLess(probe_idx, register_idx)
+
+
+class TestTailPostForwardProbe(unittest.TestCase):
+    """B43 b2 closure: the third CONTENT_SHA side (side=post) — the
+    post-forward checksum that closes the pre-forward-clobber sub-candidate.
+
+    The W2R2C3-A1 run proved META_CORRECT (the runtime metadata exactly the
+    verified derivation) with the byte-identical storage round trip and the
+    zero-class sequence — (b) the kernel-side defect. The one formal gap:
+    the window between the probes' reads and the kernel's read. The closure
+    compares the tail page's STABLE region (the loaded attended window
+    MINUS the re-added slots — reshape_and_cache legitimately rewrites the
+    scheduled token's own slot, position 9471 = page-local slot 255) before
+    and after the forward: unchanged ⇒ no other writer touched the bytes
+    the kernel read ⇒ (b) airtight."""
+
+    CLAIM = BOUNDARY - 1  # the scheduler's hit tokens (the live T2 claim)
+    STABLE_TOKENS = CLAIM - FLOOR  # 255: the window minus the re-added slot
+    BLOCK = TestHybridTailContentProbe.SAVE_BLOCK
+
+    @staticmethod
+    def _caches(populate_block=None):
+        return TestHybridTailContentProbe()._fa_caches(populate_block=populate_block)
+
+    def _worker(self, caches):
+        worker = TestHybridTailContentProbe()._probe_worker(caches)
+        worker._holemiss_tail_stable_pre = {}
+        return worker
+
+    def test_post_side_verdict_excludes_the_clobber_with_a_stable_page(self):
+        worker = self._worker(self._caches(populate_block=self.BLOCK))
+        worker.holemiss_tail_snapshot_stable_sha("req-post", self.BLOCK, BOUNDARY, self.CLAIM)
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            worker.holemiss_tail_post_forward_sha("req-post", self.BLOCK, BOUNDARY, self.CLAIM)
+        marker_lines = [line for line in logs.output if "HOLEMISS_TAIL_CONTENT_SHA" in line]
+        self.assertEqual(len(marker_lines), 1)
+        self.assertIn("side=post", marker_lines[0])
+        self.assertIn("boundary=9472", marker_lines[0])
+        self.assertIn("tail_tokens=256", marker_lines[0])
+        self.assertIn("tail_nonzero=True", marker_lines[0])
+        self.assertIn("verdict=CLOBBER_EXCLUDED", marker_lines[0])
+        # The stable sha equals the snapshot (auditable from the line alone).
+        stable = worker._holemiss_tail_stable_prefix_sha(self.BLOCK, self.STABLE_TOKENS)
+        self.assertIn(f"stable_sha={stable}", marker_lines[0])
+        self.assertIn(f"pre_stable_sha={stable}", marker_lines[0])
+        # The snapshot is consumed (fire-once).
+        self.assertEqual(worker._holemiss_tail_stable_pre, {})
+
+    def test_post_side_detects_a_stable_region_clobber(self):
+        caches = self._caches(populate_block=self.BLOCK)
+        worker = self._worker(caches)
+        block = self.BLOCK
+        worker.holemiss_tail_snapshot_stable_sha("req-post", block, BOUNDARY, self.CLAIM)
+        # An in-window clobber of the stable region: zero the page's first
+        # kernel row (page-local slots [0, 128) — all inside the stable 255).
+        for layer_caches in caches.values():
+            for cache in layer_caches:
+                cache[block * 12 : block * 12 + 1].zero_()
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            worker.holemiss_tail_post_forward_sha("req-post", block, BOUNDARY, self.CLAIM)
+        marker_lines = [line for line in logs.output if "HOLEMISS_TAIL_CONTENT_SHA" in line]
+        self.assertEqual(len(marker_lines), 1)
+        self.assertIn("verdict=CLOBBER_DETECTED", marker_lines[0])
+        self.assertIn("tail_nonzero=True", marker_lines[0])
+        # The attended window is still nonzero (only 128 of 256 tokens
+        # zeroed) — the stable comparison catches what the window flag miss.
+        stable_field = marker_lines[0].split("stable_sha=")[1].split()[0]
+        pre_field = marker_lines[0].split("pre_stable_sha=")[1].split()[0]
+        self.assertNotEqual(stable_field, pre_field)
+
+    def test_post_side_without_a_snapshot_reports_the_honest_gap(self):
+        worker = self._worker(self._caches(populate_block=self.BLOCK))
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            worker.holemiss_tail_post_forward_sha("req-post", self.BLOCK, BOUNDARY, self.CLAIM)
+        marker_lines = [line for line in logs.output if "HOLEMISS_TAIL_CONTENT_SHA" in line]
+        self.assertEqual(len(marker_lines), 1)
+        self.assertIn("verdict=NO_PRE_SNAPSHOT", marker_lines[0])
+        self.assertIn("pre_stable_sha=None", marker_lines[0])
+
+    def test_post_side_zero_pages_report_the_zero_class(self):
+        worker = self._worker(self._caches())
+        worker.holemiss_tail_snapshot_stable_sha("req-post", self.BLOCK, BOUNDARY, self.CLAIM)
+        with self.assertLogs(vllm_logger, level="INFO") as logs:
+            worker.holemiss_tail_post_forward_sha("req-post", self.BLOCK, BOUNDARY, self.CLAIM)
+        marker_lines = [line for line in logs.output if "HOLEMISS_TAIL_CONTENT_SHA" in line]
+        self.assertEqual(len(marker_lines), 1)
+        self.assertIn("tail_nonzero=False", marker_lines[0])
+
+    def test_the_stable_prefix_excludes_the_re_added_slot(self):
+        """The one-slot correctness pin: the re-added token's write
+        (page-local slot 255 = kernel row 1, offset 127 of the tail page)
+        is EXCLUDED from the stable region — its mutation leaves the stable
+        sha unchanged while the whole-page sha sees it."""
+        caches = self._caches(populate_block=self.BLOCK)
+        worker = self._worker(caches)
+        block = self.BLOCK
+        stable_before = worker._holemiss_tail_stable_prefix_sha(block, self.STABLE_TOKENS)
+        page_before = worker._holemiss_tail_content_fingerprint(block, 256)[0]
+        key_cache = caches["model.layers.3.self_attn"][0]
+        key_cache[block * 12 + 1, 127, :, :] += 1.0
+        stable_after = worker._holemiss_tail_stable_prefix_sha(block, self.STABLE_TOKENS)
+        page_after = worker._holemiss_tail_content_fingerprint(block, 256)[0]
+        self.assertEqual(stable_before, stable_after)
+        self.assertNotEqual(page_before, page_after)
 
 
 if __name__ == "__main__":

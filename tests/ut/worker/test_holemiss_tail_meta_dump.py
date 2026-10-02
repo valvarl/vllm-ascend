@@ -57,6 +57,9 @@ FLOOR = 9216
 TAIL_BLOCK_INDEX = 6
 TAIL_PAGE = 7  # the consumer's destination page (the live run's fa_blocks[6])
 FA_PAGES = [10, 11, 12, 13, 14, 15, TAIL_PAGE]
+NUM_POOL_PAGES = 12
+KV_HEADS = 4
+HEAD_DIM = 128
 REQ_ID = "0-acc011f8"
 LAYER_NAME = "model.layers.3.self_attn"
 
@@ -121,6 +124,7 @@ def _record(**overrides):
         "boundary": BOUNDARY,
         "tail_block": TAIL_BLOCK_INDEX,
         "tail_page": TAIL_PAGE,
+        "claim": BOUNDARY - 1,
     }
     record.update(overrides)
     return record
@@ -141,8 +145,7 @@ def _run_probe(runner, attn_metadata, records):
             return_value=connector,
         ),
     ):
-        runner._holemiss_probe_tail_attention_metadata(attn_metadata)
-    return take.calls
+        return runner._holemiss_probe_tail_attention_metadata(attn_metadata)
 
 
 class _PoppingTake:
@@ -302,6 +305,142 @@ class TestTailMetadataDumpProbe(unittest.TestCase):
         forward_idx = source.index("self._model_forward(")
         self.assertLess(connector_idx, probe_idx)
         self.assertLess(probe_idx, forward_idx)
+
+
+def _fa_caches(populate_page=None):
+    """The group-0 FA caches in the live layout: attention layers at
+    physical 3+4k, each a (K, V) pair over 128-token KERNEL rows (12 rows
+    per 1536-token pool page)."""
+    caches = {}
+    for layer_idx in range(2):
+        physical = 3 + 4 * layer_idx
+        shape = (NUM_POOL_PAGES * BPKB, KERNEL_BLOCK, KV_HEADS, HEAD_DIM)
+        k = torch.zeros(shape, dtype=torch.bfloat16)
+        v = torch.zeros(shape, dtype=torch.bfloat16)
+        if populate_page is not None:
+            gen = torch.Generator().manual_seed(physical)
+            row0 = populate_page * BPKB
+            k[row0 : row0 + 2] = torch.randn(2, KERNEL_BLOCK, KV_HEADS, HEAD_DIM, generator=gen, dtype=torch.bfloat16)
+            v[row0 : row0 + 2] = torch.randn(2, KERNEL_BLOCK, KV_HEADS, HEAD_DIM, generator=gen, dtype=torch.bfloat16)
+        caches[f"model.layers.{physical}.self_attn"] = (k, v)
+    return caches
+
+
+def _store_worker(caches):
+    """A REAL KVPoolWorker (the __new__ harness pattern) with just the
+    surface the page walk + the b2 probes need."""
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+    worker = KVPoolWorker.__new__(KVPoolWorker)
+    worker.tp_rank = 0
+    worker.use_hybrid = True
+    worker.hf_config = None
+    worker.num_layers = 64
+    worker.kv_cache_config = None
+    worker.kv_caches = caches
+    worker.num_blocks = NUM_POOL_PAGES
+    worker._global_to_local_layer = {}
+    worker.grouped_block_size = [GRANULARITY, GRANULARITY]
+    worker._holemiss_tail_meta_records = {}
+    worker._holemiss_tail_stable_pre = {}
+    return worker
+
+
+class TestTailPostForwardChecksum(unittest.TestCase):
+    """The b2 closure's runner half: the post-forward checksum rides the
+    records the pre-probe consumed (register -> META_DUMP -> forward ->
+    post-checksum), through the same duck-typed worker chain."""
+
+    def _patched(self, worker):
+        return (
+            patch(
+                "vllm_ascend.worker.model_runner_v1.has_kv_transfer_group",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.worker.model_runner_v1.get_kv_transfer_group",
+                return_value=SimpleNamespace(connector_worker=worker),
+            ),
+        )
+
+    def test_pre_probe_returns_the_consumed_records(self):
+        table = _hybrid_block_table()
+        runner = _runner(table)
+        records = _run_probe(runner, _attn_metadata_dict(table), [_record()])
+        self.assertEqual(records, [_record()])
+
+    def test_post_checksum_emits_per_record_through_the_duck_chain(self):
+        worker = _store_worker(_fa_caches(populate_page=TAIL_PAGE))
+        table = _hybrid_block_table()
+        runner = _runner(table)
+        has_patch, get_patch = self._patched(worker)
+        with self.assertLogs(runner_logger, level="INFO") as logs, has_patch, get_patch:
+            runner._holemiss_probe_tail_page_checksum([_record()])
+        marker_lines = [line for line in logs.output if "side=post" in line]
+        self.assertEqual(len(marker_lines), 1)
+        self.assertIn("verdict=NO_PRE_SNAPSHOT", marker_lines[0])
+        self.assertIn(f"block={TAIL_PAGE}", marker_lines[0])
+        self.assertIn("boundary=9472", marker_lines[0])
+        self.assertIn("tail_nonzero=True", marker_lines[0])
+
+    def test_post_checksum_is_a_noop_without_records(self):
+        table = _hybrid_block_table()
+        runner = _runner(table)
+        with self.assertNoLogs(runner_logger, level="INFO"):
+            runner._holemiss_probe_tail_page_checksum([])
+
+    def test_post_checksum_tolerates_a_worker_without_the_method(self):
+        table = _hybrid_block_table()
+        runner = _runner(table)
+        has_patch, get_patch = self._patched(SimpleNamespace())
+        with self.assertNoLogs(runner_logger, level="INFO"), has_patch, get_patch:
+            runner._holemiss_probe_tail_page_checksum([_record()])
+
+    def test_post_checksum_skips_requests_that_left_the_batch(self):
+        worker = _store_worker(_fa_caches(populate_page=TAIL_PAGE))
+        table = _hybrid_block_table()
+        runner = _runner(table, req_id_to_index={})
+        has_patch, get_patch = self._patched(worker)
+        with self.assertNoLogs(runner_logger, level="INFO"), has_patch, get_patch:
+            runner._holemiss_probe_tail_page_checksum([_record()])
+
+    def test_the_lifecycle_take_snapshot_dump_then_post_checksum(self):
+        """The full chain on REAL classes: the worker's registration dict ->
+        the runner's pre probe (the take, the META_DUMP, the stable
+        snapshot) -> the forward boundary -> the post checksum with the
+        CLOBBER_EXCLUDED verdict; both record stores consumed fire-once."""
+        worker = _store_worker(_fa_caches(populate_page=TAIL_PAGE))
+        worker._holemiss_tail_meta_records[REQ_ID] = _record()
+        table = _hybrid_block_table()
+        runner = _runner(table)
+        has_patch, get_patch = self._patched(worker)
+        with self.assertLogs(runner_logger, level="INFO") as logs, has_patch, get_patch:
+            records = runner._holemiss_probe_tail_attention_metadata(_attn_metadata_dict(table))
+            runner._holemiss_probe_tail_page_checksum(records)
+        self.assertEqual(records, [_record()])
+        meta_lines = [line for line in logs.output if "HOLEMISS_TAIL_META_DUMP" in line]
+        post_lines = [line for line in logs.output if "side=post" in line]
+        self.assertEqual(len(meta_lines), 1)
+        self.assertEqual(len(post_lines), 1)
+        self.assertIn("verdict=META_CORRECT", meta_lines[0])
+        self.assertIn("verdict=CLOBBER_EXCLUDED", post_lines[0])
+        self.assertIn("tail_nonzero=True", post_lines[0])
+        stable = post_lines[0].split("stable_sha=")[1].split()[0]
+        self.assertIn(f"pre_stable_sha={stable}", post_lines[0])
+        self.assertEqual(worker._holemiss_tail_meta_records, {})
+        self.assertEqual(worker._holemiss_tail_stable_pre, {})
+
+    def test_call_site_runs_the_post_checksum_after_the_model_forward(self):
+        """The source pin: the post checksum fires after _model_forward
+        (and inside the forward-context block, before its exit)."""
+        source = inspect.getsource(NPUModelRunner.execute_model)
+        probe_idx = source.index("self._holemiss_probe_tail_attention_metadata(attn_metadata)")
+        forward_idx = source.index("self._model_forward(")
+        post_idx = source.index("self._holemiss_probe_tail_page_checksum(tail_meta_records)")
+        block_end_idx = source.index("self.kvpp.complete_forward()")
+        self.assertLess(probe_idx, forward_idx)
+        self.assertLess(forward_idx, post_idx)
+        self.assertLess(post_idx, block_end_idx)
 
 
 if __name__ == "__main__":
