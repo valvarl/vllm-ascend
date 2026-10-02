@@ -197,6 +197,13 @@ class WritebackStore:
         return results
 
     def batch_copy_put(self, keys, all_buffers, all_sizes, all_offsets):
+        """The write-side ranged transfer with the store's REAL return
+        convention (B44 — the N18 fifth occurrence): each key's result is
+        the TRANSFERRED BYTE COUNT on success (the real
+        batch_put_from_multi_buffer_ranges -> BatchTransferWriteRanges
+        returns `transferred` per key) and a NEGATIVE ErrorCode on
+        failure. The pre-B44 fake returned 0 on success, which never
+        exercised the byte-count shape the production check must accept."""
         self.calls.append(
             (
                 "batch_copy_put",
@@ -219,7 +226,7 @@ class WritebackStore:
             obj = self.objects[key]
             for address, size, offset in zip(buffers, sizes, offsets, strict=True):
                 obj[offset : offset + size] = self._read(address, size)
-            results.append(0)
+            results.append(sum(sizes))
         return results
 
     def batch_commit(self, keys):
@@ -715,6 +722,53 @@ class TestWritebackExecutor(WritebackTestBase):
         self.assertEqual(names.count("batch_revoke"), 1)
         self.assertEqual([round(ms) for ms in slept], [100, 200, 400])
         self.assertTrue(any("HOLEMISS_WRITEBACK_FAILED" in line and "stage=copy_put" in line for line in logs.output))
+
+    def test_fake_copy_put_returns_transferred_bytes(self):
+        """The live-geometry return law (B44, the N18 fifth occurrence):
+        the fake models the real store's batch_copy_put convention — the
+        TRANSFERRED BYTE COUNT on success (negative on error) — so every
+        writeback test exercises the real return shape the production
+        success check must accept."""
+        worker = self._make_worker()
+        store = worker.m_store
+        store.batch_put_start([REGION_KEY], [OBJECT_SIZE])
+        base = worker.kv_caches["model.layers.0.self_attn"][0].data_ptr()
+        self.assertEqual(
+            store.batch_copy_put([REGION_KEY], [[base]], [[ENTRY_BYTES]], [[0]]),
+            [ENTRY_BYTES],
+        )
+        self.assertEqual(
+            store.batch_copy_put(
+                [REGION_KEY],
+                [[base, base + ENTRY_BYTES]],
+                [[ENTRY_BYTES, ENTRY_BYTES]],
+                [[0, ENTRY_BYTES]],
+            ),
+            [2 * ENTRY_BYTES],
+        )
+
+    def test_copy_put_byte_count_success_is_not_a_failure(self):
+        """B44: the real batch_copy_put returns the TRANSFERRED BYTE
+        COUNT on success (negative on error), so the write-back's outer
+        check must be `write_rc < 0` — a positive count means the
+        transfer COMPLETED. The live W2R2D signature: reason=50331648
+        (hybrid g0) / 16777216 (text) were complete transfers misread as
+        failures. A positive count -> the PUT marker fires, NO FAILED, no
+        revoke, the commit lands. The mutation M-B44 (reverting the outer
+        check to `write_rc != 0`) makes this test fail."""
+        worker = self._make_worker()
+        worker.record_hole_recovery_region(self._region())
+        patcher, _ = self._no_sleep()
+        with patcher, self.assertLogs(vllm_logger, level="INFO") as logs:
+            results = worker.writeback_hole_recovery_regions()
+        store = worker.m_store
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["result"], 0)
+        self.assertEqual(results[0]["stage"], "commit")
+        self.assertNotIn("batch_revoke", store.call_names())
+        self.assertNotIn("HOLEMISS_WRITEBACK_FAILED", "\n".join(logs.output))
+        self.assertTrue(any("HOLEMISS_WRITEBACK_PUT" in line for line in logs.output))
+        self.assertIn(REGION_KEY, store.complete)
 
     def test_put_start_failure_fails_loud_without_copy(self):
         worker = self._make_worker()

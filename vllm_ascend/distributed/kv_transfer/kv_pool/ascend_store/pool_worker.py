@@ -3386,7 +3386,7 @@ class KVPoolWorker:
                 return {"key": key, "result": start_results[0], "stage": "put_start"}
             buffers, sizes, offsets, layers = self._holemiss_writeback_ranges(builder, key, block_id)
             write_rc = self._holemiss_writeback_copy_put(key, buffers, sizes, offsets)
-            if write_rc != 0:
+            if write_rc < 0:
                 self._holemiss_writeback_revoke(key)
                 logger.info(
                     "HOLEMISS_WRITEBACK_FAILED tp=%d req=%s key=%s stage=copy_put reason=%d",
