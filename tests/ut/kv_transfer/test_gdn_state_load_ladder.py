@@ -589,12 +589,17 @@ class TestG3HarnessDisjointness(unittest.TestCase):
 
 
 class _FakeAnchorStore:
-    """Records the worker-issued batch_copy_get / batch_remove_lease calls."""
+    """Records the worker-issued session-start / batch_copy_get / lease calls."""
 
     def __init__(self, results):
         self.get_calls = []
         self.lease_releases = []
+        self.session_starts = []
         self._results = list(results)
+
+    def batch_get_start(self, keys):
+        self.session_starts.append(list(keys))
+        return [0] * len(keys)
 
     def batch_copy_get(self, keys, buffers, sizes, offsets):
         self.get_calls.append((list(keys), buffers, sizes, offsets))
@@ -622,6 +627,7 @@ def _anchor_stub_worker():
     pool.dcp_rank = 0
     pool.put_step = 1
     pool.layerwise_key_layer_offset = 0
+    pool.layerwise_max_transfer_blocks = 0
     pool._holemiss_req_meta_by_id = {}
     token_database = pool_worker.ChunkedTokenDatabase(metadata=[], block_size=[BLOCK] * 4, partitions=None)
     token_database.set_group_buffers(
