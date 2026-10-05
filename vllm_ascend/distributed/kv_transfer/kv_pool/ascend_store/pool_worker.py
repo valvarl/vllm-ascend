@@ -4170,7 +4170,7 @@ class KVPoolWorker:
         return None
 
     def _holemiss_fetch_gdn_repair_anchor(self, req_id: str, boundary_tokens: int) -> dict[int, int] | None:
-        """D-MTX.4 Option 1: fetch the TRUE rollback-boundary GDN state.
+        """D-MTX.6: fetch the TRUE rollback-boundary GDN state (repaired).
 
         The GDN recurrent state carries the whole prefix history, so a repair
         stream over [repair_start, ...) is exact only when it anchors at
@@ -4178,19 +4178,40 @@ class KVPoolWorker:
         zero-state class instead (the fix3/fix5 battery verdict). The ladder
         persists EVERY align boundary's state object per group (T13), so the
         rollback boundary is an older rung whose key the plan builder's own
-        derivation yields. The GET re-lands that object into the request's OWN
-        boundary slot (block_ids_by_group[g][k], exactly where the drain put
-        it — idempotent on a healthy drain, repairing a boundary whose drain
-        load failed), never a foreign slot; the mamba align pre-copy targets
-        the working slot only, so the anchor content cannot be clobbered.
+        derivation yields.
+
+        D-MTX.6 CORRECTION (the run2 battery adjudication): the consumer's
+        state-group block tables carry NULL PLACEHOLDERS for every boundary
+        below the working one (RequestTracker.update_mamba_spec_blocks masks
+        the retired prefix to the null block, id 0 — block_pool's reserved
+        placeholder), so ``block_ids_by_group[g][k]`` is NOT "the request's
+        own boundary slot where the drain put it" — the drain only ever lands
+        rung 0 (the newest boundary) at the working slot. The landing target
+        is therefore the NULL BLOCK SLOT (0) used DELIBERATELY: the one slot
+        the scheduler never allocates and no request's table references as a
+        live column, i.e. the only slot the mamba align pre-copy machinery
+        never touches as src/dst. A masked (<=0) entry degrades to exactly
+        that slot with the loud ``landing=null_scratch`` record; a live table
+        value is refused as a landing target (it belongs to the pre-copy's
+        src/dst window — clobber-unsafe by construction).
+
+        The D-MTX.4 run2 battery proved the eager (arm-time) landing is a
+        complete no-op (run1 zero-anchor vs run2 boundary-anchor outputs are
+        byte-identical on fix3/fix4/fix5), so the caller now defers this
+        fetch to repair time (inside the forward, past the input-prep
+        window) and this method verifies its own landing: after the
+        device sync a per-group content probe checksums the landed rows —
+        an all-zero landing degrades LOUDLY to the zero anchor instead of
+        claiming kind=boundary with unreadable content (the silent
+        wrong-state the run2 battery exposed).
 
         Returns {physical_layer: slot} for the GDN layers on success (the
-        mixin passes it as repair_gdn_state_idx_by_layer; the hook anchors the
-        repair/fused stream at the boundary state), None on ANY degrade —
-        always with the loud HOLEMISS_GDN_REPAIR_ANCHOR marker (never silent,
-        never guessed: the caller then falls back to the Option-2 zero
-        anchor). All-or-nothing across the state groups: a partial anchor
-        would mix boundary and zero semantics across GDN layers.
+        hook anchors the repair/fused stream at the boundary state), None on
+        ANY degrade — always with the loud HOLEMISS_GDN_REPAIR_ANCHOR marker
+        (never silent, never guessed: the caller then falls back to the
+        Option-2 zero anchor). All-or-nothing across the state groups: a
+        partial anchor would mix boundary and zero semantics across GDN
+        layers.
         """
 
         def emit(kind: str, suffix: str) -> None:
@@ -4213,6 +4234,12 @@ class KVPoolWorker:
             emit("zero", " fallback reason=no_req_meta")
             return None
 
+        # The null block is the pool's reserved never-allocated placeholder
+        # (block_pool popleft, id 0): the only state-pool slot no request
+        # table references as a live column, hence the only slot the mamba
+        # align pre-copy (block_table[src_col] -> block_table[dst_col]) can
+        # never read or write as a landing target.
+        anchor_slot = 0
         per_group: dict[int, tuple[str, int]] = {}
         for group_id in state_groups:
             block_size = get_group_block_size(self.grouped_block_size, group_id)
@@ -4225,8 +4252,17 @@ class KVPoolWorker:
             if not 0 <= block_index < min(len(group_hashes), len(group_blocks)):
                 emit("zero", f" fallback reason=boundary_out_of_range group={group_id}")
                 return None
+            if group_blocks[block_index] > 0:
+                # D-MTX.6: a LIVE table entry is a pre-copy src/dst candidate,
+                # never a safe anchor landing (the run1/run2 no-op taught the
+                # opposite assumption false). Refuse rather than guess.
+                emit(
+                    "zero",
+                    f" fallback reason=live_table_slot_unsafe group={group_id} slot={int(group_blocks[block_index])}",
+                )
+                return None
             key = self._make_layerwise_full_key(group_id, block_hash_to_str(group_hashes[block_index]))
-            per_group[group_id] = (key, int(group_blocks[block_index]))
+            per_group[group_id] = (key, anchor_slot)
 
         keys: list[str] = []
         buffers: list[list[int]] = []
@@ -4297,13 +4333,60 @@ class KVPoolWorker:
         # must not read the anchor slot before the device is synchronized.
         _holemiss_device_synchronize()
 
+        # D-MTX.6 landing probe: rc==0 does not prove the bytes are readable
+        # at the anchor rows (the run2 battery landed "successfully" yet the
+        # repair behaved as the zero anchor on every shape). Checksum one
+        # representative layer per state group; an all-zero landing degrades
+        # LOUDLY to the zero anchor instead of claiming kind=boundary with
+        # content the repair never observes.
+        landed_zero: list[int] = []
+        landed_shas: list[str] = []
+        for group_id, _ in sorted(per_group.items()):
+            probe = self._holemiss_anchor_row_probe(group_id, anchor_slot)
+            if probe is None:
+                continue
+            sha, nonzero = probe
+            landed_shas.append(f"g{group_id}:{sha}")
+            if not nonzero:
+                landed_zero.append(group_id)
+        if landed_zero:
+            emit(
+                "zero",
+                f" fallback reason=landed_zero groups={'+'.join(str(g) for g in landed_zero)}",
+            )
+            return None
+
         mapping: dict[int, int] = {}
         for group_id, (_, slot) in per_group.items():
             for layer_name in self.kv_cache_config.kv_cache_groups[group_id].layer_names:
                 mapping[self._extract_physical_layer_index(layer_name)] = slot
         slots_desc = "+".join(f"g{group}:{slot}" for group, (_, slot) in sorted(per_group.items()))
-        emit("boundary", f" slots={slots_desc}")
+        sha_desc = " ".join(landed_shas) if landed_shas else "sha=unavailable"
+        emit("boundary", f" slots={slots_desc} landing=null_scratch {sha_desc}")
         return mapping
+
+    def _holemiss_anchor_row_probe(self, group_id: int, slot: int) -> tuple[str, bool] | None:
+        """Checksum the landed anchor rows of one representative layer.
+
+        Returns (sha8, nonzero) for the group's first layer's ssm row at
+        ``slot``, or None when the caches/layer map are unavailable (the
+        probe is evidence, never a gate: None keeps the legacy
+        kind=boundary claim). CPU-testable: unit stubs inject ``kv_caches``.
+        """
+        layer_names = self.kv_cache_config.kv_cache_groups[group_id].layer_names
+        if not layer_names:
+            return None
+        caches = getattr(self, "kv_caches", None) or {}
+        cache_or_caches = caches.get(layer_names[0])
+        if cache_or_caches is None:
+            return None
+        try:
+            ssm = self._as_cache_tuple(cache_or_caches)[1]
+            row = ssm[slot]
+            digest = hashlib.sha256(row.contiguous().cpu().view(torch.uint8).numpy().tobytes()).hexdigest()[:8]
+            return digest, bool(row.count_nonzero().item() > 0)
+        except (IndexError, ValueError, RuntimeError, TypeError):
+            return None
 
     def _holemiss_teardown_finished(self, finished_req_ids: set[str]) -> None:
         """B12b: purge HR regions for EVERY finished/failed request.

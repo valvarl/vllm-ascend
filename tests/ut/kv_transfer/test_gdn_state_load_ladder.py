@@ -280,10 +280,15 @@ def _stub_worker(num_state_groups: int = 3):
 
 
 def _hybrid_request(req_id="req-H", num_blocks=4):
+    # D-MTX.6 live geometry (N18/N19): the consumer's state-group tables carry
+    # the NULL-BLOCK PREFIX (RequestTracker.update_mamba_spec_blocks masks the
+    # retired boundaries to 0) with only the working entry live — the pre-fix
+    # fake modeled unmasked per-boundary slots and green-lit a landing the
+    # live tables never present.
     return ReqMeta(
         req_id=req_id,
         block_ids_by_group=[[10 + i for i in range(num_blocks)]]
-        + [[1000 * group + i for i in range(num_blocks)] for group in (1, 2, 3)],
+        + [[0] * (num_blocks - 1) + [1000 * group + num_blocks - 1] for group in (1, 2, 3)],
         block_hashes=[f"{index:064x}" for index in range(num_blocks)],
         can_save=False,
         load_spec=SimpleNamespace(
@@ -662,8 +667,10 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
 
         # block_index = boundary // 1536 - 1 = 1: the OLDER rung's key per
-        # group, landing in the request's own boundary slot ids[1].
-        self.assertEqual(mapping, {1: 1001, 2: 2001, 3: 3001})
+        # group. The live table entry at index 1 is the MASKED NULL
+        # placeholder, so the landing target is the NULL-BLOCK SCRATCH (slot
+        # 0) — never a live pre-copy src/dst column (D-MTX.6).
+        self.assertEqual(mapping, {1: 0, 2: 0, 3: 0})
         self.assertEqual(len(store.get_calls), 1)
         keys, buffers, sizes, offsets = store.get_calls[0]
         self.assertEqual(
@@ -672,10 +679,9 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         )
         for group, key in zip(GROUPS, keys, strict=True):
             index = keys.index(key)
-            slot = 1000 * group + 1
             self.assertEqual(
                 buffers[index],
-                [100000 + 1000 * group + slot * 8, 200000 + 1000 * group + slot * 12],
+                [100000 + 1000 * group + 0 * 8, 200000 + 1000 * group + 0 * 12],
             )
             self.assertEqual(sizes[index], [1600, 2400])
             self.assertEqual(offsets[index], [0, 1600])
@@ -686,11 +692,81 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
                 "HOLEMISS_GDN_REPAIR_ANCHOR" in line
                 and "kind=boundary" in line
                 and "boundary=3072" in line
-                and "slots=g1:1001+g2:2001+g3:3001" in line
+                and "slots=g1:0+g2:0+g3:0" in line
+                and "landing=null_scratch" in line
                 for line in markers
             ),
             markers,
         )
+
+    def test_live_table_slot_refused_never_landed(self):
+        """D-MTX.6: a live (unmasked) boundary entry is a pre-copy src/dst
+        candidate — landing there would race the align machinery, so the
+        fetch refuses LOUDLY instead of guessing."""
+        pool = _anchor_stub_worker()
+        request = _hybrid_request(num_blocks=4)
+        # Unmask boundary index 1 for group 1 only: a live table value.
+        request.block_ids_by_group[1][1] = 4242
+        self._prime(pool, request)
+        store = _FakeAnchorStore(results=[0, 0, 0])
+        pool.m_store = store
+
+        mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
+
+        self.assertIsNone(mapping)
+        markers = pool._holemiss_state_markers["req-H"]
+        self.assertTrue(
+            any(
+                "kind=zero fallback" in line and "reason=live_table_slot_unsafe" in line and "slot=4242" in line
+                for line in markers
+            ),
+            markers,
+        )
+        self.assertEqual(store.get_calls, [])
+
+    def _probe_stub_worker(self, ssm_row):
+        pool = _anchor_stub_worker()
+        pool.kv_caches = {}
+        for group in GROUPS:
+            layer_name = pool.kv_cache_config.kv_cache_groups[group].layer_names[0]
+            conv = torch.zeros(4, 3, dtype=torch.float32)
+            ssm = torch.stack([ssm_row.clone(), torch.zeros(8, 8), torch.zeros(8, 8)])
+            pool.kv_caches[layer_name] = (conv, ssm)
+        return pool
+
+    def test_landing_probe_zero_degrades_loudly(self):
+        """D-MTX.6: rc==0 with all-zero landed rows is the silent wrong-state
+        the run2 battery exposed (kind=boundary claimed, zero-state output);
+        the probe must degrade to the loud zero anchor."""
+        pool = self._probe_stub_worker(ssm_row=torch.zeros(8, 8))
+        self._prime(pool, _hybrid_request())
+        store = _FakeAnchorStore(results=[0, 0, 0])
+        pool.m_store = store
+
+        mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
+
+        self.assertIsNone(mapping)
+        markers = pool._holemiss_state_markers["req-H"]
+        self.assertTrue(
+            any("kind=zero fallback" in line and "reason=landed_zero" in line for line in markers),
+            markers,
+        )
+
+    def test_landing_probe_nonzero_records_sha(self):
+        pool = self._probe_stub_worker(ssm_row=torch.full((8, 8), 0.5))
+        self._prime(pool, _hybrid_request())
+        store = _FakeAnchorStore(results=[0, 0, 0])
+        pool.m_store = store
+
+        mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
+
+        self.assertEqual(mapping, {1: 0, 2: 0, 3: 0})
+        markers = pool._holemiss_state_markers["req-H"]
+        boundary_lines = [line for line in markers if "kind=boundary" in line]
+        self.assertEqual(len(boundary_lines), 1)
+        # Every probed group records its landed-row digest on the marker.
+        for group in GROUPS:
+            self.assertIn(f"g{group}:", boundary_lines[0])
 
     def test_get_failure_degrades_loudly_to_zero(self):
         pool = _anchor_stub_worker()
@@ -778,7 +854,7 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         connector.connector_worker = pool
         self.assertEqual(
             connector.fetch_gdn_repair_anchor("req-H", 2 * BLOCK),
-            {1: 1001, 2: 2001, 3: 3001},
+            {1: 0, 2: 0, 3: 0},
         )
         connector.connector_worker = None
         with self.assertLogs("vllm", level="INFO") as logs:
