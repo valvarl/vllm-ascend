@@ -4258,6 +4258,18 @@ class KVPoolWorker:
             sizes.append(group_sizes)
             offsets.append(group_offsets)
 
+        # The session-lease law: the ranged GET rides a session
+        # (batch_get_start -> reads -> batch_get_end); without the start the
+        # C++ rejects every read with INVALID_PARAMS (-600; the fix1-run2
+        # live evidence). batch_remove_lease below is the END (B35).
+        try:
+            start_results = self._start_layerwise_get_keys(keys)
+            if any(rc < 0 for rc in start_results):
+                emit("zero", f" fallback reason=session_start_failed rc={min(start_results)}")
+                return None
+        except Exception as exc:
+            emit("zero", f" fallback reason=session_start_exception detail={str(exc)[:80]}")
+            return None
         try:
             results = require_aligned_batch_results(
                 "batch_copy_get",
