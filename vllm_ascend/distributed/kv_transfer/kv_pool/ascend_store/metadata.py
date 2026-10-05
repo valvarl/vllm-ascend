@@ -978,6 +978,15 @@ class ReqMeta:
     skip_null_blocks_by_group: list[bool] | None = None
     num_prompt_tokens: int | None = None
 
+    # D-MTX.7: the scheduler-allocated scratch block id for the GDN repair
+    # anchor landing (one shared pool id; every state group's tensors hold a
+    # distinct row with that id). Present ONLY on load-capable hybrid requests
+    # of a step whose connector meta armed a scratch; the worker's
+    # _holemiss_fetch_gdn_repair_anchor is the sole consumer. Absent => the
+    # fetch degrades loudly to the zero anchor (never the null-block row: the
+    # D-MTX.6 run3 battery proved the null row never receives the GET bytes).
+    repair_scratch_slot: int | None = None
+
     # The following parameters are only used for kv event generation
     # TODO: add lora_request which used for gen lora_id/lora_name in kv event
     token_ids: list[int] | None = None
@@ -1025,6 +1034,7 @@ class ReqMeta:
         load_key_block_offset: int = 0,
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
+        repair_scratch_slot: int | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -1067,6 +1077,7 @@ class ReqMeta:
         self.load_key_block_offset = load_key_block_offset
         self.load_last_block_key = load_last_block_key
         self.load_keys = [] if load_keys is None else list(load_keys)
+        self.repair_scratch_slot = repair_scratch_slot
 
     @property
     def block_ids(self) -> list[int]:

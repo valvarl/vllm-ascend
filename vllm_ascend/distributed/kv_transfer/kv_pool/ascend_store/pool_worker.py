@@ -601,6 +601,9 @@ class KVPoolWorker:
         # block_ids_by_group, which live only on the ReqMeta the drain saw).
         # Purged with the other per-request records at request finish (B12b).
         self._holemiss_req_meta_by_id: dict[str, Any] = {}
+        # D-MTX.7: the req_id currently owning the repair scratch (the
+        # single-request race guard; reset every step in start_load_kv).
+        self._holemiss_scratch_owner: str | None = None
         # B43 content probes: the tail key -> its persisted boundary (the
         # save-side probe derives the attended window from it) and the keys
         # already probed (the per-layer save drain fires once per key).
@@ -1292,6 +1295,10 @@ class KVPoolWorker:
             # outlive the step whose failed loads it dispositioned, or a
             # recycled id could silently mask a future FA failure's raise.
             getattr(self, "_holemiss_state_dispositioned_blocks", set()).clear()
+            # D-MTX.7: the repair-scratch owner guard is step-scoped — a
+            # stale owner from a previous step must never degrade the next
+            # step's anchor fetch with a spurious scratch_busy.
+            self._holemiss_scratch_owner = None
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         holemiss_load_requests = [
             request for request in metadata.requests if request.load_spec is not None and request.load_spec.can_load
@@ -4170,7 +4177,7 @@ class KVPoolWorker:
         return None
 
     def _holemiss_fetch_gdn_repair_anchor(self, req_id: str, boundary_tokens: int) -> dict[int, int] | None:
-        """D-MTX.6: fetch the TRUE rollback-boundary GDN state (repaired).
+        """D-MTX.7: fetch the TRUE rollback-boundary GDN state (repaired).
 
         The GDN recurrent state carries the whole prefix history, so a repair
         stream over [repair_start, ...) is exact only when it anchors at
@@ -4180,24 +4187,27 @@ class KVPoolWorker:
         rollback boundary is an older rung whose key the plan builder's own
         derivation yields.
 
-        D-MTX.6 CORRECTION (the run2 battery adjudication): the consumer's
-        state-group block tables carry NULL PLACEHOLDERS for every boundary
-        below the working one (RequestTracker.update_mamba_spec_blocks masks
-        the retired prefix to the null block, id 0 — block_pool's reserved
-        placeholder), so ``block_ids_by_group[g][k]`` is NOT "the request's
-        own boundary slot where the drain put it" — the drain only ever lands
-        rung 0 (the newest boundary) at the working slot. The landing target
-        is therefore the NULL BLOCK SLOT (0) used DELIBERATELY: the one slot
-        the scheduler never allocates and no request's table references as a
-        live column, i.e. the only slot the mamba align pre-copy machinery
-        never touches as src/dst. A masked (<=0) entry degrades to exactly
-        that slot with the loud ``landing=null_scratch`` record; a live table
-        value is refused as a landing target (it belongs to the pre-copy's
-        src/dst window — clobber-unsafe by construction).
+        D-MTX.7 LANDING (the run3 adjudication): the anchor lands at the
+        scheduler-allocated SCRATCH block stamped on the request's ReqMeta
+        (``repair_scratch_slot``; pool_scheduler._holemiss_attach_repair_scratch
+        allocates one per load-bearing step). The landing surface was disproven
+        twice before: the D-MTX.4 "own boundary slots" read masked null-table
+        entries (a no-op), and the D-MTX.6 null-block row (slot 0) executed
+        its full transfer plan yet the bytes never arrived at the row (the
+        run3 ``reason=landed_zero`` evidence — the GET's bytes demonstrably
+        arrive only at rows the pool's allocation machinery hands out, i.e.
+        the drain's working slots). The scratch is a real allocated row in
+        every state group's tensors (one shared pool id), referenced by NO
+        request table column, so the mamba align pre-copy can never see it
+        as src/dst; the kernels reach it through the hook's rebuilt metadata
+        (state_idx=scratch — the same state-index path the run3 zero-anchor
+        fallback proved kernel-writable). An absent/invalid/busy scratch
+        degrades LOUDLY to the zero anchor — never the null row, never a
+        guessed slot.
 
         The D-MTX.4 run2 battery proved the eager (arm-time) landing is a
         complete no-op (run1 zero-anchor vs run2 boundary-anchor outputs are
-        byte-identical on fix3/fix4/fix5), so the caller now defers this
+        byte-identical on fix3/fix4/fix5), so the caller defers this
         fetch to repair time (inside the forward, past the input-prep
         window) and this method verifies its own landing: after the
         device sync a per-group content probe checksums the landed rows —
@@ -4234,12 +4244,27 @@ class KVPoolWorker:
             emit("zero", " fallback reason=no_req_meta")
             return None
 
-        # The null block is the pool's reserved never-allocated placeholder
-        # (block_pool popleft, id 0): the only state-pool slot no request
-        # table references as a live column, hence the only slot the mamba
-        # align pre-copy (block_table[src_col] -> block_table[dst_col]) can
-        # never read or write as a landing target.
-        anchor_slot = 0
+        scratch_slot = getattr(request, "repair_scratch_slot", None)
+        if not isinstance(scratch_slot, int) or scratch_slot <= 0:
+            # The D-MTX.6 null-row fallback is RETIRED: the run3 battery
+            # proved the null row never receives the GET bytes (landed_zero
+            # on every fault row). No scratch on the ReqMeta means the
+            # scheduler could not arm one — degrade loudly.
+            emit("zero", " fallback reason=no_scratch_slot")
+            return None
+        if getattr(self, "num_blocks", 0) and scratch_slot >= self.num_blocks:
+            # The never-guess bounds law: an out-of-range id would DMA-write
+            # past the state tensors (silent corruption of foreign memory).
+            emit("zero", f" fallback reason=scratch_out_of_range slot={scratch_slot}")
+            return None
+        owner = getattr(self, "_holemiss_scratch_owner", None)
+        if owner is not None and owner != req_id:
+            # HR batches are single-request by design; a second armed request
+            # in the same step would race the first's landed anchor content.
+            emit("zero", f" fallback reason=scratch_busy owner={owner}")
+            return None
+        self._holemiss_scratch_owner = req_id
+        anchor_slot = scratch_slot
         per_group: dict[int, tuple[str, int]] = {}
         for group_id in state_groups:
             block_size = get_group_block_size(self.grouped_block_size, group_id)
@@ -4247,19 +4272,9 @@ class KVPoolWorker:
                 emit("zero", f" fallback reason=unaligned_boundary group={group_id}")
                 return None
             group_hashes = get_block_hashes(request.block_hashes, block_size, self.hash_block_size)
-            group_blocks = request.block_ids_by_group[group_id] if group_id < len(request.block_ids_by_group) else []
             block_index = boundary_tokens // block_size - 1
-            if not 0 <= block_index < min(len(group_hashes), len(group_blocks)):
+            if not 0 <= block_index < len(group_hashes):
                 emit("zero", f" fallback reason=boundary_out_of_range group={group_id}")
-                return None
-            if group_blocks[block_index] > 0:
-                # D-MTX.6: a LIVE table entry is a pre-copy src/dst candidate,
-                # never a safe anchor landing (the run1/run2 no-op taught the
-                # opposite assumption false). Refuse rather than guess.
-                emit(
-                    "zero",
-                    f" fallback reason=live_table_slot_unsafe group={group_id} slot={int(group_blocks[block_index])}",
-                )
                 return None
             key = self._make_layerwise_full_key(group_id, block_hash_to_str(group_hashes[block_index]))
             per_group[group_id] = (key, anchor_slot)
@@ -4362,7 +4377,7 @@ class KVPoolWorker:
                 mapping[self._extract_physical_layer_index(layer_name)] = slot
         slots_desc = "+".join(f"g{group}:{slot}" for group, (_, slot) in sorted(per_group.items()))
         sha_desc = " ".join(landed_shas) if landed_shas else "sha=unavailable"
-        emit("boundary", f" slots={slots_desc} landing=null_scratch {sha_desc}")
+        emit("boundary", f" slots={slots_desc} landing=scratch_slot {sha_desc}")
         return mapping
 
     def _holemiss_anchor_row_probe(self, group_id: int, slot: int) -> tuple[str, bool] | None:
@@ -4409,6 +4424,8 @@ class KVPoolWorker:
                 "_holemiss_req_meta_by_id",
             ):
                 getattr(self, record_name, {}).pop(req_id, None)
+            if getattr(self, "_holemiss_scratch_owner", None) == req_id:
+                self._holemiss_scratch_owner = None
         armed = self._holemiss_armed_fault
         if armed is None or armed.get("request_id") not in finished_req_ids:
             return

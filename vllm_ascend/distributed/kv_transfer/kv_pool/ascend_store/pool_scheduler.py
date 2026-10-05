@@ -11,7 +11,7 @@ from vllm.logger import logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -154,6 +154,13 @@ class KVPoolScheduler:
         self._loading_req_ids: set[str] = set()
 
         self._block_pool: BlockPool | None = None
+        # D-MTX.7: the GDN repair-anchor scratch block held for the CURRENT
+        # load-bearing step's lifetime (alloc at build_connector_meta, free at
+        # update_connector_output). One shared pool id serves every state
+        # group (each group's tensors hold their own row with that id); the
+        # refcount discipline is this tracker alone - never a request table
+        # entry, so the mamba align pre-copy can never see it as src/dst.
+        self._holemiss_repair_scratch: KVCacheBlock | None = None
         self.sending_event_id = 0
         # {event_id, flattened block_ids}
         self.sending_blocks: dict[int, list[int]] = {}
@@ -1164,6 +1171,7 @@ class KVPoolScheduler:
             # pre-forward start the same way the upstream hisparse connector
             # forces its per-step rebind.
             scheduler_output.has_sync_kv_loads = True
+        self._holemiss_attach_repair_scratch(meta)
         return meta
 
     def get_sending_event_id(self):
@@ -1209,6 +1217,9 @@ class KVPoolScheduler:
         """
         hand the connector_output, free non-null mamba blocks and so on.
         """
+        # D-MTX.7: the repair-anchor scratch outlives the worker meta check
+        # below — its step is over whatever the workers reported.
+        self._holemiss_release_repair_scratch()
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, AscendStoreKVConnectorWorkerMetadata) or self._block_pool is None:
             return
@@ -1247,6 +1258,73 @@ class KVPoolScheduler:
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         self._block_pool = gpu_block_pool
+
+    def _holemiss_attach_repair_scratch(self, meta: AscendConnectorMetadata) -> None:
+        """D-MTX.7: arm ONE scheduler-allocated scratch block for the GDN
+        repair anchor on hybrid load-bearing steps.
+
+        The run3 battery proved the GET's bytes arrive only at rows the
+        pool's own allocation machinery has handed out (the drain lands at
+        the working slots; the never-allocated null row never receives
+        them), and the worker cannot allocate (no BlockPool reference, a
+        separate process under spawn+TP). So the scheduler allocates ONE
+        block per load-bearing step and stamps it on every load-capable
+        request's ReqMeta; the worker's _holemiss_fetch_gdn_repair_anchor
+        lands the rollback-boundary state there. Never a request-table
+        entry (the mamba align pre-copy src/dst window), never the null
+        row; any degrade keeps the hook's loud zero anchor.
+        """
+        if not self.use_hybrid or not self.use_layerwise:
+            return
+        load_capable = [req for req in meta.requests if req.load_spec is not None and req.load_spec.can_load]
+        if not load_capable:
+            self._holemiss_release_repair_scratch()
+            return
+        if self._holemiss_repair_scratch is None:
+            if self._block_pool is None:
+                logger.warning(
+                    "HOLEMISS_REPAIR_SCRATCH unavailable tp=-1 reason=no_block_pool "
+                    "(the GDN repair anchor degrades to the zero state)"
+                )
+                return
+            try:
+                self._holemiss_repair_scratch = self._block_pool.get_new_blocks(1)[0]
+            except ValueError as exc:
+                logger.warning(
+                    "HOLEMISS_REPAIR_SCRATCH alloc failed reason=%s (the GDN repair anchor degrades to the zero state)",
+                    str(exc)[:80],
+                )
+                return
+            logger.info("HOLEMISS_REPAIR_SCRATCH_ALLOC block=%d", self._holemiss_repair_scratch.block_id)
+        slot = self._holemiss_repair_scratch.block_id
+        for req_meta in load_capable:
+            req_meta.repair_scratch_slot = slot
+
+    def _holemiss_release_repair_scratch(self) -> None:
+        """Free the step's repair-anchor scratch (the never-leak discipline).
+
+        The block's lifetime is exactly one load-bearing step: the anchor
+        fetch + repair both run inside that step's forward, so the earliest
+        scheduler-side release point is this step's update_connector_output.
+        A release skipped by an aborted step merely extends the hold (the
+        next load-less build releases it here); the tracker is the single
+        owner, so a double release is structurally impossible.
+        """
+        block = self._holemiss_repair_scratch
+        if block is None:
+            return
+        self._holemiss_repair_scratch = None
+        if self._block_pool is None:
+            return
+        try:
+            self._block_pool.free_blocks([block])
+            logger.info("HOLEMISS_REPAIR_SCRATCH_FREE block=%d", block.block_id)
+        except (KeyError, ValueError, AssertionError) as exc:
+            logger.error(
+                "HOLEMISS_REPAIR_SCRATCH free failed block=%d error=%s",
+                block.block_id,
+                str(exc)[:120],
+            )
 
     def update_finished_recving(self, finished_recving: set[str] | None) -> None:
         if finished_recving:

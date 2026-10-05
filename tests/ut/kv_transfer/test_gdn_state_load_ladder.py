@@ -16,9 +16,14 @@ from types import SimpleNamespace
 
 import torch
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import gdn_state_ladder, pool_worker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
+    gdn_state_ladder,
+    pool_scheduler,
+    pool_worker,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreConnector
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.gdn_state_ladder import (
     REASON_LOAD_FAILED,
@@ -31,7 +36,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.gdn_state_ladder i
     build_state_load_plan,
     run_gdn_state_load_ladder,
 )
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import ReqMeta
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata, ReqMeta
 
 # The frozen v2 vocabulary regexes (holemiss-mooncake marker_vocab.py,
 # FROZEN at T8) — copied here so the contract test does not depend on the
@@ -279,12 +284,16 @@ def _stub_worker(num_state_groups: int = 3):
     return pool
 
 
-def _hybrid_request(req_id="req-H", num_blocks=4):
+def _hybrid_request(req_id="req-H", num_blocks=4, repair_scratch_slot=510):
     # D-MTX.6 live geometry (N18/N19): the consumer's state-group tables carry
     # the NULL-BLOCK PREFIX (RequestTracker.update_mamba_spec_blocks masks the
     # retired boundaries to 0) with only the working entry live — the pre-fix
     # fake modeled unmasked per-boundary slots and green-lit a landing the
     # live tables never present.
+    # D-MTX.7 live geometry: the anchor lands at the SCHEDULER-ALLOCATED
+    # scratch block stamped on the ReqMeta (a real pool row — the run3
+    # battery proved the GET's bytes arrive only at allocated rows; the null
+    # row never receives them).
     return ReqMeta(
         req_id=req_id,
         block_ids_by_group=[[10 + i for i in range(num_blocks)]]
@@ -297,6 +306,7 @@ def _hybrid_request(req_id="req-H", num_blocks=4):
             kvpool_store_skip_tokens=None,
             vllm_cached_tokens=0,
         ),
+        repair_scratch_slot=repair_scratch_slot,
     )
 
 
@@ -646,18 +656,20 @@ def _anchor_stub_worker():
 
 
 class TestGdnRepairAnchorFetch(unittest.TestCase):
-    """D-MTX.4 Option 1: the rollback-boundary state GET into the repair slot.
+    """D-MTX.7: the rollback-boundary state GET into the scheduler scratch.
 
     Pins the boundary-key derivation at floor(repair_start/1536) (an OLDER
-    rung of the ladder plan's own key space), the landing into the request's
-    OWN boundary slot (never a foreign slot), the per-layer range merge, the
-    loud kind=zero fallback on ANY degrade, and the connector passthrough.
+    rung of the ladder plan's own key space), the landing at the
+    scheduler-allocated scratch row stamped on the ReqMeta (a REAL pool row
+    — the run3 battery proved the GET's bytes arrive only at allocated rows),
+    the per-layer range merge, the loud kind=zero fallback on ANY degrade
+    (never the retired null-block row), and the connector passthrough.
     """
 
     def _prime(self, pool, request):
         pool._holemiss_run_gdn_state_ladder(request)
 
-    def test_boundary_key_derivation_and_landing(self):
+    def test_scratch_landing_addresses(self):
         pool = _anchor_stub_worker()
         request = _hybrid_request()
         self._prime(pool, request)
@@ -667,10 +679,10 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
 
         # block_index = boundary // 1536 - 1 = 1: the OLDER rung's key per
-        # group. The live table entry at index 1 is the MASKED NULL
-        # placeholder, so the landing target is the NULL-BLOCK SCRATCH (slot
-        # 0) — never a live pre-copy src/dst column (D-MTX.6).
-        self.assertEqual(mapping, {1: 0, 2: 0, 3: 0})
+        # group. The landing target is the scheduler-allocated scratch row
+        # (the one shared pool id across every state group's tensors); the
+        # builder math is the drain's own base + slot*stride (D-MTX.7).
+        self.assertEqual(mapping, {1: 510, 2: 510, 3: 510})
         self.assertEqual(len(store.get_calls), 1)
         keys, buffers, sizes, offsets = store.get_calls[0]
         self.assertEqual(
@@ -681,7 +693,7 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
             index = keys.index(key)
             self.assertEqual(
                 buffers[index],
-                [100000 + 1000 * group + 0 * 8, 200000 + 1000 * group + 0 * 12],
+                [100000 + 1000 * group + 510 * 8, 200000 + 1000 * group + 510 * 12],
             )
             self.assertEqual(sizes[index], [1600, 2400])
             self.assertEqual(offsets[index], [0, 1600])
@@ -692,21 +704,23 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
                 "HOLEMISS_GDN_REPAIR_ANCHOR" in line
                 and "kind=boundary" in line
                 and "boundary=3072" in line
-                and "slots=g1:0+g2:0+g3:0" in line
-                and "landing=null_scratch" in line
+                and "slots=g1:510+g2:510+g3:510" in line
+                and "landing=scratch_slot" in line
                 for line in markers
             ),
             markers,
         )
+        # The owner guard latched: the fetch claimed the scratch for req-H.
+        self.assertEqual(pool._holemiss_scratch_owner, "req-H")
 
-    def test_live_table_slot_refused_never_landed(self):
-        """D-MTX.6: a live (unmasked) boundary entry is a pre-copy src/dst
-        candidate — landing there would race the align machinery, so the
-        fetch refuses LOUDLY instead of guessing."""
+    def test_no_scratch_degrades_loudly_never_the_null_row(self):
+        """D-MTX.7: the RED TWIN of the D-MTX.6 null-scratch landing — a
+        ReqMeta without the scheduler's scratch degrades to the loud zero
+        anchor and NEVER falls back to the null-block row (the run3 battery
+        proved the null row never receives the GET bytes: every fault row
+        landed_zero)."""
         pool = _anchor_stub_worker()
-        request = _hybrid_request(num_blocks=4)
-        # Unmask boundary index 1 for group 1 only: a live table value.
-        request.block_ids_by_group[1][1] = 4242
+        request = _hybrid_request(repair_scratch_slot=None)
         self._prime(pool, request)
         store = _FakeAnchorStore(results=[0, 0, 0])
         pool.m_store = store
@@ -716,28 +730,70 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         self.assertIsNone(mapping)
         markers = pool._holemiss_state_markers["req-H"]
         self.assertTrue(
-            any(
-                "kind=zero fallback" in line and "reason=live_table_slot_unsafe" in line and "slot=4242" in line
-                for line in markers
-            ),
+            any("kind=zero fallback" in line and "reason=no_scratch_slot" in line for line in markers),
+            markers,
+        )
+        self.assertFalse(any("landing=" in line for line in markers), markers)
+        self.assertEqual(store.get_calls, [])
+
+    def test_scratch_out_of_range_refused_never_guesses(self):
+        """The never-guess bounds law: an out-of-range scratch id would
+        DMA-write past the state tensors (silent corruption of foreign
+        memory)."""
+        pool = _anchor_stub_worker()
+        pool.num_blocks = 512
+        request = _hybrid_request(repair_scratch_slot=512)
+        self._prime(pool, request)
+        store = _FakeAnchorStore(results=[0, 0, 0])
+        pool.m_store = store
+
+        mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
+
+        self.assertIsNone(mapping)
+        markers = pool._holemiss_state_markers["req-H"]
+        self.assertTrue(
+            any("kind=zero fallback" in line and "reason=scratch_out_of_range slot=512" in line for line in markers),
             markers,
         )
         self.assertEqual(store.get_calls, [])
 
-    def _probe_stub_worker(self, ssm_row):
+    def test_scratch_busy_refused_for_a_second_request(self):
+        """HR batches are single-request by design; a second armed request in
+        the same step would race the first's landed anchor content."""
+        pool = _anchor_stub_worker()
+        request = _hybrid_request()
+        self._prime(pool, request)
+        pool._holemiss_scratch_owner = "req-OTHER"
+        store = _FakeAnchorStore(results=[0, 0, 0])
+        pool.m_store = store
+
+        mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
+
+        self.assertIsNone(mapping)
+        markers = pool._holemiss_state_markers["req-H"]
+        self.assertTrue(
+            any("kind=zero fallback" in line and "reason=scratch_busy owner=req-OTHER" in line for line in markers),
+            markers,
+        )
+        self.assertEqual(store.get_calls, [])
+
+    def _probe_stub_worker(self, ssm_row, num_rows=512):
         pool = _anchor_stub_worker()
         pool.kv_caches = {}
         for group in GROUPS:
             layer_name = pool.kv_cache_config.kv_cache_groups[group].layer_names[0]
-            conv = torch.zeros(4, 3, dtype=torch.float32)
-            ssm = torch.stack([ssm_row.clone(), torch.zeros(8, 8), torch.zeros(8, 8)])
+            conv = torch.zeros(num_rows, 3, dtype=torch.float32)
+            ssm = torch.zeros(num_rows, 8, 8, dtype=torch.float32)
+            ssm[510] = ssm_row
             pool.kv_caches[layer_name] = (conv, ssm)
         return pool
 
     def test_landing_probe_zero_degrades_loudly(self):
         """D-MTX.6: rc==0 with all-zero landed rows is the silent wrong-state
         the run2 battery exposed (kind=boundary claimed, zero-state output);
-        the probe must degrade to the loud zero anchor."""
+        the probe must degrade to the loud zero anchor. D-MTX.7 keeps the
+        probe guarding the REAL scratch row (if the tier/registration
+        hypothesis is right, it still catches the vanish loudly)."""
         pool = self._probe_stub_worker(ssm_row=torch.zeros(8, 8))
         self._prime(pool, _hybrid_request())
         store = _FakeAnchorStore(results=[0, 0, 0])
@@ -760,7 +816,7 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
 
         mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
 
-        self.assertEqual(mapping, {1: 0, 2: 0, 3: 0})
+        self.assertEqual(mapping, {1: 510, 2: 510, 3: 510})
         markers = pool._holemiss_state_markers["req-H"]
         boundary_lines = [line for line in markers if "kind=boundary" in line]
         self.assertEqual(len(boundary_lines), 1)
@@ -843,8 +899,11 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         self.assertNotIn("req-H", pool._holemiss_req_meta_by_id)
         self._prime(pool, request)
         self.assertIs(pool._holemiss_req_meta_by_id["req-H"], request)
+        pool._holemiss_scratch_owner = "req-H"
         pool._holemiss_teardown_finished({"req-H"})
         self.assertNotIn("req-H", pool._holemiss_req_meta_by_id)
+        # The scratch owner guard clears with its request (the B12b boundary).
+        self.assertIsNone(pool._holemiss_scratch_owner)
 
     def test_connector_passthrough_and_no_worker_loud(self):
         pool = _anchor_stub_worker()
@@ -854,7 +913,7 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         connector.connector_worker = pool
         self.assertEqual(
             connector.fetch_gdn_repair_anchor("req-H", 2 * BLOCK),
-            {1: 0, 2: 0, 3: 0},
+            {1: 510, 2: 510, 3: 510},
         )
         connector.connector_worker = None
         with self.assertLogs("vllm", level="INFO") as logs:
@@ -863,6 +922,143 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
             any("kind=zero fallback" in line and "reason=no_worker_api" in line for line in logs.output),
             logs.output,
         )
+
+
+class _FakeBlockPool:
+    """The scheduler-side BlockPool surface the scratch lifecycle rides."""
+
+    def __init__(self, block_ids=(77,), fail=False):
+        self.blocks = {block_id: KVCacheBlock(block_id=block_id) for block_id in block_ids}
+        self._pool = list(block_ids)
+        self.alloc_calls = []
+        self.freed = []
+        self.fail = fail
+
+    def get_new_blocks(self, num_blocks):
+        if self.fail:
+            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        self.alloc_calls.append(num_blocks)
+        return [self.blocks[bid] for bid in self._pool[:num_blocks]]
+
+    def free_blocks(self, blocks):
+        self.freed.extend(block.block_id for block in blocks)
+
+
+def _scratch_scheduler(use_hybrid=True, use_layerwise=True, block_pool=None):
+    scheduler = pool_scheduler.KVPoolScheduler.__new__(pool_scheduler.KVPoolScheduler)
+    scheduler.use_hybrid = use_hybrid
+    scheduler.use_layerwise = use_layerwise
+    scheduler._block_pool = block_pool
+    scheduler._holemiss_repair_scratch = None
+    return scheduler
+
+
+def _load_meta(with_load=True):
+    meta = AscendConnectorMetadata(preempted_req_ids=[])
+    # The scheduler is the SCRATCH STAMPER: the ReqMeta arrives un-stamped.
+    meta.add_request(_hybrid_request(req_id="req-A", repair_scratch_slot=None))
+    if not with_load:
+        meta.requests[0].load_spec = SimpleNamespace(can_load=False)
+    return meta
+
+
+class TestRepairScratchAllocation(unittest.TestCase):
+    """D-MTX.7: the scheduler-allocated scratch for the GDN repair anchor.
+
+    The worker cannot allocate (no BlockPool reference — a separate process
+    under spawn+TP), and the run3 battery proved the GET's bytes arrive only
+    at rows the pool's allocation machinery hands out. So the pool_scheduler
+    allocates ONE block per load-bearing hybrid step, stamps it on every
+    load-capable request's ReqMeta, and frees it at update_connector_output
+    (the never-leak discipline: the tracker is the single owner).
+    """
+
+    def test_alloc_once_and_stamp_on_load_capable_requests(self):
+        block_pool = _FakeBlockPool(block_ids=(77,))
+        scheduler = _scratch_scheduler(block_pool=block_pool)
+
+        meta = _load_meta()
+        scheduler._holemiss_attach_repair_scratch(meta)
+        scheduler._holemiss_attach_repair_scratch(meta)
+
+        # ONE allocation per step (the second attach is idempotent — the
+        # tracker holds the block).
+        self.assertEqual(block_pool.alloc_calls, [1])
+        self.assertEqual(meta.requests[0].repair_scratch_slot, 77)
+        self.assertEqual(scheduler._holemiss_repair_scratch.block_id, 77)
+
+    def test_release_at_update_connector_output(self):
+        block_pool = _FakeBlockPool(block_ids=(77,))
+        scheduler = _scratch_scheduler(block_pool=block_pool)
+        scheduler._holemiss_attach_repair_scratch(_load_meta())
+        self.assertIsNotNone(scheduler._holemiss_repair_scratch)
+
+        # update_connector_output releases the scratch BEFORE its worker-meta
+        # early return (the release must not depend on the workers' report).
+        class _NoMeta:
+            kv_connector_worker_meta = None
+
+        scheduler.update_connector_output(_NoMeta())
+
+        self.assertIsNone(scheduler._holemiss_repair_scratch)
+        self.assertEqual(block_pool.freed, [77])
+        # Idempotent: a second release is a no-op (never a double free).
+        scheduler.update_connector_output(_NoMeta())
+        self.assertEqual(block_pool.freed, [77])
+
+    def test_non_hybrid_and_non_layerwise_never_allocate(self):
+        for use_hybrid, use_layerwise in ((False, True), (True, False)):
+            with self.subTest(use_hybrid=use_hybrid, use_layerwise=use_layerwise):
+                block_pool = _FakeBlockPool(block_ids=(77,))
+                scheduler = _scratch_scheduler(
+                    use_hybrid=use_hybrid, use_layerwise=use_layerwise, block_pool=block_pool
+                )
+                meta = _load_meta()
+                scheduler._holemiss_attach_repair_scratch(meta)
+                self.assertEqual(block_pool.alloc_calls, [])
+                self.assertIsNone(meta.requests[0].repair_scratch_slot)
+
+    def test_loadless_step_releases_a_stale_scratch(self):
+        """A step whose update never fired (an aborted forward) merely
+        extends the hold; the next load-less build releases it here — the
+        never-leak discipline without per-step growth."""
+        block_pool = _FakeBlockPool(block_ids=(77,))
+        scheduler = _scratch_scheduler(block_pool=block_pool)
+        scheduler._holemiss_attach_repair_scratch(_load_meta())
+        self.assertIsNotNone(scheduler._holemiss_repair_scratch)
+
+        scheduler._holemiss_attach_repair_scratch(_load_meta(with_load=False))
+
+        self.assertIsNone(scheduler._holemiss_repair_scratch)
+        self.assertEqual(block_pool.freed, [77])
+
+    def test_alloc_failure_degrades_loudly_never_stamps(self):
+        block_pool = _FakeBlockPool(fail=True)
+        scheduler = _scratch_scheduler(block_pool=block_pool)
+
+        with self.assertLogs("vllm", level="WARNING") as logs:
+            meta = _load_meta()
+            scheduler._holemiss_attach_repair_scratch(meta)
+
+        self.assertTrue(
+            any("HOLEMISS_REPAIR_SCRATCH alloc failed" in line for line in logs.output),
+            logs.output,
+        )
+        self.assertIsNone(meta.requests[0].repair_scratch_slot)
+        self.assertIsNone(scheduler._holemiss_repair_scratch)
+
+    def test_no_block_pool_degrades_loudly(self):
+        scheduler = _scratch_scheduler(block_pool=None)
+
+        with self.assertLogs("vllm", level="WARNING") as logs:
+            meta = _load_meta()
+            scheduler._holemiss_attach_repair_scratch(meta)
+
+        self.assertTrue(
+            any("HOLEMISS_REPAIR_SCRATCH unavailable" in line for line in logs.output),
+            logs.output,
+        )
+        self.assertIsNone(meta.requests[0].repair_scratch_slot)
 
 
 if __name__ == "__main__":
