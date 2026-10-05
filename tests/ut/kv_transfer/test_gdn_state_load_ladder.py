@@ -242,6 +242,7 @@ def _stub_worker(num_state_groups: int = 3):
     pool._holemiss_state_load_results = {}
     pool._holemiss_state_markers = {}
     pool._holemiss_failed_load_keys = {}
+    pool._holemiss_req_meta_by_id = {}
     pool._holemiss_state_dispositioned_blocks = set()
     pool._invalid_block_ids = set()
     pool._invalid_block_ids_lock = pool_worker.threading.Lock()
@@ -422,10 +423,12 @@ class TestWorkerGlue(unittest.TestCase):
         self.assertIn("req-H", pool._holemiss_state_load_results)
         self.assertIn("req-H", pool._holemiss_state_markers)
         self.assertIn("req-H", pool._holemiss_failed_load_keys)
+        self.assertIn("req-H", pool._holemiss_req_meta_by_id)
         pool._holemiss_teardown_finished({"req-H"})
         self.assertNotIn("req-H", pool._holemiss_state_load_results)
         self.assertNotIn("req-H", pool._holemiss_state_markers)
         self.assertNotIn("req-H", pool._holemiss_failed_load_keys)
+        self.assertNotIn("req-H", pool._holemiss_req_meta_by_id)
 
     def test_retry_success_discards_the_failed_key_record(self):
         """V-T14.4: the session tracker retries failed get-starts; a retry
@@ -583,6 +586,201 @@ class TestG3HarnessDisjointness(unittest.TestCase):
         self.assertEqual(result.rung, RUNG_LAST_SAVED)
         self.assertTrue(result.state_load_block_ids)
         self.assertEqual(zero_candidates & set(result.state_load_block_ids), set())
+
+
+class _FakeAnchorStore:
+    """Records the worker-issued batch_copy_get / batch_remove_lease calls."""
+
+    def __init__(self, results):
+        self.get_calls = []
+        self.lease_releases = []
+        self._results = list(results)
+
+    def batch_copy_get(self, keys, buffers, sizes, offsets):
+        self.get_calls.append((list(keys), buffers, sizes, offsets))
+        return list(self._results)
+
+    def batch_remove_lease(self, keys):
+        self.lease_releases.append(list(keys))
+
+
+def _anchor_stub_worker():
+    """A stub worker whose group builders run the REAL LayerBatchBuilder math."""
+    pool = _stub_worker()
+    pool.use_block_key_layerwise = True
+    pool.num_kv_cache_groups = 4
+    pool.group_num_layers = {0: 2, 1: 1, 2: 1, 3: 1}
+    pool.group_block_len = {
+        0: [OBJECT_BYTES],
+        1: [1600, 2400],
+        2: [1600, 2400],
+        3: [1600, 2400],
+    }
+    pool.page_size_bytes = 4096
+    pool.pp_size = 1
+    pool.dcp_size = 1
+    pool.dcp_rank = 0
+    pool.put_step = 1
+    pool.layerwise_key_layer_offset = 0
+    pool._holemiss_req_meta_by_id = {}
+    token_database = pool_worker.ChunkedTokenDatabase(metadata=[], block_size=[BLOCK] * 4, partitions=None)
+    token_database.set_group_buffers(
+        group_kv_caches_base_addr={group: [100000 + 1000 * group, 200000 + 1000 * group] for group in (0, 1, 2, 3)},
+        group_block_len={group: [1600, 2400] for group in (0, 1, 2, 3)},
+        group_block_stride={group: [8, 12] for group in (0, 1, 2, 3)},
+        group_layer_cache_entry_offsets={group: [0, 2] for group in (0, 1, 2, 3)},
+    )
+    pool.token_database = token_database
+    return pool
+
+
+class TestGdnRepairAnchorFetch(unittest.TestCase):
+    """D-MTX.4 Option 1: the rollback-boundary state GET into the repair slot.
+
+    Pins the boundary-key derivation at floor(repair_start/1536) (an OLDER
+    rung of the ladder plan's own key space), the landing into the request's
+    OWN boundary slot (never a foreign slot), the per-layer range merge, the
+    loud kind=zero fallback on ANY degrade, and the connector passthrough.
+    """
+
+    def _prime(self, pool, request):
+        pool._holemiss_run_gdn_state_ladder(request)
+
+    def test_boundary_key_derivation_and_landing(self):
+        pool = _anchor_stub_worker()
+        request = _hybrid_request()
+        self._prime(pool, request)
+        store = _FakeAnchorStore(results=[0, 0, 0])
+        pool.m_store = store
+
+        mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
+
+        # block_index = boundary // 1536 - 1 = 1: the OLDER rung's key per
+        # group, landing in the request's own boundary slot ids[1].
+        self.assertEqual(mapping, {1: 1001, 2: 2001, 3: 3001})
+        self.assertEqual(len(store.get_calls), 1)
+        keys, buffers, sizes, offsets = store.get_calls[0]
+        self.assertEqual(
+            keys,
+            [f"m@layout@group:{group}@block:1536@{1:064x}@0" for group in GROUPS],
+        )
+        for group, key in zip(GROUPS, keys, strict=True):
+            index = keys.index(key)
+            slot = 1000 * group + 1
+            self.assertEqual(
+                buffers[index],
+                [100000 + 1000 * group + slot * 8, 200000 + 1000 * group + slot * 12],
+            )
+            self.assertEqual(sizes[index], [1600, 2400])
+            self.assertEqual(offsets[index], [0, 1600])
+        self.assertEqual(store.lease_releases, [keys])
+        markers = pool._holemiss_state_markers["req-H"]
+        self.assertTrue(
+            any(
+                "HOLEMISS_GDN_REPAIR_ANCHOR" in line
+                and "kind=boundary" in line
+                and "boundary=3072" in line
+                and "slots=g1:1001+g2:2001+g3:3001" in line
+                for line in markers
+            ),
+            markers,
+        )
+
+    def test_get_failure_degrades_loudly_to_zero(self):
+        pool = _anchor_stub_worker()
+        self._prime(pool, _hybrid_request())
+        store = _FakeAnchorStore(results=[0, -1102, 0])
+        pool.m_store = store
+
+        mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
+
+        self.assertIsNone(mapping)
+        markers = pool._holemiss_state_markers["req-H"]
+        self.assertTrue(
+            any("kind=zero fallback" in line and "reason=get_failed rc=-1102" in line for line in markers),
+            markers,
+        )
+        # All-or-nothing: the lease release still ran (B35), but no partial
+        # anchor escapes — a mixed boundary/zero anchor across GDN layers
+        # would be a silent wrong-state.
+        self.assertEqual(store.lease_releases and len(store.lease_releases[0]), 3)
+
+    def test_missing_req_meta_degrades_loudly(self):
+        pool = _anchor_stub_worker()
+        store = _FakeAnchorStore(results=[0])
+        pool.m_store = store
+
+        self.assertIsNone(pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK))
+        markers = pool._holemiss_state_markers["req-H"]
+        self.assertTrue(any("reason=no_req_meta" in line for line in markers), markers)
+        self.assertEqual(store.get_calls, [])
+
+    def test_zero_boundary_is_the_exact_zero_anchor(self):
+        pool = _anchor_stub_worker()
+        self._prime(pool, _hybrid_request())
+        store = _FakeAnchorStore(results=[0])
+        pool.m_store = store
+
+        self.assertIsNone(pool._holemiss_fetch_gdn_repair_anchor("req-H", 0))
+        markers = pool._holemiss_state_markers["req-H"]
+        # state@0 IS the zero state: no fallback token on this line.
+        self.assertTrue(
+            any("kind=zero" in line and "reason=repair_start_zero" in line for line in markers),
+            markers,
+        )
+        self.assertFalse(any("fallback" in line for line in markers), markers)
+        self.assertEqual(store.get_calls, [])
+
+    def test_unaligned_boundary_refuses_never_guesses(self):
+        pool = _anchor_stub_worker()
+        self._prime(pool, _hybrid_request())
+        store = _FakeAnchorStore(results=[0])
+        pool.m_store = store
+
+        self.assertIsNone(pool._holemiss_fetch_gdn_repair_anchor("req-H", BLOCK + 1))
+        markers = pool._holemiss_state_markers["req-H"]
+        self.assertTrue(any("reason=unaligned_boundary" in line for line in markers), markers)
+        self.assertEqual(store.get_calls, [])
+
+    def test_boundary_out_of_range_degrades_loudly(self):
+        pool = _anchor_stub_worker()
+        request = _hybrid_request(num_blocks=1)
+        self._prime(pool, request)
+        store = _FakeAnchorStore(results=[0])
+        pool.m_store = store
+
+        # boundary 2*1536 needs block_index 1; the request only has block 0.
+        self.assertIsNone(pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK))
+        markers = pool._holemiss_state_markers["req-H"]
+        self.assertTrue(any("reason=boundary_out_of_range" in line for line in markers), markers)
+        self.assertEqual(store.get_calls, [])
+
+    def test_req_meta_recorded_by_ladder_and_purged_at_finish(self):
+        pool = _anchor_stub_worker()
+        request = _hybrid_request()
+        self.assertNotIn("req-H", pool._holemiss_req_meta_by_id)
+        self._prime(pool, request)
+        self.assertIs(pool._holemiss_req_meta_by_id["req-H"], request)
+        pool._holemiss_teardown_finished({"req-H"})
+        self.assertNotIn("req-H", pool._holemiss_req_meta_by_id)
+
+    def test_connector_passthrough_and_no_worker_loud(self):
+        pool = _anchor_stub_worker()
+        self._prime(pool, _hybrid_request())
+        pool.m_store = _FakeAnchorStore(results=[0, 0, 0])
+        connector = AscendStoreConnector.__new__(AscendStoreConnector)
+        connector.connector_worker = pool
+        self.assertEqual(
+            connector.fetch_gdn_repair_anchor("req-H", 2 * BLOCK),
+            {1: 1001, 2: 2001, 3: 3001},
+        )
+        connector.connector_worker = None
+        with self.assertLogs("vllm", level="INFO") as logs:
+            self.assertIsNone(connector.fetch_gdn_repair_anchor("req-H", 2 * BLOCK))
+        self.assertTrue(
+            any("kind=zero fallback" in line and "reason=no_worker_api" in line for line in logs.output),
+            logs.output,
+        )
 
 
 if __name__ == "__main__":

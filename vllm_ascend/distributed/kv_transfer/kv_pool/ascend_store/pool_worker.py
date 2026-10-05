@@ -596,6 +596,11 @@ class KVPoolWorker:
         self._holemiss_state_markers: dict[str, list[str]] = {}
         self._holemiss_failed_load_keys: dict[str, set[str]] = {}
         self._holemiss_state_dispositioned_blocks: set[int] = set()
+        # D-MTX.4 Option-1 GDN repair anchor: the drain's ReqMeta per req_id
+        # (the rollback-boundary key/slot derivation needs block_hashes and
+        # block_ids_by_group, which live only on the ReqMeta the drain saw).
+        # Purged with the other per-request records at request finish (B12b).
+        self._holemiss_req_meta_by_id: dict[str, Any] = {}
         # B43 content probes: the tail key -> its persisted boundary (the
         # save-side probe derives the attended window from it) and the keys
         # already probed (the per-layer save drain fires once per key).
@@ -4104,6 +4109,12 @@ class KVPoolWorker:
         invalid-block surface (whole-request recompute) but marks them
         dispositioned so the hybrid load-error check does not re-raise.
         """
+        if self.use_hybrid:
+            # __new__-stub tolerance (the file's getattr law); a missing record
+            # surfaces as the fetch's loud no_req_meta degrade, never a crash.
+            req_meta_records = getattr(self, "_holemiss_req_meta_by_id", None)
+            if isinstance(req_meta_records, dict):
+                req_meta_records[request.req_id] = request
         plan = self._holemiss_build_state_ladder_plan(request)
         if plan is None:
             return None
@@ -4148,6 +4159,140 @@ class KVPoolWorker:
         """The request's state-ladder result (G14's dynamic boundary input)."""
         return self._holemiss_state_load_results.get(req_id)
 
+    def _holemiss_group_builder(self, group_id: int) -> LayerBatchBuilder | None:
+        """The live per-group range builder (the writeback builder generalized)."""
+        recv_thread = getattr(self, "kv_recv_thread", None)
+        builders = getattr(recv_thread, "group_builders", None)
+        if builders:
+            return builders[group_id]
+        if getattr(self, "token_database", None) is not None:
+            return self._build_group_layer_builders()[group_id]
+        return None
+
+    def _holemiss_fetch_gdn_repair_anchor(self, req_id: str, boundary_tokens: int) -> dict[int, int] | None:
+        """D-MTX.4 Option 1: fetch the TRUE rollback-boundary GDN state.
+
+        The GDN recurrent state carries the whole prefix history, so a repair
+        stream over [repair_start, ...) is exact only when it anchors at
+        state@repair_start — the Option-2 zero anchor lands on the certified
+        zero-state class instead (the fix3/fix5 battery verdict). The ladder
+        persists EVERY align boundary's state object per group (T13), so the
+        rollback boundary is an older rung whose key the plan builder's own
+        derivation yields. The GET re-lands that object into the request's OWN
+        boundary slot (block_ids_by_group[g][k], exactly where the drain put
+        it — idempotent on a healthy drain, repairing a boundary whose drain
+        load failed), never a foreign slot; the mamba align pre-copy targets
+        the working slot only, so the anchor content cannot be clobbered.
+
+        Returns {physical_layer: slot} for the GDN layers on success (the
+        mixin passes it as repair_gdn_state_idx_by_layer; the hook anchors the
+        repair/fused stream at the boundary state), None on ANY degrade —
+        always with the loud HOLEMISS_GDN_REPAIR_ANCHOR marker (never silent,
+        never guessed: the caller then falls back to the Option-2 zero
+        anchor). All-or-nothing across the state groups: a partial anchor
+        would mix boundary and zero semantics across GDN layers.
+        """
+
+        def emit(kind: str, suffix: str) -> None:
+            line = (
+                f"HOLEMISS_GDN_REPAIR_ANCHOR tp={self.tp_rank} req={req_id} "
+                f"kind={kind}{suffix} boundary={boundary_tokens}"
+            )
+            self._holemiss_state_markers.setdefault(req_id, []).append(line)
+            logger.info("%s", line)
+
+        state_groups = self._holemiss_state_groups()
+        if not state_groups:
+            return None
+        if boundary_tokens <= 0:
+            # state@0 IS the zero state: the hook's zero anchor is exact here.
+            emit("zero", " reason=repair_start_zero")
+            return None
+        request = getattr(self, "_holemiss_req_meta_by_id", {}).get(req_id)
+        if request is None:
+            emit("zero", " fallback reason=no_req_meta")
+            return None
+
+        per_group: dict[int, tuple[str, int]] = {}
+        for group_id in state_groups:
+            block_size = get_group_block_size(self.grouped_block_size, group_id)
+            if boundary_tokens % block_size != 0:
+                emit("zero", f" fallback reason=unaligned_boundary group={group_id}")
+                return None
+            group_hashes = get_block_hashes(request.block_hashes, block_size, self.hash_block_size)
+            group_blocks = request.block_ids_by_group[group_id] if group_id < len(request.block_ids_by_group) else []
+            block_index = boundary_tokens // block_size - 1
+            if not 0 <= block_index < min(len(group_hashes), len(group_blocks)):
+                emit("zero", f" fallback reason=boundary_out_of_range group={group_id}")
+                return None
+            key = self._make_layerwise_full_key(group_id, block_hash_to_str(group_hashes[block_index]))
+            per_group[group_id] = (key, int(group_blocks[block_index]))
+
+        keys: list[str] = []
+        buffers: list[list[int]] = []
+        sizes: list[list[int]] = []
+        offsets: list[list[int]] = []
+        for group_id, (key, slot) in per_group.items():
+            builder = self._holemiss_group_builder(group_id)
+            if builder is None:
+                emit("zero", f" fallback reason=no_group_builder group={group_id}")
+                return None
+            shared = SharedBlockData(
+                block_ids_arr=np.asarray([slot], dtype=np.int64),
+                block_gvas_arr=None,
+                block_keys=[key],
+                req_ids=[req_id],
+                is_last_chunks=[None],
+            )
+            group_num_layers = int(self.group_num_layers.get(group_id, builder.num_layers))
+            group_buffers: list[int] = []
+            group_sizes: list[int] = []
+            group_offsets: list[int] = []
+            for layer_idx_in_group in range(group_num_layers):
+                range_meta = builder.build_addrs(shared, layer_idx_in_group)
+                group_buffers.extend(range_meta.all_buffers[0])
+                group_sizes.extend(range_meta.all_sizes[0])
+                group_offsets.extend(range_meta.all_offsets[0])
+            keys.append(key)
+            buffers.append(group_buffers)
+            sizes.append(group_sizes)
+            offsets.append(group_offsets)
+
+        try:
+            results = require_aligned_batch_results(
+                "batch_copy_get",
+                keys,
+                self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
+            )
+        except Exception as exc:
+            emit("zero", f" fallback reason=get_exception detail={str(exc)[:80]}")
+            return None
+        try:
+            # B35's release law: the completed read releases the lease it took.
+            self.m_store.batch_remove_lease(keys)
+        except Exception as exc:
+            logger.warning(
+                "HOLEMISS_GDN_REPAIR_ANCHOR lease release failed tp=%d req=%s error=%s",
+                self.tp_rank,
+                req_id,
+                str(exc)[:120],
+            )
+        failed = [(key, rc) for key, rc in zip(keys, results, strict=True) if rc < 0]
+        if failed:
+            emit("zero", f" fallback reason=get_failed rc={failed[0][1]}")
+            return None
+        # The TE read is CPU-initiated DMA, not stream-ordered: the forward
+        # must not read the anchor slot before the device is synchronized.
+        _holemiss_device_synchronize()
+
+        mapping: dict[int, int] = {}
+        for group_id, (_, slot) in per_group.items():
+            for layer_name in self.kv_cache_config.kv_cache_groups[group_id].layer_names:
+                mapping[self._extract_physical_layer_index(layer_name)] = slot
+        slots_desc = "+".join(f"g{group}:{slot}" for group, (_, slot) in sorted(per_group.items()))
+        emit("boundary", f" slots={slots_desc}")
+        return mapping
+
     def _holemiss_teardown_finished(self, finished_req_ids: set[str]) -> None:
         """B12b: purge HR regions for EVERY finished/failed request.
 
@@ -4166,6 +4311,7 @@ class KVPoolWorker:
                 "_holemiss_state_load_results",
                 "_holemiss_state_markers",
                 "_holemiss_failed_load_keys",
+                "_holemiss_req_meta_by_id",
             ):
                 getattr(self, record_name, {}).pop(req_id, None)
         armed = self._holemiss_armed_fault

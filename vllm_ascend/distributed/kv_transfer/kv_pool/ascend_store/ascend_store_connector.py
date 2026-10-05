@@ -531,6 +531,27 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return None
         return worker.get_gdn_state_load_result(req_id)
 
+    def fetch_gdn_repair_anchor(self, req_id: str, boundary_tokens: int):
+        """D-MTX.4 Option-1 GDN repair anchor: the rollback-boundary state GET.
+
+        Called by the vllm-side HR mixin (hasattr-gated) after G14 fixes the
+        rollback boundary. Returns {physical_layer: repair_slot} for the GDN
+        layers when the boundary object landed (the hook then anchors the
+        repair/fused stream at the TRUE state@repair_start), None on any
+        degrade — the worker emits the loud HOLEMISS_GDN_REPAIR_ANCHOR marker
+        and the hook falls back to the Option-2 zero anchor.
+        """
+        worker = getattr(self, "connector_worker", None)
+        fetch = getattr(worker, "_holemiss_fetch_gdn_repair_anchor", None)
+        if worker is None or not callable(fetch):
+            logger.info(
+                "HOLEMISS_GDN_REPAIR_ANCHOR tp=-1 req=%s kind=zero fallback reason=no_worker_api boundary=%d",
+                req_id,
+                boundary_tokens,
+            )
+            return None
+        return fetch(req_id, boundary_tokens)
+
     def get_hole_recovery_regions(self) -> list:
         """Holemiss HR payload passthrough; the worker store is canonical.
 
