@@ -390,6 +390,121 @@ class TestMemoryTierUnchanged(unittest.TestCase):
         self.assertEqual(sorted(actual), sorted(expected))
 
 
+class TestFaultPathChunking(unittest.TestCase):
+    """F5 (D-MTX.5): the fault arm rides the SAME chunked batches as the
+    default arms.
+
+    The pre-fix fault path delegated the WHOLE merged key list to
+    execute_holemiss_range_target, whose healthy-subset call was ONE
+    unchunked batch_copy_get — at text 16384 (127 healthy objects ~2GiB
+    per rank) the store's batch staging overflowed (file_storage.cpp
+    "Failed to allocate batch objects" -> BUFFER_OVERFLOW) and the load
+    failed wholesale: the whole cached prefix invalidated, the engine
+    recomputed the full prefix, and the GT anchor was reproduced
+    perfectly (the GT-vacuous full-recompute fallback).  With the knob
+    set, only the batch carrying the armed key diverts to the isolated
+    executor; every healthy batch stays <= the knob."""
+
+    def _armed_thread(self, num_keys: int, max_transfer_blocks: int, armed_index: int):
+        metas = {layer: [_layer_req_meta(layer, num_keys=num_keys)] for layer in range(NUM_LAYERS)}
+        task, build_map = _batched_task(metas)
+        thread = _stub_recv_thread(build_map)
+        thread.max_transfer_blocks = max_transfer_blocks
+        thread.max_transfer_bytes = 0
+        armed_key = f"m@h{armed_index}@0"
+        executed: list[tuple[list[str], int]] = []
+
+        def target_position(keys, physical_layer_id):
+            return keys.index(armed_key) if armed_key in keys else None
+
+        def execute_target(keys, buffers, sizes, offsets, target_pos):
+            executed.append((list(keys), target_pos))
+            return [-1102 if i == target_pos else (sum(sizes[i]) if sizes[i] else 0) for i in range(len(keys))]
+
+        worker = SimpleNamespace(
+            _holemiss_armed_fault={"key": armed_key, "layer_id": 2},
+            use_hybrid=False,
+        )
+        worker.holemiss_range_target_position = target_position
+        worker.execute_holemiss_range_target = execute_target
+        thread.worker = worker
+        return thread, task, executed
+
+    def test_knob_set_healthy_batches_respect_the_knob(self):
+        """5 keys, knob 2, the armed key at the end: the healthy keys ride
+        plain store calls of <= 2 keys each; only the armed batch (the
+        last, alone at the chunk boundary) diverts to the executor."""
+        thread, task, executed = self._armed_thread(num_keys=5, max_transfer_blocks=2, armed_index=4)
+        store_calls: list[tuple[str, ...]] = []
+
+        def store_call(keys, buffers, sizes, offsets):
+            store_calls.append(tuple(keys))
+            return [sum(sizes_k) if sizes_k else 0 for sizes_k in sizes]
+
+        thread.m_store.batch_copy_get.side_effect = store_call
+        thread._handle_batched_range_layer_task(task)
+        self.assertEqual(
+            store_calls,
+            [("m@h0@0", "m@h1@0"), ("m@h2@0", "m@h3@0")],
+            "healthy batches are chunked by the knob",
+        )
+        self.assertEqual(executed, [(["m@h4@0"], 0)], "the armed batch diverts alone")
+        self.assertEqual(thread._invalid_block_ids, {104}, "only the armed key's block")
+        for event in thread.layer_load_finished_events:
+            self.assertTrue(event.is_set())
+
+    def test_knob_set_armed_key_mid_chunk_isolates_within_it(self):
+        """The armed key landing INSIDE a chunk: that chunk diverts whole
+        (its healthy subset rides the executor's own healthy call), the
+        other chunks stay plain — the failure mapping stays global."""
+        thread, task, executed = self._armed_thread(num_keys=5, max_transfer_blocks=2, armed_index=1)
+        store_calls: list[tuple[str, ...]] = []
+
+        def store_call(keys, buffers, sizes, offsets):
+            store_calls.append(tuple(keys))
+            return [sum(sizes_k) if sizes_k else 0 for sizes_k in sizes]
+
+        thread.m_store.batch_copy_get.side_effect = store_call
+        thread._handle_batched_range_layer_task(task)
+        self.assertEqual(store_calls, [("m@h2@0", "m@h3@0"), ("m@h4@0",)])
+        self.assertEqual(executed, [(["m@h0@0", "m@h1@0"], 1)])
+        self.assertEqual(thread._invalid_block_ids, {101})
+
+    def test_b27_retry_stays_failed_rows_only_under_chunking(self):
+        """The B27 semantics survive the chunking: a -706 on a HEALTHY key
+        (in a plain chunk) retries via exactly one plain call carrying that
+        key alone; the armed key's injected -1102 never rides a plain
+        re-issue (the EIO pin, UT-3's chunked twin)."""
+        thread, task, executed = self._armed_thread(num_keys=5, max_transfer_blocks=2, armed_index=4)
+        store_calls: list[tuple[str, ...]] = []
+        lease_failures = {"m@h0@0": 1}
+
+        def store_call(keys, buffers, sizes, offsets):
+            store_calls.append(tuple(keys))
+            results = []
+            for key, sizes_k in zip(keys, sizes):
+                remaining = lease_failures.get(key, 0)
+                if remaining > 0:
+                    lease_failures[key] = remaining - 1
+                    results.append(-706)
+                else:
+                    results.append(sum(sizes_k) if sizes_k else 0)
+            return results
+
+        thread.m_store.batch_copy_get.side_effect = store_call
+        with patch(KV_TIME_SLEEP):
+            thread._handle_batched_range_layer_task(task)
+        self.assertEqual(
+            store_calls,
+            [("m@h0@0", "m@h1@0"), ("m@h2@0", "m@h3@0"), ("m@h0@0",)],
+            "the retry carries the failed row only",
+        )
+        self.assertNotIn("m@h4@0", store_calls[-1])
+        self.assertEqual(thread._invalid_block_ids, {104}, "the armed key stands; the -706 healed")
+        for event in thread.layer_load_finished_events:
+            self.assertTrue(event.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()
 

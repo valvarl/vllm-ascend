@@ -115,6 +115,46 @@ class TestArmedRangeRouting(unittest.TestCase):
         self.assertEqual(results, [0])
         worker.execute_holemiss_range_target.assert_not_called()
 
+    def test_knob_set_armed_chunk_diverts_others_chunk(self):
+        """F5 (D-MTX.5): with the transfer knob set the per-layer fault
+        path rides the SAME chunked batches as the default arms — only the
+        batch carrying the armed key diverts to the isolated executor (the
+        pre-fix delegation handed the whole layer list over in ONE
+        unchunked healthy-subset call, the file_storage BUFFER_OVERFLOW at
+        >=2GiB/rank)."""
+        worker = MagicMock()
+        worker._holemiss_armed_fault = {"key": "k2"}
+        worker.holemiss_range_target_position.side_effect = (
+            lambda keys, layer: keys.index("k2") if "k2" in keys else None
+        )
+        worker.execute_holemiss_range_target.side_effect = lambda keys, buffers, sizes, offsets, target_pos: [
+            -1102 if i == target_pos else 0 for i in range(len(keys))
+        ]
+        thread = self._thread(worker)
+        thread.max_transfer_blocks = 2
+        thread.m_store.batch_copy_get.side_effect = lambda keys, buffers, sizes, offsets: [0] * len(keys)
+        results = thread._issue_range_get(
+            ["k0", "k1", "k2", "k3"],
+            [[1]] * 4,
+            [[2]] * 4,
+            [[0]] * 4,
+            5,
+        )
+        self.assertEqual(results, [0, 0, -1102, 0])
+        # The healthy keys before the armed batch rode ONE plain chunked
+        # call of <= 2 keys; the armed batch never hit the plain path.
+        self.assertEqual(
+            [call.args[0] for call in thread.m_store.batch_copy_get.call_args_list],
+            [["k0", "k1"]],
+        )
+        # The armed batch diverted whole, the armed key at chunk-local 0.
+        worker.execute_holemiss_range_target.assert_called_once()
+        divert_keys, divert_buffers, divert_sizes, divert_offsets, divert_pos = (
+            worker.execute_holemiss_range_target.call_args.args
+        )
+        self.assertEqual(divert_keys, ["k2", "k3"])
+        self.assertEqual(divert_pos, 0)
+
 
 class TestConnectorRegions(EnvBase):
     def _connector(self, regions):

@@ -2118,14 +2118,17 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         layer_id: int,
     ) -> list[int]:
         worker = self.worker
-        if worker is not None and hasattr(worker, "holemiss_range_target_position"):
-            if getattr(worker, "_holemiss_armed_fault", None) is not None:
-                target = worker.holemiss_range_target_position(active_keys, layer_id)
-                if target is not None:
-                    return worker.execute_holemiss_range_target(
-                        active_keys, active_buffers, active_sizes, active_offsets, target
-                    )
+        armed = getattr(worker, "_holemiss_armed_fault", None) if worker is not None else None
+        has_target_gate = worker is not None and hasattr(worker, "holemiss_range_target_position")
         results: list[int] = []
+        # The fault arm rides the SAME chunked batches as the default arms
+        # (F5): an unchunked healthy-subset call stages every object in ONE
+        # batch allocation, which overflows the store's staging buffer at
+        # >=2GiB per rank (file_storage.cpp "Failed to allocate batch
+        # objects" -> BUFFER_OVERFLOW -> the whole-prefix invalidation).
+        # Only the batch carrying the armed key diverts to the isolated
+        # executor; with both transfer knobs unset the single batch IS the
+        # whole list, preserving the legacy single-shot shape.
         for keys, buffers, sizes, offsets in self._range_transfer_batches(
             active_keys,
             active_buffers,
@@ -2134,13 +2137,19 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.max_transfer_blocks,
             self.max_transfer_bytes,
         ):
-            results.extend(
-                require_aligned_batch_results(
-                    "batch_copy_get",
-                    keys,
-                    self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
+            target = None
+            if armed is not None and has_target_gate:
+                target = worker.holemiss_range_target_position(keys, layer_id)
+            if target is not None:
+                results.extend(worker.execute_holemiss_range_target(keys, buffers, sizes, offsets, target))
+            else:
+                results.extend(
+                    require_aligned_batch_results(
+                        "batch_copy_get",
+                        keys,
+                        self.m_store.batch_copy_get(keys, buffers, sizes, offsets),
+                    )
                 )
-            )
         return results
 
     def _handle_range_request(self, req_meta: LayerRangeReqMeta, shared: SharedBlockData) -> None:
@@ -2250,27 +2259,39 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             active_buffers = merged_buffers
             active_sizes = merged_sizes
             active_offsets = merged_offsets
+            has_target_gate = worker is not None and hasattr(worker, "holemiss_range_target_position")
             target_position = None
-            if worker is not None and hasattr(worker, "holemiss_range_target_position") and armed is not None:
+            if has_target_gate and armed is not None:
                 # The merged call spans every layer; the position logic gates
                 # on the ARMED layer so the isolated target read fires
                 # exactly once (the per-layer shape deduplicated via the
-                # active-index skip — the count is unchanged).
+                # active-index skip — the count is unchanged). The full-list
+                # position also feeds the B27 retry's armed-key exclusion.
                 target_position = worker.holemiss_range_target_position(active_keys, armed_layer_id)
-            if target_position is not None and worker is not None:
-                results = worker.execute_holemiss_range_target(
-                    active_keys, active_buffers, active_sizes, active_offsets, target_position
-                )
-            else:
-                results = []
-                for keys, buffers, sizes, offsets in self._range_transfer_batches(
-                    active_keys,
-                    active_buffers,
-                    active_sizes,
-                    active_offsets,
-                    self.max_transfer_blocks,
-                    self.max_transfer_bytes,
-                ):
+            results: list[int] = []
+            # The fault arm rides the SAME chunked batches as the default
+            # arms (F5): an unchunked healthy-subset call stages every
+            # object in ONE batch allocation, which overflows the store's
+            # staging buffer at >=2GiB per rank (file_storage.cpp "Failed
+            # to allocate batch objects" -> BUFFER_OVERFLOW -> the
+            # whole-prefix invalidation). Only the batch carrying the armed
+            # key diverts to the isolated executor; with both transfer
+            # knobs unset the single batch IS the whole merged list,
+            # preserving the legacy single-shot fault shape.
+            for keys, buffers, sizes, offsets in self._range_transfer_batches(
+                active_keys,
+                active_buffers,
+                active_sizes,
+                active_offsets,
+                self.max_transfer_blocks,
+                self.max_transfer_bytes,
+            ):
+                chunk_target = None
+                if target_position is not None and has_target_gate:
+                    chunk_target = worker.holemiss_range_target_position(keys, armed_layer_id)
+                if chunk_target is not None:
+                    results.extend(worker.execute_holemiss_range_target(keys, buffers, sizes, offsets, chunk_target))
+                else:
                     results.extend(
                         require_aligned_batch_results(
                             "batch_copy_get",
