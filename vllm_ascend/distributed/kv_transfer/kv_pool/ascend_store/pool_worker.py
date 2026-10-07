@@ -4187,20 +4187,31 @@ class KVPoolWorker:
         rollback boundary is an older rung whose key the plan builder's own
         derivation yields.
 
-        D-MTX.7 LANDING (the run3 adjudication): the anchor lands at the
-        scheduler-allocated SCRATCH block stamped on the request's ReqMeta
-        (``repair_scratch_slot``; pool_scheduler._holemiss_attach_repair_scratch
-        allocates one per load-bearing step). The landing surface was disproven
-        twice before: the D-MTX.4 "own boundary slots" read masked null-table
-        entries (a no-op), and the D-MTX.6 null-block row (slot 0) executed
-        its full transfer plan yet the bytes never arrived at the row (the
-        run3 ``reason=landed_zero`` evidence — the GET's bytes demonstrably
-        arrive only at rows the pool's allocation machinery hands out, i.e.
-        the drain's working slots). The scratch is a real allocated row in
-        every state group's tensors (one shared pool id), referenced by NO
-        request table column, so the mamba align pre-copy can never see it
-        as src/dst; the kernels reach it through the hook's rebuilt metadata
-        (state_idx=scratch — the same state-index path the run3 zero-anchor
+        D-MTX.7 LANDING (the run3 adjudication) + the D15/D16 per-group
+        repair: the anchor lands at the scheduler-allocated scratch rows
+        stamped on the request's ReqMeta (``repair_scratch_slots``; ONE ROW
+        PER GDN STATE GROUP, allocated per load-bearing step by
+        pool_scheduler._holemiss_attach_repair_scratch). The D15/D16
+        evidence: the 48 GDN pools are 16 SHARED tensors per family
+        (layers 4k/4k+1/4k+2 alias the same conv+ssm tensors; the groups
+        are round-robin over them), so the pre-fix single shared row made
+        all three groups' GETs land at the same addresses and only one
+        group's content survived — every non-surviving group's layers
+        anchored at the wrong group's state (the D14 layer-1 ssm
+        divergence, the F-H3/D-MTX.11 root). One row per group is the
+        platform's own convention (the drain lands each group's state at
+        its own row of the shared tensor). The landing surface was
+        disproven twice before: the D-MTX.4 "own boundary slots" read
+        masked null-table entries (a no-op), and the D-MTX.6 null-block
+        row (slot 0) executed its full transfer plan yet the bytes never
+        arrived at the row (the run3 ``reason=landed_zero`` evidence —
+        the GET's bytes demonstrably arrive only at rows the pool's
+        allocation machinery hands out, i.e. the drain's working slots).
+        The scratch rows are real allocated rows in every state group's
+        tensors, referenced by NO request table column, so the mamba
+        align pre-copy can never see them as src/dst; the kernels reach
+        them through the hook's rebuilt metadata (state_idx=the group's
+        scratch row — the same state-index path the run3 zero-anchor
         fallback proved kernel-writable). An absent/invalid/busy scratch
         degrades LOUDLY to the zero anchor — never the null row, never a
         guessed slot.
@@ -4244,18 +4255,46 @@ class KVPoolWorker:
             emit("zero", " fallback reason=no_req_meta")
             return None
 
-        scratch_slot = getattr(request, "repair_scratch_slot", None)
-        if not isinstance(scratch_slot, int) or scratch_slot <= 0:
+        scratch_slots_raw = getattr(request, "repair_scratch_slots", None)
+        scratch_slots: list[int] = []
+        if isinstance(scratch_slots_raw, (list, tuple)):
+            for candidate in scratch_slots_raw:
+                if isinstance(candidate, int):
+                    scratch_slots.append(candidate)
+        if len(scratch_slots) < len(state_groups):
             # The D-MTX.6 null-row fallback is RETIRED: the run3 battery
             # proved the null row never receives the GET bytes (landed_zero
-            # on every fault row). No scratch on the ReqMeta means the
-            # scheduler could not arm one — degrade loudly.
-            emit("zero", " fallback reason=no_scratch_slot")
+            # on every fault row). The D15/D16 evidence requires ONE row
+            # PER STATE GROUP: the GDN pools alias across each (4k, 4k+1,
+            # 4k+2) layer triple, so a single shared row collapses every
+            # group's GET onto one address (only one group's content
+            # survives — every other group anchors at the wrong layer's
+            # state). A missing/short list means the scheduler could not
+            # arm the per-group rows — degrade loudly.
+            emit(
+                "zero",
+                f" fallback reason=no_scratch_slot slots={len(scratch_slots)} groups={len(state_groups)}",
+            )
             return None
-        if getattr(self, "num_blocks", 0) and scratch_slot >= self.num_blocks:
-            # The never-guess bounds law: an out-of-range id would DMA-write
-            # past the state tensors (silent corruption of foreign memory).
-            emit("zero", f" fallback reason=scratch_out_of_range slot={scratch_slot}")
+        for slot in scratch_slots[: len(state_groups)]:
+            if slot <= 0:
+                emit("zero", f" fallback reason=no_scratch_slot slot={slot}")
+                return None
+            if getattr(self, "num_blocks", 0) and slot >= self.num_blocks:
+                # The never-guess bounds law: an out-of-range id would
+                # DMA-write past the state tensors (silent corruption of
+                # foreign memory).
+                emit("zero", f" fallback reason=scratch_out_of_range slot={slot}")
+                return None
+        if len(set(scratch_slots[: len(state_groups)])) != len(state_groups):
+            # The D15 law: the GDN pool tensors alias across each layer
+            # triple, so two groups sharing one row collapses their GETs
+            # onto one address — the exact defect this fetch exists to
+            # repair. Refuse a collapsed list loudly, never re-arm it.
+            emit(
+                "zero",
+                f" fallback reason=scratch_not_per_group slots={scratch_slots[: len(state_groups)]}",
+            )
             return None
         owner = getattr(self, "_holemiss_scratch_owner", None)
         if owner is not None and owner != req_id:
@@ -4264,9 +4303,8 @@ class KVPoolWorker:
             emit("zero", f" fallback reason=scratch_busy owner={owner}")
             return None
         self._holemiss_scratch_owner = req_id
-        anchor_slot = scratch_slot
         per_group: dict[int, tuple[str, int]] = {}
-        for group_id in state_groups:
+        for group_index, group_id in enumerate(state_groups):
             block_size = get_group_block_size(self.grouped_block_size, group_id)
             if boundary_tokens % block_size != 0:
                 emit("zero", f" fallback reason=unaligned_boundary group={group_id}")
@@ -4277,7 +4315,7 @@ class KVPoolWorker:
                 emit("zero", f" fallback reason=boundary_out_of_range group={group_id}")
                 return None
             key = self._make_layerwise_full_key(group_id, block_hash_to_str(group_hashes[block_index]))
-            per_group[group_id] = (key, anchor_slot)
+            per_group[group_id] = (key, scratch_slots[group_index])
 
         keys: list[str] = []
         buffers: list[list[int]] = []
@@ -4356,8 +4394,8 @@ class KVPoolWorker:
         # content the repair never observes.
         landed_zero: list[int] = []
         landed_shas: list[str] = []
-        for group_id, _ in sorted(per_group.items()):
-            probe = self._holemiss_anchor_row_probe(group_id, anchor_slot)
+        for group_id, (_, slot) in sorted(per_group.items()):
+            probe = self._holemiss_anchor_row_probe(group_id, slot)
             if probe is None:
                 continue
             sha, nonzero = probe

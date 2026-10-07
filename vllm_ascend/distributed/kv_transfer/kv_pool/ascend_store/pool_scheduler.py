@@ -154,13 +154,16 @@ class KVPoolScheduler:
         self._loading_req_ids: set[str] = set()
 
         self._block_pool: BlockPool | None = None
-        # D-MTX.7: the GDN repair-anchor scratch block held for the CURRENT
+        # D-MTX.7: the GDN repair-anchor scratch blocks held for the CURRENT
         # load-bearing step's lifetime (alloc at build_connector_meta, free at
-        # update_connector_output). One shared pool id serves every state
-        # group (each group's tensors hold their own row with that id); the
+        # update_connector_output). One row PER GDN STATE GROUP (group order):
+        # the D16 runtime dump proved the GDN pools are shared tensors aliased
+        # across each (4k, 4k+1, 4k+2) layer triple, so a single shared row
+        # collapses every group's GET onto one address and only one group's
+        # content survives (the D15 permutation, the F-H3/D-MTX.11 root). The
         # refcount discipline is this tracker alone - never a request table
         # entry, so the mamba align pre-copy can never see it as src/dst.
-        self._holemiss_repair_scratch: KVCacheBlock | None = None
+        self._holemiss_repair_scratch: list[KVCacheBlock] | None = None
         self.sending_event_id = 0
         # {event_id, flattened block_ids}
         self.sending_blocks: dict[int, list[int]] = {}
@@ -1259,26 +1262,47 @@ class KVPoolScheduler:
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         self._block_pool = gpu_block_pool
 
+    def _holemiss_gdn_state_group_count(self) -> int:
+        """The GDN state-group count (the worker's _holemiss_state_groups)."""
+        if not self.use_hybrid or self.kv_cache_config is None:
+            return 0
+        count = 0
+        for group_spec in self.kv_cache_config.kv_cache_groups:
+            spec = group_spec.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = next(iter(spec.kv_cache_specs.values()))
+            if isinstance(spec, MambaSpec):
+                count += 1
+        return count
+
     def _holemiss_attach_repair_scratch(self, meta: AscendConnectorMetadata) -> None:
-        """D-MTX.7: arm ONE scheduler-allocated scratch block for the GDN
-        repair anchor on hybrid load-bearing steps.
+        """D-MTX.7 + D15/D16: arm the scratch rows for the GDN repair anchor
+        on hybrid load-bearing steps -- ONE ROW PER GDN STATE GROUP.
 
         The run3 battery proved the GET's bytes arrive only at rows the
         pool's own allocation machinery has handed out (the drain lands at
         the working slots; the never-allocated null row never receives
         them), and the worker cannot allocate (no BlockPool reference, a
-        separate process under spawn+TP). So the scheduler allocates ONE
-        block per load-bearing step and stamps it on every load-capable
-        request's ReqMeta; the worker's _holemiss_fetch_gdn_repair_anchor
-        lands the rollback-boundary state there. Never a request-table
-        entry (the mamba align pre-copy src/dst window), never the null
-        row; any degrade keeps the hook's loud zero anchor.
+        separate process under spawn+TP). So the scheduler allocates one
+        block PER STATE GROUP per load-bearing step and stamps the list on
+        every load-capable request's ReqMeta; the worker's
+        _holemiss_fetch_gdn_repair_anchor lands each group's rollback
+        boundary state at that group's own row. The D15/D16 evidence: the
+        GDN pools alias across each (4k, 4k+1, 4k+2) layer triple, so the
+        pre-fix single shared row collapsed all three groups' GETs onto
+        one address and every non-surviving group anchored at the wrong
+        layer's state. Never a request-table entry (the mamba align
+        pre-copy src/dst window), never the null row; any degrade keeps
+        the hook's loud zero anchor.
         """
         if not self.use_hybrid or not self.use_layerwise:
             return
         load_capable = [req for req in meta.requests if req.load_spec is not None and req.load_spec.can_load]
         if not load_capable:
             self._holemiss_release_repair_scratch()
+            return
+        n_slots = self._holemiss_gdn_state_group_count()
+        if n_slots <= 0:
             return
         if self._holemiss_repair_scratch is None:
             if self._block_pool is None:
@@ -1288,41 +1312,60 @@ class KVPoolScheduler:
                 )
                 return
             try:
-                self._holemiss_repair_scratch = self._block_pool.get_new_blocks(1)[0]
+                self._holemiss_repair_scratch = self._block_pool.get_new_blocks(n_slots)
             except ValueError as exc:
                 logger.warning(
                     "HOLEMISS_REPAIR_SCRATCH alloc failed reason=%s (the GDN repair anchor degrades to the zero state)",
                     str(exc)[:80],
                 )
                 return
-            logger.info("HOLEMISS_REPAIR_SCRATCH_ALLOC block=%d", self._holemiss_repair_scratch.block_id)
-        slot = self._holemiss_repair_scratch.block_id
+            logger.info(
+                "HOLEMISS_REPAIR_SCRATCH_ALLOC blocks=%s",
+                [block.block_id for block in self._holemiss_repair_scratch],
+            )
+        slots = [block.block_id for block in self._holemiss_repair_scratch]
+        if len(slots) != n_slots:
+            # The geometry is static per engine; a mismatch means the tracker
+            # predates this build. Refuse to arm a wrong-count list (the
+            # never-guess law): release and let the next step re-allocate.
+            logger.warning(
+                "HOLEMISS_REPAIR_SCRATCH count mismatch held=%d need=%d "
+                "(releasing; the anchor degrades to the zero state)",
+                len(slots),
+                n_slots,
+            )
+            self._holemiss_release_repair_scratch()
+            return
         for req_meta in load_capable:
-            req_meta.repair_scratch_slot = slot
+            req_meta.repair_scratch_slot = slots[0]
+            req_meta.repair_scratch_slots = list(slots)
 
     def _holemiss_release_repair_scratch(self) -> None:
-        """Free the step's repair-anchor scratch (the never-leak discipline).
+        """Free the step's repair-anchor scratch rows (the never-leak discipline).
 
-        The block's lifetime is exactly one load-bearing step: the anchor
+        The blocks' lifetime is exactly one load-bearing step: the anchor
         fetch + repair both run inside that step's forward, so the earliest
         scheduler-side release point is this step's update_connector_output.
         A release skipped by an aborted step merely extends the hold (the
         next load-less build releases it here); the tracker is the single
         owner, so a double release is structurally impossible.
         """
-        block = self._holemiss_repair_scratch
-        if block is None:
+        blocks = self._holemiss_repair_scratch
+        if blocks is None:
             return
         self._holemiss_repair_scratch = None
         if self._block_pool is None:
             return
         try:
-            self._block_pool.free_blocks([block])
-            logger.info("HOLEMISS_REPAIR_SCRATCH_FREE block=%d", block.block_id)
+            self._block_pool.free_blocks(blocks)
+            logger.info(
+                "HOLEMISS_REPAIR_SCRATCH_FREE blocks=%s",
+                [block.block_id for block in blocks],
+            )
         except (KeyError, ValueError, AssertionError) as exc:
             logger.error(
-                "HOLEMISS_REPAIR_SCRATCH free failed block=%d error=%s",
-                block.block_id,
+                "HOLEMISS_REPAIR_SCRATCH free failed blocks=%s error=%s",
+                [block.block_id for block in blocks],
                 str(exc)[:120],
             )
 

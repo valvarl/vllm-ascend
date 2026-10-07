@@ -987,6 +987,17 @@ class ReqMeta:
     # D-MTX.6 run3 battery proved the null row never receives the GET bytes).
     repair_scratch_slot: int | None = None
 
+    # D15/D16 (hrc_t3): the per-GDN-group scratch rows for the anchor
+    # landing. The D16 runtime dump proved the 48 GDN pools are 16 SHARED
+    # tensors per family (layers 4k/4k+1/4k+2 alias the same conv+ssm
+    # tensors; groups are round-robin over them), so one shared row makes
+    # every group's GET land at the same address and only one group's
+    # content survives — every non-surviving group anchors at the wrong
+    # layer's state (the D15 permutation, the F-H3/D-MTX.11 root). The
+    # scheduler allocates one row PER STATE GROUP (group order) and stamps
+    # the list here; the singular field stays as the legacy first-slot view.
+    repair_scratch_slots: list[int] | None = None
+
     # The following parameters are only used for kv event generation
     # TODO: add lora_request which used for gen lora_id/lora_name in kv event
     token_ids: list[int] | None = None
@@ -1035,6 +1046,7 @@ class ReqMeta:
         load_last_block_key: str | None = None,
         load_keys: list[str] | None = None,
         repair_scratch_slot: int | None = None,
+        repair_scratch_slots: list[int] | None = None,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -1078,6 +1090,7 @@ class ReqMeta:
         self.load_last_block_key = load_last_block_key
         self.load_keys = [] if load_keys is None else list(load_keys)
         self.repair_scratch_slot = repair_scratch_slot
+        self.repair_scratch_slots = repair_scratch_slots
 
     @property
     def block_ids(self) -> list[int]:

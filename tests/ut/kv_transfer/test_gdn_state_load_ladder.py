@@ -284,16 +284,21 @@ def _stub_worker(num_state_groups: int = 3):
     return pool
 
 
-def _hybrid_request(req_id="req-H", num_blocks=4, repair_scratch_slot=510):
+def _hybrid_request(req_id="req-H", num_blocks=4, repair_scratch_slot=510, repair_scratch_slots=None):
     # D-MTX.6 live geometry (N18/N19): the consumer's state-group tables carry
     # the NULL-BLOCK PREFIX (RequestTracker.update_mamba_spec_blocks masks the
     # retired boundaries to 0) with only the working entry live — the pre-fix
     # fake modeled unmasked per-boundary slots and green-lit a landing the
     # live tables never present.
     # D-MTX.7 live geometry: the anchor lands at the SCHEDULER-ALLOCATED
-    # scratch block stamped on the ReqMeta (a real pool row — the run3
+    # scratch blocks stamped on the ReqMeta (real pool rows — the run3
     # battery proved the GET's bytes arrive only at allocated rows; the null
-    # row never receives them).
+    # row never receives them). D15/D16 live geometry: ONE ROW PER STATE
+    # GROUP — the GDN pools alias across each (4k, 4k+1, 4k+2) layer triple,
+    # so a shared row collapses every group's GET onto one address (the
+    # pre-fix fake modeled the singular slot, green-lighting the collision).
+    if repair_scratch_slots is None and isinstance(repair_scratch_slot, int):
+        repair_scratch_slots = [repair_scratch_slot + i for i in range(3)]
     return ReqMeta(
         req_id=req_id,
         block_ids_by_group=[[10 + i for i in range(num_blocks)]]
@@ -307,6 +312,7 @@ def _hybrid_request(req_id="req-H", num_blocks=4, repair_scratch_slot=510):
             vllm_cached_tokens=0,
         ),
         repair_scratch_slot=repair_scratch_slot,
+        repair_scratch_slots=repair_scratch_slots,
     )
 
 
@@ -679,10 +685,12 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
 
         # block_index = boundary // 1536 - 1 = 1: the OLDER rung's key per
-        # group. The landing target is the scheduler-allocated scratch row
-        # (the one shared pool id across every state group's tensors); the
-        # builder math is the drain's own base + slot*stride (D-MTX.7).
-        self.assertEqual(mapping, {1: 510, 2: 510, 3: 510})
+        # group. The landing targets are the scheduler-allocated scratch
+        # rows, ONE PER STATE GROUP (the D15/D16 law: the GDN pools alias
+        # across each layer triple, so a shared row collapses every group's
+        # GET onto one address); the builder math is the drain's own
+        # base + slot*stride (D-MTX.7).
+        self.assertEqual(mapping, {1: 510, 2: 511, 3: 512})
         self.assertEqual(len(store.get_calls), 1)
         keys, buffers, sizes, offsets = store.get_calls[0]
         self.assertEqual(
@@ -691,9 +699,10 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         )
         for group, key in zip(GROUPS, keys, strict=True):
             index = keys.index(key)
+            slot = 510 + (group - GROUPS[0])
             self.assertEqual(
                 buffers[index],
-                [100000 + 1000 * group + 510 * 8, 200000 + 1000 * group + 510 * 12],
+                [100000 + 1000 * group + slot * 8, 200000 + 1000 * group + slot * 12],
             )
             self.assertEqual(sizes[index], [1600, 2400])
             self.assertEqual(offsets[index], [0, 1600])
@@ -704,7 +713,7 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
                 "HOLEMISS_GDN_REPAIR_ANCHOR" in line
                 and "kind=boundary" in line
                 and "boundary=3072" in line
-                and "slots=g1:510+g2:510+g3:510" in line
+                and "slots=g1:510+g2:511+g3:512" in line
                 and "landing=scratch_slot" in line
                 for line in markers
             ),
@@ -712,6 +721,27 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         )
         # The owner guard latched: the fetch claimed the scratch for req-H.
         self.assertEqual(pool._holemiss_scratch_owner, "req-H")
+
+    def test_collapsed_scratch_slots_refused_loudly(self):
+        """The D15 regression pin: a scratch list assigning TWO groups the
+        same row re-arms the shared-row collision (the GDN pools alias
+        across each layer triple, so the writes land at one address and
+        only one group's content survives). Refuse loudly, never run it."""
+        pool = _anchor_stub_worker()
+        request = _hybrid_request(repair_scratch_slots=[510, 510, 512])
+        self._prime(pool, request)
+        store = _FakeAnchorStore(results=[0, 0, 0])
+        pool.m_store = store
+
+        mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
+
+        self.assertIsNone(mapping)
+        markers = pool._holemiss_state_markers["req-H"]
+        self.assertTrue(
+            any("kind=zero fallback" in line and "reason=scratch_not_per_group" in line for line in markers),
+            markers,
+        )
+        self.assertEqual(store.get_calls, [])
 
     def test_no_scratch_degrades_loudly_never_the_null_row(self):
         """D-MTX.7: the RED TWIN of the D-MTX.6 null-scratch landing — a
@@ -777,14 +807,17 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         )
         self.assertEqual(store.get_calls, [])
 
-    def _probe_stub_worker(self, ssm_row, num_rows=512):
+    def _probe_stub_worker(self, ssm_row, num_rows=520):
         pool = _anchor_stub_worker()
         pool.kv_caches = {}
         for group in GROUPS:
             layer_name = pool.kv_cache_config.kv_cache_groups[group].layer_names[0]
             conv = torch.zeros(num_rows, 3, dtype=torch.float32)
             ssm = torch.zeros(num_rows, 8, 8, dtype=torch.float32)
-            ssm[510] = ssm_row
+            # The probe reads each group's first layer at THAT group's
+            # scratch row (the D15/D16 per-group landing).
+            for slot in (510, 511, 512):
+                ssm[slot] = ssm_row
             pool.kv_caches[layer_name] = (conv, ssm)
         return pool
 
@@ -816,7 +849,7 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
 
         mapping = pool._holemiss_fetch_gdn_repair_anchor("req-H", 2 * BLOCK)
 
-        self.assertEqual(mapping, {1: 510, 2: 510, 3: 510})
+        self.assertEqual(mapping, {1: 510, 2: 511, 3: 512})
         markers = pool._holemiss_state_markers["req-H"]
         boundary_lines = [line for line in markers if "kind=boundary" in line]
         self.assertEqual(len(boundary_lines), 1)
@@ -913,7 +946,7 @@ class TestGdnRepairAnchorFetch(unittest.TestCase):
         connector.connector_worker = pool
         self.assertEqual(
             connector.fetch_gdn_repair_anchor("req-H", 2 * BLOCK),
-            {1: 510, 2: 510, 3: 510},
+            {1: 510, 2: 511, 3: 512},
         )
         connector.connector_worker = None
         with self.assertLogs("vllm", level="INFO") as logs:
@@ -944,12 +977,29 @@ class _FakeBlockPool:
         self.freed.extend(block.block_id for block in blocks)
 
 
-def _scratch_scheduler(use_hybrid=True, use_layerwise=True, block_pool=None):
+def _scratch_scheduler(use_hybrid=True, use_layerwise=True, block_pool=None, state_groups=3):
     scheduler = pool_scheduler.KVPoolScheduler.__new__(pool_scheduler.KVPoolScheduler)
     scheduler.use_hybrid = use_hybrid
     scheduler.use_layerwise = use_layerwise
     scheduler._block_pool = block_pool
     scheduler._holemiss_repair_scratch = None
+    full = FullAttentionSpec(block_size=BLOCK, num_kv_heads=2, head_size=128, dtype=torch.float32)
+    mamba = MambaSpec(
+        block_size=BLOCK,
+        shapes=((8,), (8,)),
+        dtypes=(torch.float32, torch.float32),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode="align",
+    )
+    scheduler.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=full, layer_names=["model.layers.0.attn"]),
+            *(
+                SimpleNamespace(kv_cache_spec=mamba, layer_names=[f"model.layers.{i}.linear_attn"])
+                for i in range(state_groups)
+            ),
+        ]
+    )
     return scheduler
 
 
@@ -963,18 +1013,22 @@ def _load_meta(with_load=True):
 
 
 class TestRepairScratchAllocation(unittest.TestCase):
-    """D-MTX.7: the scheduler-allocated scratch for the GDN repair anchor.
+    """D-MTX.7 + D15/D16: the scheduler-allocated scratch rows for the GDN
+    repair anchor.
 
     The worker cannot allocate (no BlockPool reference — a separate process
     under spawn+TP), and the run3 battery proved the GET's bytes arrive only
     at rows the pool's allocation machinery hands out. So the pool_scheduler
-    allocates ONE block per load-bearing hybrid step, stamps it on every
-    load-capable request's ReqMeta, and frees it at update_connector_output
-    (the never-leak discipline: the tracker is the single owner).
+    allocates ONE BLOCK PER GDN STATE GROUP per load-bearing hybrid step
+    (the D15/D16 law: the GDN pools alias across each layer triple, so a
+    shared row collapses every group's GET onto one address — the F-H3 /
+    D-MTX.11 root), stamps the list on every load-capable request's
+    ReqMeta, and frees all of them at update_connector_output (the
+    never-leak discipline: the tracker is the single owner).
     """
 
     def test_alloc_once_and_stamp_on_load_capable_requests(self):
-        block_pool = _FakeBlockPool(block_ids=(77,))
+        block_pool = _FakeBlockPool(block_ids=(77, 78, 79))
         scheduler = _scratch_scheduler(block_pool=block_pool)
 
         meta = _load_meta()
@@ -982,13 +1036,17 @@ class TestRepairScratchAllocation(unittest.TestCase):
         scheduler._holemiss_attach_repair_scratch(meta)
 
         # ONE allocation per step (the second attach is idempotent — the
-        # tracker holds the block).
-        self.assertEqual(block_pool.alloc_calls, [1])
+        # tracker holds the blocks).
+        self.assertEqual(block_pool.alloc_calls, [3])
         self.assertEqual(meta.requests[0].repair_scratch_slot, 77)
-        self.assertEqual(scheduler._holemiss_repair_scratch.block_id, 77)
+        self.assertEqual(meta.requests[0].repair_scratch_slots, [77, 78, 79])
+        self.assertEqual(
+            [block.block_id for block in scheduler._holemiss_repair_scratch],
+            [77, 78, 79],
+        )
 
     def test_release_at_update_connector_output(self):
-        block_pool = _FakeBlockPool(block_ids=(77,))
+        block_pool = _FakeBlockPool(block_ids=(77, 78, 79))
         scheduler = _scratch_scheduler(block_pool=block_pool)
         scheduler._holemiss_attach_repair_scratch(_load_meta())
         self.assertIsNotNone(scheduler._holemiss_repair_scratch)
@@ -1001,15 +1059,15 @@ class TestRepairScratchAllocation(unittest.TestCase):
         scheduler.update_connector_output(_NoMeta())
 
         self.assertIsNone(scheduler._holemiss_repair_scratch)
-        self.assertEqual(block_pool.freed, [77])
+        self.assertEqual(block_pool.freed, [77, 78, 79])
         # Idempotent: a second release is a no-op (never a double free).
         scheduler.update_connector_output(_NoMeta())
-        self.assertEqual(block_pool.freed, [77])
+        self.assertEqual(block_pool.freed, [77, 78, 79])
 
     def test_non_hybrid_and_non_layerwise_never_allocate(self):
         for use_hybrid, use_layerwise in ((False, True), (True, False)):
             with self.subTest(use_hybrid=use_hybrid, use_layerwise=use_layerwise):
-                block_pool = _FakeBlockPool(block_ids=(77,))
+                block_pool = _FakeBlockPool(block_ids=(77, 78, 79))
                 scheduler = _scratch_scheduler(
                     use_hybrid=use_hybrid, use_layerwise=use_layerwise, block_pool=block_pool
                 )
@@ -1017,12 +1075,13 @@ class TestRepairScratchAllocation(unittest.TestCase):
                 scheduler._holemiss_attach_repair_scratch(meta)
                 self.assertEqual(block_pool.alloc_calls, [])
                 self.assertIsNone(meta.requests[0].repair_scratch_slot)
+                self.assertIsNone(meta.requests[0].repair_scratch_slots)
 
     def test_loadless_step_releases_a_stale_scratch(self):
         """A step whose update never fired (an aborted forward) merely
         extends the hold; the next load-less build releases it here — the
         never-leak discipline without per-step growth."""
-        block_pool = _FakeBlockPool(block_ids=(77,))
+        block_pool = _FakeBlockPool(block_ids=(77, 78, 79))
         scheduler = _scratch_scheduler(block_pool=block_pool)
         scheduler._holemiss_attach_repair_scratch(_load_meta())
         self.assertIsNotNone(scheduler._holemiss_repair_scratch)
@@ -1030,7 +1089,7 @@ class TestRepairScratchAllocation(unittest.TestCase):
         scheduler._holemiss_attach_repair_scratch(_load_meta(with_load=False))
 
         self.assertIsNone(scheduler._holemiss_repair_scratch)
-        self.assertEqual(block_pool.freed, [77])
+        self.assertEqual(block_pool.freed, [77, 78, 79])
 
     def test_alloc_failure_degrades_loudly_never_stamps(self):
         block_pool = _FakeBlockPool(fail=True)
