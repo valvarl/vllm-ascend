@@ -531,6 +531,21 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return None
         return worker.get_gdn_state_load_result(req_id)
 
+    def get_holemiss_invalid_block_layers(self) -> dict[int, set[int]]:
+        """T4 layer-scoped invalidation: partially-invalid blocks (V3a seam).
+
+        Called by the vllm-side HR mixin / the bench censuses (hasattr-gated):
+        block id -> the failed PHYSICAL FA layers of the armed key's isolated
+        per-range call. The healthy layers of a recorded block were DELIVERED
+        and must stay untouched between the load failure and the repair
+        forward (the T4 lifecycle invariant).
+        """
+        worker = getattr(self, "connector_worker", None)
+        getter = getattr(worker, "get_holemiss_invalid_block_layers", None)
+        if worker is None or not callable(getter):
+            return {}
+        return getter()
+
     def fetch_gdn_repair_anchor(self, req_id: str, boundary_tokens: int):
         """D-MTX.4 Option-1 GDN repair anchor: the rollback-boundary state GET.
 

@@ -617,6 +617,16 @@ class KVPoolWorker:
         self._holemiss_state_markers: dict[str, list[str]] = {}
         self._holemiss_failed_load_keys: dict[str, set[str]] = {}
         self._holemiss_state_dispositioned_blocks: set[int] = set()
+        # T4 layer-scoped invalidation: physical block id -> the PHYSICAL FA
+        # layers whose ranges failed on the per-range (V3a) isolated call.
+        # The block-level set above still carries the whole block id (the
+        # scheduler's no-rollback gate keys on REGIONS and every other
+        # consumer keeps its whole-block semantics); this record is the
+        # repair-facing truth that the block is only PARTIALLY invalid — the
+        # healthy layers' delivered bytes are load-bearing for the below-CL
+        # repair attention. Step-scoped like the dispositioned set (block
+        # ids are recycled across requests; cleared in start_load_kv).
+        self._holemiss_invalid_block_layers: dict[int, set[int]] = {}
         # D-MTX.4 Option-1 GDN repair anchor: the drain's ReqMeta per req_id
         # (the rollback-boundary key/slot derivation needs block_hashes and
         # block_ids_by_group, which live only on the ReqMeta the drain saw).
@@ -1316,6 +1326,10 @@ class KVPoolWorker:
             # outlive the step whose failed loads it dispositioned, or a
             # recycled id could silently mask a future FA failure's raise.
             getattr(self, "_holemiss_state_dispositioned_blocks", set()).clear()
+            # The layer-scoped record obeys the same recycling law: a stale
+            # (block, layer) entry would mis-scope a future fault on the
+            # recycled block id.
+            getattr(self, "_holemiss_invalid_block_layers", {}).clear()
             # D-MTX.7: the repair-scratch owner guard is step-scoped — a
             # stale owner from a previous step must never degrade the next
             # step's anchor fetch with a spurious scratch_busy.
@@ -2964,10 +2978,35 @@ class KVPoolWorker:
     def record_hole_recovery_region(self, region: dict) -> None:
         with self._hole_recovery_lock:
             self._hole_recovery_regions.append(region)
+            # T4: a region with the V3a per-range seam means the armed key's
+            # isolated call delivered every OTHER range — the block is only
+            # partially invalid. Record the failed PHYSICAL layers beside the
+            # whole-block id the load path already marked, so the repair and
+            # the censuses can derive the healthy (delivered) layer set.
+            # __new__-stub tolerance (the file's getattr law): the live
+            # worker always carries the record from __init__.
+            failed_layers = region.get("failed_layers")
+            block_id = region.get("physical_block_id", -1)
+            layer_record = getattr(self, "_holemiss_invalid_block_layers", None)
+            if failed_layers and layer_record is not None and isinstance(block_id, int) and block_id >= 0:
+                layer_record.setdefault(block_id, set()).update(int(layer) for layer in failed_layers)
 
     def get_hole_recovery_regions(self) -> list[dict]:
         with self._hole_recovery_lock:
             return list(self._hole_recovery_regions)
+
+    def get_holemiss_invalid_block_layers(self) -> dict[int, set[int]]:
+        """Partially-invalid blocks: block id -> failed PHYSICAL FA layers.
+
+        Only blocks whose armed key rode the V3a per-range call appear here;
+        a fully-failed key (the legacy whole-key fold, the async/bulk paths,
+        the GDN ladder's state blocks) keeps the whole-block semantics and
+        never enters this record. The healthy layer set of a recorded block
+        is its group-0 FA physical layers minus the recorded set.
+        """
+        layer_record = getattr(self, "_holemiss_invalid_block_layers", None) or {}
+        with self._hole_recovery_lock:
+            return {block: set(layers) for block, layers in layer_record.items()}
 
     def clear_hole_recovery_regions(self) -> None:
         with self._hole_recovery_lock:
