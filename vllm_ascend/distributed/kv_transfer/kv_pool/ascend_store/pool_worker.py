@@ -163,17 +163,22 @@ def _holemiss_clear_eio_target_envs() -> None:
 WRITEBACK_REMOVE_LEASE_WAIT_BUDGET_MS = 120_000
 WRITEBACK_REMOVE_RETRY_INTERVAL_MS = 5_000
 
-# B42: REPLICA_IS_NOT_READY (-703) — the aborted-restore replica class. The
-# consumer's EIO-aborted owner-side restore leaves a non-COMPLETE replica on
-# the armed key (its staging completion is rejected as an illegal client: the
-# key's metadata still belongs to the producer, master_service.cpp PutEnd),
-# and the master's remove gate ``AllReplicas(&Replica::fn_is_completed)``
-# refuses until every replica is complete. The recovery ladder (this
-# constant's consumers): the best-effort client-side session revoke, ONE
-# bounded remove re-attempt, then the upsert takeover — the master's
-# UpsertStart preempts PROCESSING replicas IMMEDIATELY (unlike PutStart,
-# which only preempts after put_start_discard_timeout_sec), so the healed
-# bytes can still land under the armed key.
+# B42: REPLICA_IS_NOT_READY (-703) — the stale non-COMPLETE replica on the
+# armed key blocks the master's remove gate
+# (``AllReplicas(&Replica::fn_is_completed)``; force does NOT bypass; the
+# consumer cannot revoke the producer-owned key — ILLEGAL_CLIENT). The stale
+# replica is the producer-lifecycle leftover (the expired-client /
+# rejected-PutEnd PROCESSING class the master never reaps — the owner-visible
+# reaping follow-up), NOT an aborted consumer restore: the restore chain is
+# whole-object at every level, so there are never partial bytes to stage.
+# The recovery ladder (this constant's consumers,
+# ``_holemiss_writeback_recover_stale_replica``): REMOVE_STALE -> the
+# best-effort client-side session revoke -> ONE remove re-attempt -> the
+# LOUD FAILED. The round-1 upsert takeover was REMOVED (c20ac074f, refuted
+# at verify: the master's Case-B dispatch on a COMPLETE LOCAL_DISK survivor
+# fails the client-side allocation check before any transfer AND leaves the
+# survivor stuck PROCESSING — see the method docstring); the round stays
+# honestly RED on the unreaped topology.
 WRITEBACK_REMOVE_REPLICA_NOT_READY_RC = -703
 
 
