@@ -674,9 +674,29 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         b.store.batch_get_into_multi_buffer_ranges.return_value = [0]
 
         self.assertEqual(b.batch_copy_put(["k"], [[100]], [[16]], [[32]]), [0])
-        self.assertEqual(b.batch_copy_get(["k"], [[200]], [[16]], [[32]]), [0])
         b.store.batch_put_from_multi_buffer_ranges.assert_called_once_with(["k"], [[100]], [[16]], [[32]])
-        b.store.batch_get_into_multi_buffer_ranges.assert_called_once_with(["k"], [[200]], [[16]], [[32]])
+        b.store.batch_get_into_multi_buffer_ranges.assert_not_called()
+
+        # V3a: batch_copy_get prefers the per-range API when the store has
+        # it (the healthy ranges of a partially-failed key land); the folded
+        # per-key rc keeps the historical contract.
+        b.store.batch_get_into_multi_buffer_ranges_v2.return_value = [[0]]
+        self.assertEqual(b.batch_copy_get(["k"], [[200]], [[16]], [[32]]), [0])
+        b.store.batch_get_into_multi_buffer_ranges_v2.assert_called_once_with(
+            ["k"], [[200]], [[16]], [[32]]
+        )
+        b.store.batch_get_into_multi_buffer_ranges.assert_not_called()
+
+    def test_layerwise_range_methods_fall_back_without_v2(self):
+        b = self._make_backend()
+        b.store.batch_get_into_multi_buffer_ranges.return_value = [0]
+        # A store predating the V3a surface: the legacy per-key passthrough.
+        b.store.batch_get_into_multi_buffer_ranges_v2 = None
+
+        self.assertEqual(b.batch_copy_get(["k"], [[200]], [[16]], [[32]]), [0])
+        b.store.batch_get_into_multi_buffer_ranges.assert_called_once_with(
+            ["k"], [[200]], [[16]], [[32]]
+        )
 
     def test_layerwise_batch_result_shape_is_rejected(self):
         b = self._make_backend()

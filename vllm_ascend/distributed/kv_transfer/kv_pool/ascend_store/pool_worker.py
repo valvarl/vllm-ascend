@@ -45,6 +45,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import (
     require_aligned_batch_results,
+    require_aligned_range_results,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tracker import (
     LayerwiseSessionTracker,
@@ -126,6 +127,26 @@ SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
 # every read is a live os.getenv (P0.2: Python and C++ must never diverge).
 HOLEMISS_SYNTHETIC_FAULT_RC = -800  # simulated rc; real disk-EIO surfaces -800/-1102
 HOLEMISS_EIO_TARGET_ENV = "EIO_TARGET_KEY"  # empty/unset == injector off
+# V3a: the armed FA layer's byte extent inside the layerless D7 block object,
+# derived from the SAME layer_cache_entry_offsets arithmetic the load plan
+# builder uses (kv_transfer build_addrs). The Mooncake C++ narrows the EIO
+# window to this extent so the armed key's sibling ranges survive.
+HOLEMISS_EIO_TARGET_OFFSET_ENV = "HOLEMISS_EIO_TARGET_OFFSET"
+HOLEMISS_EIO_TARGET_SIZE_ENV = "HOLEMISS_EIO_TARGET_SIZE"
+
+
+def _holemiss_clear_eio_target_envs() -> None:
+    """Clear the real-EIO target envs (key + extent) unconditionally.
+
+    Mirrors the P0.2 rule for EIO_TARGET_KEY: every disarm site clears all
+    three; the C++ gates re-read them live per call, so a cleared key alone
+    disarms even with a stale extent left behind — the extent clear is
+    hygiene (a stale extent with a fresh key could otherwise narrow a future
+    arm unexpectedly).
+    """
+    os.environ[HOLEMISS_EIO_TARGET_ENV] = ""
+    os.environ.pop(HOLEMISS_EIO_TARGET_OFFSET_ENV, None)
+    os.environ.pop(HOLEMISS_EIO_TARGET_SIZE_ENV, None)
 
 # B37: the write-back remove waits out the Mooncake MASTER-side read lease.
 # The consumer's own query sites (ExistKey / GetReplicaList via
@@ -3059,7 +3080,7 @@ class KVPoolWorker:
         isdigit) takes precedence over real disk-EIO.
         """
         self._holemiss_emit_state_readback("configure")
-        os.environ[HOLEMISS_EIO_TARGET_ENV] = ""
+        _holemiss_clear_eio_target_envs()
         self._holemiss_armed_fault = None
         if request is None:
             return
@@ -3118,6 +3139,29 @@ class KVPoolWorker:
             return
         self._holemiss_arm_disk_eio(request, eio_layer, eio_logical)
 
+    def _holemiss_armable_layer_extent(self, store_layer_id: int) -> tuple[int, int] | None:
+        """The armed store-local FA layer's byte extent inside the group-0 object.
+
+        The SAME arithmetic the load plan builder uses (kv_transfer
+        build_addrs): layer_object_offset = sum(block_len[:base_offset]),
+        layer size = sum(block_len[base_offset:end_offset]) over the group's
+        layer_cache_entry_offsets. Returns None when the geometry is absent
+        (the arm then falls back to the whole-object window — never guesses).
+        """
+        offsets = getattr(self, "group_layer_cache_entry_offsets", {}).get(0)
+        block_len = getattr(self, "group_block_len", {}).get(0)
+        if not offsets or not block_len or not (0 <= store_layer_id < len(offsets) - 1):
+            return None
+        base_offset = int(offsets[store_layer_id])
+        end_offset = int(offsets[store_layer_id + 1])
+        if not (0 <= base_offset <= end_offset <= len(block_len)):
+            return None
+        layer_offset = sum(int(x) for x in block_len[:base_offset])
+        layer_size = sum(int(x) for x in block_len[base_offset:end_offset])
+        if layer_size <= 0:
+            return None
+        return layer_offset, layer_size
+
     def _holemiss_arm_disk_eio(self, request: ReqMeta, eio_layer: int, eio_logical: int) -> None:
         target_key = self._holemiss_derive_block_key(request, eio_logical)
         if target_key is None:
@@ -3135,6 +3179,20 @@ class KVPoolWorker:
                 type(self.m_store).__name__,
             )
         os.environ[HOLEMISS_EIO_TARGET_ENV] = target_key
+        # V3a: narrow the C++ EIO window to the armed layer's extent so the
+        # armed key's healthy ranges survive the per-range reads. A missing
+        # geometry degrades LOUDLY to the whole-object window (the pre-V3a
+        # semantics) — never a guessed extent.
+        target_extent = self._holemiss_armable_layer_extent(eio_layer)
+        if target_extent is not None:
+            os.environ[HOLEMISS_EIO_TARGET_OFFSET_ENV] = str(target_extent[0])
+            os.environ[HOLEMISS_EIO_TARGET_SIZE_ENV] = str(target_extent[1])
+        else:
+            logger.warning(
+                "HOLEMISS_EIO_ARM tp=%d layer=%d extent_unavailable=whole_object_window",
+                self.tp_rank,
+                eio_layer,
+            )
         self._holemiss_armed_fault = self._holemiss_make_armed_record(
             "disk_eio", request, target_key, eio_layer, eio_logical
         )
@@ -3229,6 +3287,57 @@ class KVPoolWorker:
             return None
         return keys.index(armed["key"])
 
+    def holemiss_range_failed_layers(
+        self,
+        offsets: list[int],
+        sizes: list[int],
+        range_rcs: list[int],
+    ) -> tuple[list[int], list[int]]:
+        """Map failed ranges of the armed key back to its layers (V3a seam).
+
+        The offset arithmetic inverse of the load plan builder: a range
+        [offset, offset+size) belongs to every store-local group-0 layer
+        whose object extent overlaps it. Returns (physical_layer_ids,
+        failed_range_indices) — the layer ids are PHYSICAL (hybrid-mapped)
+        so they line up with the region's layer_id; text ids pass through.
+        """
+        if len(offsets) != len(sizes) or len(offsets) != len(range_rcs):
+            return [], []
+        entry_offsets = getattr(self, "group_layer_cache_entry_offsets", {}).get(0)
+        block_len = getattr(self, "group_block_len", {}).get(0)
+        if not entry_offsets or not block_len:
+            return [], []
+        extents: list[tuple[int, int, int]] = []  # (start, end, store_layer)
+        for store_layer in range(len(entry_offsets) - 1):
+            base = int(entry_offsets[store_layer])
+            end = int(entry_offsets[store_layer + 1])
+            if not (0 <= base <= end <= len(block_len)):
+                continue
+            start_off = sum(int(x) for x in block_len[:base])
+            layer_bytes = sum(int(x) for x in block_len[base:end])
+            if layer_bytes <= 0:
+                continue
+            extents.append((start_off, start_off + layer_bytes, store_layer))
+        failed_layers: list[int] = []
+        failed_indices: list[int] = []
+        for range_index, rc in enumerate(range_rcs):
+            if rc >= 0:
+                continue
+            failed_indices.append(range_index)
+            range_start = int(offsets[range_index])
+            range_end = range_start + int(sizes[range_index])
+            for start_off, end_off, store_layer in extents:
+                if range_start < end_off and start_off < range_end:
+                    layer_id = store_layer
+                    if self.use_hybrid:
+                        # Raises on an untranslatable store-local id — the
+                        # same refusal as _holemiss_make_region (never emit a
+                        # region seam with a store-local layer id).
+                        layer_id = self._holemiss_hybrid_physical_layer(store_layer)
+                    if layer_id not in failed_layers:
+                        failed_layers.append(layer_id)
+        return failed_layers, failed_indices
+
     def execute_holemiss_range_target(
         self,
         keys: list[str],
@@ -3253,6 +3362,7 @@ class KVPoolWorker:
             healthy_results = require_aligned_batch_results("batch_copy_get", healthy_keys, healthy_results)
             for pos, result in zip(healthy, healthy_results, strict=True):
                 results[pos] = int(result)
+        target_range_rcs: list[int] | None = None
         if armed["kind"] == "synthetic":
             target_rc: int = HOLEMISS_SYNTHETIC_FAULT_RC
             logger.info(
@@ -3263,19 +3373,51 @@ class KVPoolWorker:
                 HOLEMISS_SYNTHETIC_FAULT_RC,
             )
         else:
-            target_result = self.m_store.batch_copy_get(
-                [keys[target_pos]], [buffers[target_pos]], [sizes[target_pos]], [offsets[target_pos]]
-            )
-            if target_result is None:
-                target_rc = -1
+            # V3a: the isolated armed-key call rides the per-range API when
+            # the store exposes it — the healthy ranges of the armed key
+            # LAND while the armed range fails; the per-range rcs feed the
+            # failed-layer mapping (the T4 invalidation seam). The legacy
+            # per-key store keeps the pre-V3a whole-key semantics.
+            per_range_call = getattr(self.m_store, "batch_copy_get_ranges", None)
+            if callable(per_range_call):
+                range_results = per_range_call(
+                    [keys[target_pos]],
+                    [buffers[target_pos]],
+                    [sizes[target_pos]],
+                    [offsets[target_pos]],
+                )
+                range_rcs = require_aligned_range_results(
+                    "batch_copy_get_ranges", [keys[target_pos]], [len(sizes[target_pos])], range_results
+                )[0]
+                target_range_rcs = range_rcs
+                target_rc = next((int(rc) for rc in range_rcs if rc < 0), sum(int(rc) for rc in range_rcs))
             else:
-                target_rc = int(require_aligned_batch_results("batch_copy_get", [keys[target_pos]], target_result)[0])
+                target_result = self.m_store.batch_copy_get(
+                    [keys[target_pos]], [buffers[target_pos]], [sizes[target_pos]], [offsets[target_pos]]
+                )
+                if target_result is None:
+                    target_rc = -1
+                else:
+                    target_rc = int(
+                        require_aligned_batch_results("batch_copy_get", [keys[target_pos]], target_result)[0]
+                    )
         results[target_pos] = target_rc
         if target_rc < 0:
             region = self._holemiss_make_region(armed, target_rc, target_pos)
+            if target_range_rcs is not None:
+                failed_layers, failed_indices = self.holemiss_range_failed_layers(
+                    offsets[target_pos], sizes[target_pos], target_range_rcs
+                )
+                if failed_layers:
+                    region["failed_layers"] = failed_layers
+                    region["failed_range_indices"] = failed_indices
+                    region["range_rcs"] = [int(rc) for rc in target_range_rcs]
+                    region["layer_start"] = min(failed_layers)
+                    region["layer_end"] = max(failed_layers)
             self.record_hole_recovery_region(region)
             logger.info(
-                "HOLEMISS_GET_COMPLETE req=%s key=%s token=%d-%d block=%d layer=%d logical=%d tp=%d result=%d",
+                "HOLEMISS_GET_COMPLETE req=%s key=%s token=%d-%d block=%d layer=%d logical=%d tp=%d "
+                "result=%d failed_layers=%s",
                 region["request_id"],
                 region["key"],
                 region["token_start"],
@@ -3285,6 +3427,7 @@ class KVPoolWorker:
                 region["logical_block_index"],
                 region["tp_rank"],
                 region["result"],
+                region.get("failed_layers", []),
             )
         else:
             logger.warning(
@@ -4468,7 +4611,7 @@ class KVPoolWorker:
         if armed is None or armed.get("request_id") not in finished_req_ids:
             return
         self._holemiss_emit_state_readback("finished")
-        os.environ[HOLEMISS_EIO_TARGET_ENV] = ""
+        _holemiss_clear_eio_target_envs()
         self._holemiss_armed_fault = None
 
     def validate_notified_save_layer(self, layer_name: str) -> None:

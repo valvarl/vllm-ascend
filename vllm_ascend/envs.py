@@ -132,6 +132,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "HOLEMISS_EIO_LAYER": lambda: int(os.getenv("HOLEMISS_EIO_LAYER", "-1")),
     # Disk-EIO target logical block id. Default: 2.
     "HOLEMISS_EIO_LOGICAL_BLOCK": lambda: int(os.getenv("HOLEMISS_EIO_LOGICAL_BLOCK", "2")),
+    # V3a: the armed FA layer's byte extent inside the layerless D7 block
+    # object (object-relative). Set by the worker's EIO arm from the SAME
+    # layer_cache_entry_offsets arithmetic the load plan builder uses; the
+    # Mooncake C++ narrows the injected window to this extent so the armed
+    # key's healthy ranges survive. Unset = the whole-object window (the
+    # pre-V3a semantics). Raw strings: the C++ parses them live per call.
+    "HOLEMISS_EIO_TARGET_OFFSET": lambda: os.getenv("HOLEMISS_EIO_TARGET_OFFSET", ""),
+    "HOLEMISS_EIO_TARGET_SIZE": lambda: os.getenv("HOLEMISS_EIO_TARGET_SIZE", ""),
     # HR execution mode. Valid values: "hr_sequential", "hr_gap".
     # Default: "hr_sequential".
     "HOLEMISS_RECOVERY_MODE": lambda: os.getenv("HOLEMISS_RECOVERY_MODE", "hr_sequential"),

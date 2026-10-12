@@ -21,8 +21,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base impor
     QOS_VALUE_MIN,
     Backend,
     BatchResultShapeError,
+    fold_range_results_to_key,
     parse_qos_from_extra_config,
     require_aligned_batch_results,
+    require_aligned_range_results,
     set_scheduler_device,
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
@@ -442,6 +444,57 @@ class MooncakeBackend(Backend):
     def batch_get_start(self, keys: list[str]) -> list[int]:
         return self._call_layerwise_batch("batch_get_session_start", keys, keys)
 
+    def _get_range_rows(
+        self,
+        keys: list[str],
+        all_buffers: list[list[int]],
+        all_sizes: list[list[int]],
+        all_src_offsets: list[list[int]],
+    ) -> list[list[int]] | None:
+        """The raw per-key per-range rows from the v2 store API, or None.
+
+        None means the store predates the V3a surface (or is a test double
+        without it) — the caller falls back to the legacy per-key call.
+        """
+        self.ensure_initialized()
+        if self.store is None:
+            raise RuntimeError("Mooncake store is unavailable for batch_get_into_multi_buffer_ranges_v2")
+        method = getattr(self.store, "batch_get_into_multi_buffer_ranges_v2", None)
+        if not callable(method):
+            return None
+        rows = method(keys, all_buffers, all_sizes, all_src_offsets)
+        return require_aligned_range_results(
+            "batch_get_into_multi_buffer_ranges_v2",
+            keys,
+            [len(sizes) for sizes in all_sizes],
+            rows,
+        )
+
+    def batch_copy_get_ranges(
+        self,
+        keys: list[str],
+        all_buffers: list[list[int]],
+        all_sizes: list[list[int]],
+        all_src_offsets: list[list[int]],
+    ) -> list[list[int]]:
+        rows = self._get_range_rows(keys, all_buffers, all_sizes, all_src_offsets)
+        if rows is None:
+            # Pre-V3a store: the per-key rc is the whole-key verdict — every
+            # requested range of the key inherits it (nothing lands on a
+            # negative; all ranges land on a success).
+            key_results = self._call_layerwise_batch(
+                "batch_get_into_multi_buffer_ranges",
+                keys,
+                keys,
+                all_buffers,
+                all_sizes,
+                all_src_offsets,
+            )
+            return [
+                [int(key_results[index])] * len(all_sizes[index]) for index in range(len(keys))
+            ]
+        return rows
+
     def batch_copy_get(
         self,
         keys: list[str],
@@ -449,6 +502,12 @@ class MooncakeBackend(Backend):
         all_sizes: list[list[int]],
         all_src_offsets: list[list[int]],
     ) -> list[int]:
+        # V3a: ride the per-range API when available so the healthy ranges
+        # of a partially-failed key LAND; fold back to the historical
+        # per-key rc contract (any failed range fails the key fail-fast).
+        rows = self._get_range_rows(keys, all_buffers, all_sizes, all_src_offsets)
+        if rows is not None:
+            return [fold_range_results_to_key(row) for row in rows]
         return self._call_layerwise_batch(
             "batch_get_into_multi_buffer_ranges",
             keys,

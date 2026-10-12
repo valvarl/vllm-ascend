@@ -57,6 +57,51 @@ def require_aligned_batch_results(
     return values
 
 
+def require_aligned_range_results(
+    operation: str,
+    keys: list[str],
+    per_key_range_counts: list[int],
+    results: Iterable[Iterable[int]] | None,
+) -> list[list[int]]:
+    """Validate per-key per-range results: one row per key, one rc per range.
+
+    V3a: the per-range store API (batch_get_into_multi_buffer_ranges_v2)
+    returns results[key][range]; the row length must equal the caller's
+    requested range count for that key.
+    """
+    if results is None:
+        raise BatchResultShapeError(f"{operation} returned no results")
+    try:
+        rows = [list(row) if row is not None else [] for row in results]
+    except (TypeError, ValueError) as exc:
+        raise BatchResultShapeError(f"{operation} returned non-integer batch results") from exc
+    if len(rows) != len(keys):
+        raise BatchResultShapeError(f"{operation} returned {len(rows)} rows for {len(keys)} keys")
+    for row in rows:
+        if any(isinstance(value, bool) or not isinstance(value, Integral) for value in row):
+            raise BatchResultShapeError(f"{operation} returned non-integer batch results")
+    for row, expected in zip(rows, per_key_range_counts, strict=True):
+        if len(row) != expected:
+            raise BatchResultShapeError(
+                f"{operation} returned {len(row)} range results where {expected} were requested"
+            )
+    return [[int(value) for value in row] for row in rows]
+
+
+def fold_range_results_to_key(range_rcs: list[int]) -> int:
+    """Fold per-range rcs into the historical per-key rc contract.
+
+    Any failed range fails the key with the FIRST negative rc (fail-fast,
+    preserving the pre-V3a per-key sign semantics); all-success reports the
+    transferred byte total. The healthy ranges' bytes have already landed in
+    the destination buffers either way (the V3a per-range delivery).
+    """
+    for rc in range_rcs:
+        if rc < 0:
+            return int(rc)
+    return sum(int(rc) for rc in range_rcs)
+
+
 def get_scheduler_device_id(parallel_config: ParallelConfig) -> int:
     """Resolve a scheduler's device without creating an NPU context."""
     assigned_ids = parallel_config.assigned_physical_gpu_ids
@@ -153,6 +198,16 @@ class Backend(ABC):
         all_src_offsets: list[list[int]],
     ) -> list[int]:
         raise NotImplementedError(f"{type(self).__name__} does not support batch_copy_get")
+
+    def batch_copy_get_ranges(
+        self,
+        keys: list[str],
+        all_buffers: list[list[int]],
+        all_sizes: list[list[int]],
+        all_src_offsets: list[list[int]],
+    ) -> list[list[int]]:
+        """Per-key per-range ranged GET (V3a): results[key][range]."""
+        raise NotImplementedError(f"{type(self).__name__} does not support batch_copy_get_ranges")
 
     def batch_get_end(self, keys: list[str]) -> int:
         raise NotImplementedError(f"{type(self).__name__} does not support batch_get_end")
