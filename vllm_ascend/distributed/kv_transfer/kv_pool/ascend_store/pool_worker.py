@@ -4660,14 +4660,20 @@ class KVPoolWorker:
                 # num_prompt, and a mid-prompt chunk end captures nothing.
                 continue
             boundary = num_prompt
-            if (request.req_id, boundary) in snapshots or (request.req_id, boundary) in getattr(
-                self, "_holemiss_state_tail_sources", {}
+            if (
+                (request.req_id, boundary) in snapshots
+                or (request.req_id, boundary) in getattr(self, "_holemiss_state_tail_sources", {})
+                or (request.req_id, boundary) in getattr(self, "_holemiss_tail_key_boundaries", {}).values()
             ):
                 # The double-capture fence: a second qualifying step for the
                 # same (req_id, boundary) captures nothing — including one
                 # whose artifact the drain already consumed into the frozen
                 # sources stash (T7 fix-2: re-capturing an in-flight artifact
-                # would double the snapshot markers and orphan the clone).
+                # would double the snapshot markers and orphan the clone), or
+                # whose finish-time tail key was already constructed (T7
+                # fix-2c: the send thread's put-complete free can drop the
+                # sources stash BEFORE this step's final-layer capture runs —
+                # the registration is the durable consumed signal).
                 continue
             unaligned_groups = [
                 group_id

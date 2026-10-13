@@ -203,6 +203,7 @@ def _make_worker(kv_role="kv_producer", consumer_is_to_put=False, use_hybrid=Tru
     worker._holemiss_state_tail_snapshot_pending_free = {}
     worker._holemiss_state_tail_seen_reqs = set()
     worker._holemiss_state_tail_sources = {}
+    worker._holemiss_tail_key_boundaries = {}
     worker._holemiss_state_markers = {}
     worker._holemiss_state_load_results = {}
     worker._holemiss_failed_load_keys = {}
@@ -510,6 +511,21 @@ class TestLifecycle(unittest.TestCase):
         self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
         for group, tensors in worker._holemiss_state_tail_sources[("req-A", BOUNDARY)].items():
             self.assertNotEqual(_tensors_bytes(tensors), b"")
+
+    def test_the_fence_skips_a_consumed_and_freed_boundary(self):
+        """T7 fix-2c: the send thread's put-complete free can drop the
+        sources stash BEFORE the same step's final-layer capture — the
+        tail-key registration is the durable consumed signal."""
+        with _profile("evidence"):
+            worker, _ = _make_worker()
+            request = _make_request()
+            worker._holemiss_capture_state_tail_snapshots([request])
+            worker._holemiss_take_state_tail_snapshots("req-A", BOUNDARY)
+            # The put completed: the sources stash freed, the tail key
+            # registered at the take-site construction.
+            worker._holemiss_tail_key_boundaries["<the-tail-key>"] = ("req-A", BOUNDARY)
+            worker._holemiss_capture_state_tail_snapshots([request])
+        self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
 
 
 class TestTriggerConditions(unittest.TestCase):
