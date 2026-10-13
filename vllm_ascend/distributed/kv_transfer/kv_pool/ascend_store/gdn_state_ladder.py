@@ -32,6 +32,9 @@ RUNG_ZERO_RECOMPUTE = 2
 
 SOURCE_LAST_SAVED = "last_saved"
 SOURCE_OLDER_SAVED = "older_saved"
+# hybrid-gdn-tail-state (T5): the interior tail boundary's rung-0 load (the
+# additive frozen-v2 VALUE extension — marker_vocab.STATE_LOAD_SOURCES).
+SOURCE_TAIL = "tail"
 
 REASON_MISSING = "missing"
 REASON_LOAD_FAILED = "load_failed"
@@ -63,6 +66,11 @@ class StateLoadPlan:
     # The SAVE channel's state (G12): use_layerwise=false still saves via the
     # bulk whole-object path (T13 control (a)) — never equate the two.
     save_enabled: bool
+    # hybrid-gdn-tail-state (T5): the interior tail boundary when the plan's
+    # NEWEST rung is the tail rung (None otherwise). The loaded branch picks
+    # source=tail for exactly this boundary — a va-internal field, never the
+    # frozen marker grammar.
+    tail_boundary_tokens: int | None = None
 
 
 @dataclass
@@ -73,6 +81,10 @@ class BoundaryOutcome:
     loaded: bool
     payload_bytes: int = 0
     content_sha: str | None = None
+    # hybrid-gdn-tail-state (T5): the tail rung's per-group loaded-slot
+    # digests (LEG-1's consumer side — the STATE_LOAD sha field fills per
+    # group; the scalar content_sha stays the full-block rungs' None).
+    content_sha_by_group: dict[int, str] | None = None
     failed_block_ids: tuple[int, ...] = ()
 
 
@@ -105,9 +117,14 @@ def _emit_state_load(
     rung: int,
     payload_bytes: int,
     content_sha: str | None,
+    content_sha_by_group: dict[int, str] | None = None,
 ) -> None:
     blocks = boundary.blocks_by_group.get(group) or (-1,)
-    sha = content_sha if content_sha is not None else "none"
+    sha = content_sha
+    if content_sha_by_group is not None:
+        sha = content_sha_by_group.get(group)
+    if sha is None:
+        sha = "none"
     emit(
         f"HOLEMISS_STATE_LOAD layer={boundary.first_layer_by_group[group]} group={group} "
         f"boundary={boundary.boundary_tokens} slot={blocks[0]} source={source} "
@@ -182,8 +199,22 @@ def run_gdn_state_load_ladder(
         if outcome.loaded:
             rung = RUNG_LAST_SAVED if walk_index == newest_index else RUNG_OLDER_SAVED
             source = SOURCE_LAST_SAVED if rung == RUNG_LAST_SAVED else SOURCE_OLDER_SAVED
+            if plan.tail_boundary_tokens is not None and boundary.boundary_tokens == plan.tail_boundary_tokens:
+                # hybrid-gdn-tail-state (T5): the tail rung rides the newest
+                # slot (appended last), so it loads at rung 0 under the
+                # additive source value; the marker grammar is untouched.
+                source = SOURCE_TAIL
             for group in plan.state_groups:
-                _emit_state_load(emit, boundary, group, source, rung, outcome.payload_bytes, outcome.content_sha)
+                _emit_state_load(
+                    emit,
+                    boundary,
+                    group,
+                    source,
+                    rung,
+                    outcome.payload_bytes,
+                    outcome.content_sha,
+                    outcome.content_sha_by_group,
+                )
             if demoted:
                 logger.info(
                     "HOLEMISS state ladder req=%s demoted=%s loaded_boundary=%d rung=%d",
@@ -227,6 +258,7 @@ def build_state_load_plan(
     boundaries: Iterable[StateBoundary],
     fa_hit_tokens: int,
     save_enabled: bool,
+    tail_boundary_tokens: int | None = None,
 ) -> StateLoadPlan | None:
     """Build the ladder plan; None when the layout has no GDN state groups.
 
@@ -242,4 +274,5 @@ def build_state_load_plan(
         boundaries=tuple(boundaries),
         fa_hit_tokens=fa_hit_tokens,
         save_enabled=save_enabled,
+        tail_boundary_tokens=tail_boundary_tokens,
     )

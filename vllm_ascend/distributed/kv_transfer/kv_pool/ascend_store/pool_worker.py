@@ -1911,19 +1911,21 @@ class KVPoolWorker:
         )
 
     def _make_layerwise_tail_load_key(self, request: ReqMeta, group_id: int) -> tuple[str, int] | None:
-        """The group-0 partial-tail GET key for an exact-end hit (B41).
+        """The partial-tail GET key for an exact-end hit (B41 + hybrid-gdn-tail-state T5).
 
         The load-side mirror of ``_make_layerwise_finished_tail_key`` (B39):
         the SAME D7 tail key — the raw-chain sub-hash at
         ``boundary // hash_block_size - 1`` qualified by the boundary —
         derived from the load spec's positive tail signal
         (``tail_boundary_tokens``, set by the scheduler's exact-end probe)
-        instead of the save-side ``finished_tail_boundary``. Group-0 only
-        (the T18 law: the GDN tail state rides the last full boundary's
-        state objects — groups 1-3 never fetch a tail artifact). Returns
-        ``(key, partial_block_index)`` only when the boundary extends the
-        cached extent's OWN partial block and the group-0 block table covers
-        it — the load then claims exactly what it fetches (never
+        instead of the save-side ``finished_tail_boundary``. Group 0 fetches
+        the FA partial page; the GDN state groups (1-3) fetch the state-tail
+        artifact (T5, the T3 save-key mirror — the same key form, the two
+        signal sources); a non-Mamba hybrid group never does (its partial
+        state is not a portable snapshot). Returns ``(key,
+        partial_block_index)`` only when the boundary extends the cached
+        extent's OWN partial block and the group's block table covers it —
+        the load then claims exactly what it fetches (never
         9471-cached-with-9216-fetched, the zero-tail hazard); None otherwise
         (no signal, an aligned extent, a mismatched boundary, or a
         block-table shortfall — the full-block entries alone decide the
@@ -1931,7 +1933,9 @@ class KVPoolWorker:
         """
         load_spec = request.load_spec
         boundary = getattr(load_spec, "tail_boundary_tokens", None) if load_spec is not None else None
-        if group_id != 0 or boundary is None or not load_spec.can_load:
+        if boundary is None or not load_spec.can_load:
+            return None
+        if group_id != 0 and group_id not in self._holemiss_state_tail_save_groups():
             return None
         block_size = get_group_block_size(self.grouped_block_size, group_id)
         cached_tokens = load_spec.kvpool_cached_tokens
@@ -4381,6 +4385,7 @@ class KVPoolWorker:
         if not self.use_eagle and load_spec.kvpool_store_skip_tokens is not None:
             cached_tokens = load_spec.kvpool_store_skip_tokens
         boundaries = []
+        first_layer_by_group: dict[int, int] = {}
         for group_id in state_groups:
             block_size = get_group_block_size(self.grouped_block_size, group_id)
             group_block_hashes = get_block_hashes(request.block_hashes, block_size, self.hash_block_size)
@@ -4395,6 +4400,7 @@ class KVPoolWorker:
                 ),
                 default=0,
             )
+            first_layer_by_group[group_id] = first_layer
             for block_index in range(num_blocks):
                 key = self._make_layerwise_full_key(group_id, block_hash_to_str(group_block_hashes[block_index]))
                 while len(boundaries) <= block_index:
@@ -4412,6 +4418,40 @@ class KVPoolWorker:
                 boundary.keys_by_group.setdefault(group_id, []).append(key)
                 boundary.blocks_by_group.setdefault(group_id, []).append(group_blocks[block_index])
                 boundary.first_layer_by_group.setdefault(group_id, first_layer)
+        # hybrid-gdn-tail-state (T5): the interior tail boundary joins the
+        # plan as the NEWEST rung-0 candidate when the LoadSpec carries the
+        # tail signal. All-or-nothing across the state groups (a mixed
+        # tail/full-boundary rung would load one group's slot 6 while
+        # another demotes — the ladder's boundary granularity): every group
+        # must derive its state-tail key (the same derivation the GET-side
+        # view construction uses, so the ladder classifies exactly the keys
+        # the drain fetched). The keys are unaligned-boundary objects, so
+        # they can never collide with a full-block boundary_tokens value.
+        tail_boundary_tokens = getattr(load_spec, "tail_boundary_tokens", None)
+        tail_appended = False
+        if tail_boundary_tokens is not None:
+            tail_keys: dict[int, tuple[str, ...]] = {}
+            tail_blocks: dict[int, tuple[int, ...]] = {}
+            for group_id in state_groups:
+                tail_load = self._make_layerwise_tail_load_key(request, group_id)
+                if tail_load is None:
+                    tail_keys = {}
+                    break
+                tail_key, tail_index = tail_load
+                tail_keys[group_id] = (tail_key,)
+                tail_blocks[group_id] = (request.block_ids_by_group[group_id][tail_index],)
+            if tail_keys:
+                boundaries.append(
+                    gdn_state_ladder.StateBoundary(
+                        block_index=tail_boundary_tokens
+                        // get_group_block_size(self.grouped_block_size, state_groups[0]),
+                        boundary_tokens=tail_boundary_tokens,
+                        keys_by_group=tail_keys,
+                        blocks_by_group=tail_blocks,
+                        first_layer_by_group=dict(first_layer_by_group),
+                    )
+                )
+                tail_appended = True
         if not boundaries:
             return None
         frozen_boundaries = tuple(
@@ -4430,6 +4470,7 @@ class KVPoolWorker:
             boundaries=frozen_boundaries,
             fa_hit_tokens=cached_tokens,
             save_enabled=_hm_state_save_enabled(),
+            tail_boundary_tokens=tail_boundary_tokens if tail_appended else None,
         )
 
     def _holemiss_record_failed_load_keys(self, req_id: str, keys: Iterable[str]) -> None:
@@ -4469,8 +4510,19 @@ class KVPoolWorker:
                     block_id for group in plan.state_groups for block_id in boundary.blocks_by_group.get(group, ())
                 )
                 return gdn_state_ladder.BoundaryOutcome(attempted=True, loaded=False, failed_block_ids=failed_blocks)
+            content_sha_by_group = None
+            if plan.tail_boundary_tokens is not None and boundary.boundary_tokens == plan.tail_boundary_tokens:
+                # hybrid-gdn-tail-state (T5, design section h.4): the tail
+                # rung fills the STATE_LOAD sha with the loaded-slot digest
+                # per group (LEG-1's consumer side); the full-block rungs
+                # keep content_sha=None — byte-identical today.
+                content_sha_by_group = self._holemiss_state_tail_loaded_shas(request, boundary)
             return gdn_state_ladder.BoundaryOutcome(
-                attempted=True, loaded=True, payload_bytes=object_bytes, content_sha=None
+                attempted=True,
+                loaded=True,
+                payload_bytes=object_bytes,
+                content_sha=None,
+                content_sha_by_group=content_sha_by_group,
             )
 
         def emit(line: str) -> None:
@@ -4496,6 +4548,37 @@ class KVPoolWorker:
     def get_gdn_state_load_result(self, req_id: str) -> Any:
         """The request's state-ladder result (G14's dynamic boundary input)."""
         return self._holemiss_state_load_results.get(req_id)
+
+    def _holemiss_state_tail_loaded_shas(self, request: ReqMeta, boundary: Any) -> dict[int, str] | None:
+        """hybrid-gdn-tail-state (T5, design section h.4): the tail rung's digest.
+
+        A D2H read of each state group's loaded slot extent (the block-table
+        row the GET landed at — the same ``_holemiss_state_tail_entries``
+        walk and byte order as the producer's SNAPSHOT marker, so the two
+        digests are LEG-1-comparable). All-or-nothing: ANY failure logs
+        loudly and returns None (the STATE_LOAD sha field stays ``none`` —
+        an honest gap, never a guessed digest); never raises into the
+        ladder.
+        """
+        shas: dict[int, str] = {}
+        try:
+            for group_id, blocks in boundary.blocks_by_group.items():
+                if not blocks:
+                    return None
+                digest = hashlib.sha256()
+                for _layer_name, cache in self._holemiss_state_tail_entries(group_id):
+                    digest.update(cache[blocks[0]].contiguous().view(torch.uint8).cpu().numpy().tobytes())
+                shas[group_id] = digest.hexdigest()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "HOLEMISS state tail load sha failed tp=%d req=%s boundary=%d error=%s",
+                self.tp_rank,
+                request.req_id,
+                boundary.boundary_tokens,
+                f"{type(exc).__name__}: {exc}"[:200],
+            )
+            return None
+        return shas or None
 
     def _holemiss_capture_state_tail_snapshots(self, requests: Iterable[ReqMeta]) -> None:
         """hybrid-gdn-tail-state (T2): the GDN tail-state snapshot freeze.

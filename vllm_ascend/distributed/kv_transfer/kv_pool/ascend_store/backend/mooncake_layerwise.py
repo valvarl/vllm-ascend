@@ -363,16 +363,21 @@ def _prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> di
             for name, index in entries:
                 view.load_block_keys[index] = name
                 get_slots.append((view, name, ids[index], index))
-            # B41: the exact-end hit's GROUP-0 partial tail block (T18) — the
-            # load-side mirror of the B39 save key. The scheduler claimed the
-            # boundary (kvpool_cached = boundary - 1); without this fetch the
-            # claimed tokens ride ZEROED pool pages (the zero-tail hazard).
-            # The tail slot extends the populated range, so the block-key load
-            # path (the populated-slots range + the key-major shared zip)
-            # fetches the tail block as a standard block row under the tail
-            # key the probe hit. The full-block masks are NOT consulted: the
-            # tail block rides outside them (the B38 at-or-beyond-length law).
-            # Groups 1-3 never fetch a tail artifact (the T18 law).
+            # B41 + hybrid-gdn-tail-state (T5): the exact-end hit's partial
+            # tail block — the load-side mirror of the B39 save key. The
+            # scheduler claimed the boundary (kvpool_cached = boundary);
+            # without this fetch the claimed tokens ride ZEROED pool pages
+            # (the zero-tail hazard). The tail slot extends the populated
+            # range, so the block-key load path (the populated-slots range +
+            # the key-major shared zip) fetches the tail block as a standard
+            # block row under the tail key the probe hit. The full-block
+            # masks are NOT consulted: the tail block rides outside them
+            # (the B38 at-or-beyond-length law). Group 0 fetches the FA
+            # partial page; the GDN state groups fetch the state-tail
+            # artifact (the T3 save-key mirror) — their census point is the
+            # ladder's STATE_LOAD source=tail marker, NOT the FA-tail
+            # HOLEMISS_TAIL_KEY_LOAD line (design section h: the bench gates
+            # tail_key_loaded == tp exactly).
             tail_load = worker._make_layerwise_tail_load_key(request, group)
             if tail_load is not None:
                 tail_key, tail_index = tail_load
@@ -380,14 +385,15 @@ def _prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> di
                     view.load_block_keys.extend([None] * (tail_index + 1 - len(view.load_block_keys)))
                 view.load_block_keys[tail_index] = tail_key
                 get_slots.append((view, tail_key, ids[tail_index], tail_index))
-                logger.info(
-                    "HOLEMISS_TAIL_KEY_LOAD tp=%d req=%s boundary=%d tail_block=%d key=%s",
-                    worker.tp_rank,
-                    request.req_id,
-                    request.load_spec.tail_boundary_tokens,
-                    tail_index,
-                    tail_key,
-                )
+                if group == 0:
+                    logger.info(
+                        "HOLEMISS_TAIL_KEY_LOAD tp=%d req=%s boundary=%d tail_block=%d key=%s",
+                        worker.tp_rank,
+                        request.req_id,
+                        request.load_spec.tail_boundary_tokens,
+                        tail_index,
+                        tail_key,
+                    )
 
             start = request.save_start_token // block_size
             end = min(request.save_end_token // block_size, len(hashes), len(ids))
