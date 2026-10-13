@@ -199,6 +199,8 @@ def _make_worker(kv_role="kv_producer", consumer_is_to_put=False, use_hybrid=Tru
     worker.num_blocks = NUM_SLOTS
     worker._global_to_local_layer = {}
     worker._holemiss_state_tail_snapshots = {}
+    worker._holemiss_state_tail_snapshot_pending_free = set()
+    worker._holemiss_state_tail_sources = {}
     worker._holemiss_state_markers = {}
     worker._holemiss_state_load_results = {}
     worker._holemiss_failed_load_keys = {}
@@ -428,9 +430,59 @@ class TestLifecycle(unittest.TestCase):
         other = _make_request(req_id="req-B", num_prompt=BOUNDARY + 256)
         worker._holemiss_capture_state_tail_snapshots([other])
         worker._holemiss_teardown_finished({"req-A"})
+        # The snapshot free defers one teardown call (the finish->drain grace
+        # window): the registry must SURVIVE the finish step's purge.
+        self.assertIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
+        self.assertIn(("req-A", ALIGNED_BOUNDARY), worker._holemiss_state_tail_snapshots)
+        worker._holemiss_teardown_finished(set())
         self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
         self.assertNotIn(("req-A", ALIGNED_BOUNDARY), worker._holemiss_state_tail_snapshots)
         self.assertIn(("req-B", BOUNDARY + 256), worker._holemiss_state_tail_snapshots)
+
+    def test_the_drain_take_survives_the_finish_step_teardown(self):
+        """T7 fix-2, THE ordering closure: a request finishing AT its
+        capture step (max_tokens=1) tears down BEFORE the finish-time tail
+        drains at the next forward-bearing step — the take must still find
+        the frozen bytes (the live PUT_SKIPPED no_frozen_snapshot starved
+        exactly here)."""
+        worker, _ = _make_worker()
+        worker._hole_recovery_regions = []
+        worker._hole_recovery_lock = threading.Lock()
+        worker._holemiss_armed_fault = None
+        request = _make_request()
+        worker._holemiss_capture_state_tail_snapshots([request])
+        frozen = {
+            group: _tensors_bytes(tensors)
+            for group, tensors in worker._holemiss_state_tail_snapshots[("req-A", BOUNDARY)].items()
+        }
+        worker._holemiss_teardown_finished({"req-A"})
+        taken = worker._holemiss_take_state_tail_snapshots("req-A", BOUNDARY)
+        self.assertIsNotNone(taken)
+        self.assertEqual(set(taken), set(STATE_GROUPS))
+        for group, tensors in taken.items():
+            self.assertEqual(_tensors_bytes(tensors), frozen[group])
+        self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
+        worker._holemiss_teardown_finished(set())
+        self.assertEqual(worker._holemiss_state_tail_snapshot_pending_free, set())
+
+    def test_the_fence_skips_a_source_stashed_boundary(self):
+        """T7 fix-2: a boundary the drain already consumed into the frozen
+        sources stash is not re-captured — the artifact is in flight (a
+        re-capture would double the snapshot markers and orphan the clone)."""
+        with _profile("evidence"):
+            worker, _ = _make_worker()
+            request = _make_request()
+            worker._holemiss_capture_state_tail_snapshots([request])
+            taken = worker._holemiss_take_state_tail_snapshots("req-A", BOUNDARY)
+            worker._holemiss_state_tail_sources[("req-A", BOUNDARY)] = taken
+            conv, ssm = worker.kv_caches["model.layers.24.linear_attn"]
+            for row in GROUP_TAIL_ROWS.values():
+                conv[row] = torch.full_like(conv[row], 3.0)
+                ssm[row] = torch.full_like(ssm[row], 3.0)
+            worker._holemiss_capture_state_tail_snapshots([request])
+        self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
+        for group, tensors in worker._holemiss_state_tail_sources[("req-A", BOUNDARY)].items():
+            self.assertNotEqual(_tensors_bytes(tensors), b"")
 
 
 class TestTriggerConditions(unittest.TestCase):
