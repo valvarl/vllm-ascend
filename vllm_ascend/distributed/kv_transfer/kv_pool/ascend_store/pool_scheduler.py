@@ -580,7 +580,7 @@ class KVPoolScheduler:
         return num_speculative_blocks_by_group
 
     def _probe_partial_tail_hit(self, request: "Request", boundary_tokens: int) -> int | None:
-        """Probe the FA partial-tail key at the prompt's exact end (T18).
+        """Probe the FA partial-tail key at a candidate boundary (T18 + §c).
 
         Returns the exact-end boundary on a hit, None otherwise. The key is
         the boundary sub-hash (the last complete hash block at the boundary)
@@ -602,6 +602,25 @@ class KVPoolScheduler:
         if hits and all(hits):
             return boundary_tokens
         return None
+
+    def _partial_tail_probe_boundaries(self, prompt_token_len: int, token_len: int) -> list[int]:
+        """Tail-probe candidate boundaries, NEWEST-first (design §c).
+
+        The prompt's exact end is always the newest candidate (the T18
+        single-probe call site — text prompt ends are not pmu-aligned in
+        general, and the text extension must keep working byte-identically);
+        the older candidates are the pmu-aligned boundaries in
+        (token_len, prompt_token_len], so the walk costs at most
+        (prompt_token_len - token_len) // hash_block_size + 1 cheap metadata
+        probes — the pmu quantization bounds it, never O(prompt).
+        """
+        hash_block_size = self.hash_block_size
+        candidates: list[int] = []
+        if prompt_token_len % hash_block_size != 0:
+            candidates.append(prompt_token_len)
+        newest_aligned = prompt_token_len // hash_block_size * hash_block_size
+        candidates.extend(range(newest_aligned, token_len, -hash_block_size))
+        return candidates
 
     def register_finished_partial_tail(
         self,
@@ -724,18 +743,37 @@ class KVPoolScheduler:
         if num_external_hit_tokens == 0:
             return 0, False
 
-        # T18 exact-end tail probe: when the floor truncated a partial tail
+        # T18/§c interior tail probe: when the floor truncated a partial tail
         # and the full-block hit is COMPLETE at the floor (the FA-prefix
         # anchor — the full-block check already validated every group's full
-        # blocks), probe the FA tail key at the prompt's exact end. The GDN
+        # blocks), walk the tail candidates NEWEST-first (the pmu-aligned
+        # interior boundaries plus the prompt's exact end), probing the FA
+        # tail key at each — the FIRST hit wins (the longest claim). The GDN
         # tail state is the last full boundary's state (already covered by
         # the full-block hit): nothing is checked at the tail boundary
         # except this one FA key — never an all-groups-complete-chunks
         # anchor (the #57216 defect class).
         tail_boundary_tokens = None
         if self.use_block_key_layerwise and prompt_token_len > token_len and num_external_hit_tokens == token_len:
-            tail_boundary_tokens = self._probe_partial_tail_hit(request, prompt_token_len)
-            if tail_boundary_tokens is not None:
+            for boundary in self._partial_tail_probe_boundaries(prompt_token_len, token_len):
+                probed = self._probe_partial_tail_hit(request, boundary)
+                if probed is None:
+                    continue
+                if probed == request.num_tokens and self.num_speculative_blocks_by_group:
+                    # The honest -1 refusal (§c, GDN layouts only): a hit at
+                    # the prompt's exact end would trigger the -= 1 below, and
+                    # the boundary-state tail artifact cannot serve the
+                    # re-added token's composition (the structural off-by-one:
+                    # the artifact holds after b-1, the -1 claim needs
+                    # after b-2). Decline THIS candidate, keep walking older
+                    # ones. Unconditional — no env gate; text never declines.
+                    logger.info(
+                        "KV pool partial tail declined req=%s boundary=%d reason=hybrid_full_end",
+                        request.request_id,
+                        probed,
+                    )
+                    continue
+                tail_boundary_tokens = probed
                 num_external_hit_tokens = tail_boundary_tokens
                 logger.info(
                     "KV pool partial tail hit req=%s exact_end=%d (floor was %d)",
@@ -743,6 +781,7 @@ class KVPoolScheduler:
                     tail_boundary_tokens,
                     token_len,
                 )
+                break
 
         store_skip_tokens = num_external_hit_tokens
         if self.use_eagle:
