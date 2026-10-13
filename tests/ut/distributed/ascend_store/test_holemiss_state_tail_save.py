@@ -660,15 +660,40 @@ class TestSnapshotConsumedPut(unittest.TestCase):
         self.assertEqual(payload, frozen[1][: sum(store.copy_puts[0][2][0])])
         self.assertNotEqual(payload, _live_slot_bytes(worker, 1)[: len(payload)])
 
-    def test_sources_free_after_the_put_completes(self):
-        """The lifecycle: the request's last layer task completes -> the
-        frozen sources are dropped (the put read them; the free)."""
+    def test_sources_survive_the_per_row_refcount_zero_crossing(self):
+        """T7 fix-3, THE s1e closure: the stored-request count OSCILLATES per
+        layer (one add per layer submission, one dec per row), so
+        try_finish_and_delete_stored_request fires at EVERY row — group 1's
+        FIRST row completion must NOT free the frozen sources (the live run
+        freed them there; groups 2/3's rows then found no tensors and the 6
+        state keys never persisted). The free fires at the teardown flush."""
         store = _SessionStore()
         worker, _ = _make_session_worker(store)
         _capture(worker, _capture_request())
-        _drive_state_group_put(worker, store, group_id=1, physical_layer=0)
-        self.assertEqual(worker._holemiss_state_tail_sources, {})
+        frozen = {
+            group: _tensors_bytes(tensors)
+            for group, tensors in worker._holemiss_state_tail_snapshots[("req-tail", BOUNDARY)].items()
+        }
+        view1 = _drive_state_group_put(worker, store, group_id=1, physical_layer=0)
+        # The zero-crossing fired at group 1's row; the sources must survive.
+        self.assertIn(("req-tail", BOUNDARY), worker._holemiss_state_tail_sources)
+        view2 = _drive_state_group_put(worker, store, group_id=2, physical_layer=1)
+        self.assertEqual(
+            [keys for keys, _, _, _ in store.copy_puts],
+            [(view1.save_last_block_key,), (view2.save_last_block_key,)],
+        )
+        # Group 2's row rode the FROZEN tensors (layer 0's slice = the
+        # object-layout front of the group's frozen entry list).
+        payload = store.copy_puts[1][3][0]
+        self.assertEqual(payload, frozen[2][: sum(store.copy_puts[1][2][0])])
+        self.assertIn(("req-tail", BOUNDARY), worker._holemiss_state_tail_sources)
         self.assertEqual(worker._holemiss_state_tail_snapshots, {})
+        # The free's true owner: the drain-signal teardown flush.
+        worker._holemiss_teardown_finished({"req-tail"})
+        self.assertIn(("req-tail", BOUNDARY), worker._holemiss_state_tail_sources)
+        worker._holemiss_record_state_tail_drain([_tail_save_request()])
+        worker._holemiss_teardown_finished(set())
+        self.assertEqual(worker._holemiss_state_tail_sources, {})
 
     def test_substitution_slices_the_layer_entries(self):
         """The per-layer correspondence: layer L's buffers are the snapshot
@@ -811,11 +836,14 @@ class TestSourcePins(unittest.TestCase):
         self.assertLess(substitution, probe)
         self.assertLess(probe, range_request)
 
-    def test_free_follows_the_put_complete_finish(self):
+    def test_the_row_loop_never_frees_the_frozen_sources(self):
+        """T7 fix-3 pin: the per-layer refcount zero-crossing is NOT the
+        request's put completion (the stored count oscillates per layer;
+        s1e freed the sources at group 1's first row and the remaining 47
+        state rows dropped). The free lives in the teardown flush only."""
         source = inspect.getsource(KVCacheStoreLayerSendingThread._handle_range_layer_tasks)
-        finish = source.index("try_finish_and_delete_stored_request")
-        free = source.index("_holemiss_free_state_tail_sources")
-        self.assertLess(finish, free)
+        self.assertNotIn("_holemiss_free_state_tail_sources", source)
+        self.assertIn("try_finish_and_delete_stored_request", source)
 
     def test_take_is_consumed_by_the_key_construction(self):
         source = inspect.getsource(KVPoolWorker._make_layerwise_state_tail_key)

@@ -1963,15 +1963,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         getattr(req_meta, name).pop(index)
         return bad
 
-    def _holemiss_free_state_tail_sources(self, req_id: str) -> None:
-        """Drop the request's frozen state-tail sources (the put completed)."""
-        worker = self.worker
-        sources = getattr(worker, "_holemiss_state_tail_sources", None) if worker is not None else None
-        if not isinstance(sources, dict):
-            return
-        for source_key in [key for key in sources if key[0] == req_id]:
-            sources.pop(source_key, None)
-
     def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
         layer_id = transfer_tasks[0].layer_id
         try:
@@ -2001,9 +1992,14 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     self.dec_stored_request(req_id)
                     if self.try_finish_and_delete_stored_request(req_id):
                         self.set_finished_request(req_id)
-                        # The request's puts all committed: the frozen
-                        # state-tail sources have served their ranged reads.
-                        self._holemiss_free_state_tail_sources(req_id)
+                        # T7 fix-3: the stored count OSCILLATES per layer
+                        # (one add per layer submission, one dec per row), so
+                        # this zero-crossing fires at EVERY row — s1e freed
+                        # the frozen sources at group 1's FIRST row and every
+                        # later state row found no tensors (the keys never
+                        # persisted). The sources free lives in the worker's
+                        # teardown flush (the drain-signal branch, post-puts);
+                        # never on this signal.
         except Exception as exc:
             self._fatal_error = exc
             # All started objects belong to the failed forward step, including
