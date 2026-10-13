@@ -260,6 +260,8 @@ def _make_session_worker(store, kv_role="kv_producer", use_hybrid=True):
     worker.m_store = store
     # The T2/T3 registries (__new__ bypasses _init_state_vars).
     worker._holemiss_state_tail_snapshots = {}
+    worker._holemiss_state_tail_snapshot_pending_free = {}
+    worker._holemiss_state_tail_seen_reqs = set()
     worker._holemiss_state_markers = {}
     worker._holemiss_state_load_results = {}
     worker._holemiss_req_meta_by_id = {}
@@ -827,9 +829,16 @@ class TestSourcePins(unittest.TestCase):
         store = _SessionStore()
         worker, _ = _make_session_worker(store)
         _capture(worker, _capture_request())
-        _prepare_group_sessions(worker, [_tail_save_request()])
+        tail_request = _tail_save_request()
+        _prepare_group_sessions(worker, [tail_request])
         self.assertIn(("req-tail", BOUNDARY), worker._holemiss_state_tail_sources)
+        # T7 fix-2: the sources free rides the snapshot deferral — it fires
+        # at the drain-signal teardown (this step carried the tail ReqMeta;
+        # the put-complete free already took the primary path).
         worker._holemiss_teardown_finished({"req-tail"})
+        self.assertIn(("req-tail", BOUNDARY), worker._holemiss_state_tail_sources)
+        worker._holemiss_record_state_tail_drain([tail_request])
+        worker._holemiss_teardown_finished(set())
         self.assertEqual(worker._holemiss_state_tail_sources, {})
 
 

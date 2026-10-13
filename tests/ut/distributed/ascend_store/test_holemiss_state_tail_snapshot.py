@@ -53,6 +53,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+    STATE_TAIL_SNAPSHOT_PENDING_GRACE,
     KVPoolWorker,
 )
 
@@ -199,7 +200,8 @@ def _make_worker(kv_role="kv_producer", consumer_is_to_put=False, use_hybrid=Tru
     worker.num_blocks = NUM_SLOTS
     worker._global_to_local_layer = {}
     worker._holemiss_state_tail_snapshots = {}
-    worker._holemiss_state_tail_snapshot_pending_free = set()
+    worker._holemiss_state_tail_snapshot_pending_free = {}
+    worker._holemiss_state_tail_seen_reqs = set()
     worker._holemiss_state_tail_sources = {}
     worker._holemiss_state_markers = {}
     worker._holemiss_state_load_results = {}
@@ -430,11 +432,12 @@ class TestLifecycle(unittest.TestCase):
         other = _make_request(req_id="req-B", num_prompt=BOUNDARY + 256)
         worker._holemiss_capture_state_tail_snapshots([other])
         worker._holemiss_teardown_finished({"req-A"})
-        # The snapshot free defers one teardown call (the finish->drain grace
-        # window): the registry must SURVIVE the finish step's purge.
-        self.assertIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
-        self.assertIn(("req-A", ALIGNED_BOUNDARY), worker._holemiss_state_tail_snapshots)
-        worker._holemiss_teardown_finished(set())
+        # The snapshot free defers until the drain signal (the finish->drain
+        # window): the registry must SURVIVE the finish step's purge and any
+        # number of intermediate teardowns.
+        for _ in range(STATE_TAIL_SNAPSHOT_PENDING_GRACE + 1):
+            self.assertIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
+            worker._holemiss_teardown_finished(set())
         self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
         self.assertNotIn(("req-A", ALIGNED_BOUNDARY), worker._holemiss_state_tail_snapshots)
         self.assertIn(("req-B", BOUNDARY + 256), worker._holemiss_state_tail_snapshots)
@@ -442,7 +445,7 @@ class TestLifecycle(unittest.TestCase):
     def test_the_drain_take_survives_the_finish_step_teardown(self):
         """T7 fix-2, THE ordering closure: a request finishing AT its
         capture step (max_tokens=1) tears down BEFORE the finish-time tail
-        drains at the next forward-bearing step — the take must still find
+        drains at a later forward-bearing step — the take must still find
         the frozen bytes (the live PUT_SKIPPED no_frozen_snapshot starved
         exactly here)."""
         worker, _ = _make_worker()
@@ -455,15 +458,39 @@ class TestLifecycle(unittest.TestCase):
             group: _tensors_bytes(tensors)
             for group, tensors in worker._holemiss_state_tail_snapshots[("req-A", BOUNDARY)].items()
         }
+        # The live failure shape: intermediate teardowns between the finish
+        # and the drain step must not free the frozen artifact.
         worker._holemiss_teardown_finished({"req-A"})
+        for _ in range(3):
+            worker._holemiss_teardown_finished(set())
         taken = worker._holemiss_take_state_tail_snapshots("req-A", BOUNDARY)
         self.assertIsNotNone(taken)
         self.assertEqual(set(taken), set(STATE_GROUPS))
         for group, tensors in taken.items():
             self.assertEqual(_tensors_bytes(tensors), frozen[group])
         self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
+
+    def test_the_drain_signal_frees_the_leftovers(self):
+        """The drain recording (the step whose metadata carries the tail
+        ReqMeta) is the flush trigger: the sources stash a failed put left
+        behind frees at that step's teardown."""
+        worker, _ = _make_worker()
+        worker._hole_recovery_regions = []
+        worker._hole_recovery_lock = threading.Lock()
+        worker._holemiss_armed_fault = None
+        request = _make_request()
+        worker._holemiss_capture_state_tail_snapshots([request])
+        worker._holemiss_state_tail_sources[("req-A", BOUNDARY)] = worker._holemiss_state_tail_snapshots[
+            ("req-A", BOUNDARY)
+        ]
+        worker._holemiss_teardown_finished({"req-A"})
+        self.assertIn(("req-A", BOUNDARY), worker._holemiss_state_tail_sources)
+        tail_meta = _make_request(req_id="req-A")
+        tail_meta.finished_tail_boundary = BOUNDARY
+        worker._holemiss_record_state_tail_drain([tail_meta])
         worker._holemiss_teardown_finished(set())
-        self.assertEqual(worker._holemiss_state_tail_snapshot_pending_free, set())
+        self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_sources)
+        self.assertNotIn("req-A", worker._holemiss_state_tail_snapshot_pending_free)
 
     def test_the_fence_skips_a_source_stashed_boundary(self):
         """T7 fix-2: a boundary the drain already consumed into the frozen

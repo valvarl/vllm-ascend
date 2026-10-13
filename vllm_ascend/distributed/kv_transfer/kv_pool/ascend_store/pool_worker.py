@@ -164,6 +164,14 @@ def _holemiss_clear_eio_target_envs() -> None:
 WRITEBACK_REMOVE_LEASE_WAIT_BUDGET_MS = 120_000
 WRITEBACK_REMOVE_RETRY_INTERVAL_MS = 5_000
 
+# hybrid-gdn-tail-state T7 fix-2: the deferred state-tail snapshot frees wait
+# for the drain signal (the step carrying the request's finish-time tail
+# ReqMeta). The grace bound covers the never-drained leftovers (no upstream
+# tail offer, the consumer probe leg): the observed finish->drain latency is
+# 1-3 engine steps, so 8 teardown calls carries > 2x headroom (the
+# calibration law). UT-pinned: any change is a deliberate re-pin.
+STATE_TAIL_SNAPSHOT_PENDING_GRACE = 8
+
 # B42: REPLICA_IS_NOT_READY (-703) — the stale non-COMPLETE replica on the
 # armed key blocks the master's remove gate
 # (``AllReplicas(&Replica::fn_is_completed)``; force does NOT bypass; the
@@ -693,13 +701,18 @@ class KVPoolWorker:
         # hybrid-gdn-tail-state T7 fix-2: the deferred snapshot frees. A
         # request finishing AT its capture step (max_tokens=1 ends the
         # request at the last prefill step) hits this worker's teardown
-        # purge BEFORE the finish-time tail drains at the NEXT
-        # forward-bearing step — freeing the registry entry there starved
-        # the drain (the live PUT_SKIPPED no_frozen_snapshot). The purge
-        # now defers each finished request's snapshot free by ONE teardown
-        # call: the drain's take (which pops the registry) lands inside
-        # that grace window; the flush frees whatever it left.
-        self._holemiss_state_tail_snapshot_pending_free: set[str] = set()
+        # purge a VARIABLE number of steps before the finish-time tail
+        # drains at the next forward-bearing step — freeing the registry
+        # entry there starved the drain (the live PUT_SKIPPED
+        # no_frozen_snapshot). The purge defers each finished request's
+        # snapshot free until the drain signal (the step whose connector
+        # metadata carries the request's tail ReqMeta — recorded in
+        # _holemiss_state_tail_seen_reqs at process_layer_data; the take
+        # runs before that step's teardown by construction) or a grace
+        # bound of teardown calls (the never-drained leftovers: no upstream
+        # tail offer, the probe leg), whichever first.
+        self._holemiss_state_tail_snapshot_pending_free: dict[str, int] = {}
+        self._holemiss_state_tail_seen_reqs: set[str] = set()
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -2904,6 +2917,21 @@ class KVPoolWorker:
         except AssertionError:
             return None
 
+    def _holemiss_record_state_tail_drain(self, requests: list[ReqMeta]) -> None:
+        """T7 fix-2: the drain signal for the deferred snapshot frees.
+
+        A request recorded here carried its finish-time tail ReqMeta in THIS
+        step's connector metadata — the take runs during this step's session
+        prep, before the step's teardown — so the deferred frees for it may
+        flush at this step's teardown (or any later one).
+        """
+        tail_seen = getattr(self, "_holemiss_state_tail_seen_reqs", None)
+        if not isinstance(tail_seen, set):
+            return
+        for request in requests:
+            if request.finished_tail_boundary is not None:
+                tail_seen.add(request.req_id)
+
     def process_layer_data(self, requests: list[ReqMeta]) -> None:
         if not requests:
             return
@@ -2917,6 +2945,7 @@ class KVPoolWorker:
             num_local = self.num_layers
         self.layer_save_tasks = [[] for _ in range(self.num_layers)]
         self.layer_load_tasks = [[] for _ in range(self.num_layers)]
+        self._holemiss_record_state_tail_drain(requests)
         for request in requests:
             request.store_masks = self._compute_reachable_store_masks(request)
         group_requests = {}
@@ -5050,21 +5079,27 @@ class KVPoolWorker:
         """
         deferred_snapshots = getattr(self, "_holemiss_state_tail_snapshot_pending_free", None)
         deferred_sources = getattr(self, "_holemiss_state_tail_sources", None)
-        if isinstance(deferred_snapshots, set) and deferred_snapshots:
-            # T7 fix-2: flush the PREVIOUS teardown call's deferred frees.
-            # The one-call grace covered the finish->drain window; whatever
-            # the drain's take left in the registry (or stashed in the
-            # sources when its put never completed) frees NOW.
+        tail_seen = getattr(self, "_holemiss_state_tail_seen_reqs", None)
+        if isinstance(deferred_snapshots, dict) and deferred_snapshots:
+            # T7 fix-2: free a deferred request's snapshots once its
+            # finish-time tail drained (the step that carried the tail
+            # ReqMeta — its take ran before this teardown by construction)
+            # or its grace bound ran out (the never-drained leftovers).
             stale_snapshots = getattr(self, "_holemiss_state_tail_snapshots", None)
-            if isinstance(stale_snapshots, dict):
-                for deferred_req_id in deferred_snapshots:
+            for deferred_req_id, grace in list(deferred_snapshots.items()):
+                drained = isinstance(tail_seen, set) and deferred_req_id in tail_seen
+                if not drained and grace > 0:
+                    deferred_snapshots[deferred_req_id] = grace - 1
+                    continue
+                if isinstance(stale_snapshots, dict):
                     for snapshot_key in [key for key in stale_snapshots if key[0] == deferred_req_id]:
                         stale_snapshots.pop(snapshot_key, None)
-            if isinstance(deferred_sources, dict):
-                for deferred_req_id in deferred_snapshots:
+                if isinstance(deferred_sources, dict):
                     for source_key in [key for key in deferred_sources if key[0] == deferred_req_id]:
                         deferred_sources.pop(source_key, None)
-            deferred_snapshots.clear()
+                del deferred_snapshots[deferred_req_id]
+                if isinstance(tail_seen, set):
+                    tail_seen.discard(deferred_req_id)
         for req_id in finished_req_ids:
             self._holemiss_purge_regions(req_id)
             # The state-ladder records are set in __init__; __new__-stub tests
@@ -5081,26 +5116,24 @@ class KVPoolWorker:
             # keys — the probe leg's snapshots always leave here, and the
             # producer's leave via the save-drain consume first whenever
             # the drain ran. T7 fix-2: a request finishing AT its capture
-            # step (max_tokens=1) drains its finish-time tail only at the
-            # NEXT forward-bearing step, so the free is DEFERRED by one
-            # teardown call (the flush above) — the immediate free starved
-            # the drain (the live PUT_SKIPPED no_frozen_snapshot).
+            # step (max_tokens=1) drains its finish-time tail a VARIABLE
+            # number of steps later, so the free defers until the drain
+            # signal or the grace bound (the flush above) — the immediate
+            # free starved the drain (the live PUT_SKIPPED
+            # no_frozen_snapshot).
             snapshots = getattr(self, "_holemiss_state_tail_snapshots", None)
             pending_snapshots = getattr(self, "_holemiss_state_tail_snapshot_pending_free", None)
             if isinstance(snapshots, dict):
-                if isinstance(pending_snapshots, set):
-                    pending_snapshots.add(req_id)
+                if isinstance(pending_snapshots, dict):
+                    pending_snapshots[req_id] = STATE_TAIL_SNAPSHOT_PENDING_GRACE
                 else:
                     for snapshot_key in [key for key in snapshots if key[0] == req_id]:
                         snapshots.pop(snapshot_key, None)
             # hybrid-gdn-tail-state (T3): the stashed frozen sources free
-            # here too when the send thread's put-complete free never ran
-            # (the session was rejected, the drain never fired, or the
-            # thread died) — whichever of the two frees fires first wins.
-            sources = getattr(self, "_holemiss_state_tail_sources", None)
-            if isinstance(sources, dict):
-                for source_key in [key for key in sources if key[0] == req_id]:
-                    sources.pop(source_key, None)
+            # through the SAME deferral as the snapshots (the flush above):
+            # the stash exists only after the drain's take, which follows
+            # the finish — the put-complete free is the primary, the flush
+            # is the backstop (the rejected put, the dead thread).
             skip_warned = getattr(self, "_holemiss_state_tail_skip_warned", None)
             if isinstance(skip_warned, set):
                 for warned_key in [key for key in skip_warned if key[0] == req_id]:
