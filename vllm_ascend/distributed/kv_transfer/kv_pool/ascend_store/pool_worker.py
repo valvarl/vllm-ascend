@@ -673,6 +673,23 @@ class KVPoolWorker:
         # non-save roles — so its capture site is wait_for_layer_load's
         # final layer).
         self._holemiss_step_requests: list[ReqMeta] = []
+        # hybrid-gdn-tail-state (T3): the state-tail put's FROZEN sources —
+        # (req_id, boundary) -> {group: [per-entry frozen clones]}. The
+        # save-path key construction consumes the T2 snapshot registry (the
+        # take) and stashes the entry here for the send thread's ranged
+        # read: a state-tail key's buffers must address THOSE tensors,
+        # never the live slot (the request's own decode advanced the live
+        # slot past the boundary state before the finish-time drain runs).
+        # Freed when the put completes (the send thread drops the entry) or
+        # at the per-request teardown purge, whichever first.
+        self._holemiss_state_tail_sources: dict[tuple[str, int], dict[int, list[torch.Tensor]]] = {}
+        # The state-tail keys this worker constructed: the B43 FA-page probe
+        # skips them (its group-0 page view cannot read a state slot) and
+        # the send thread identifies its substitution rows through it.
+        self._holemiss_state_tail_keys: set[str] = set()
+        # The loud-skip dedup: one missing-snapshot warning per
+        # (req_id, boundary).
+        self._holemiss_state_tail_skip_warned: set[tuple[str, int]] = set()
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -1773,24 +1790,31 @@ class KVPoolWorker:
         """The finish-time partial-tail key for the hybrid group sessions (B39).
 
         Returns ``(key, tail_block_index)`` for the GROUP-0 FA partial block of
-        a finish-time tail request, None for every other group or request.
-        The tail persists under the cross-request boundary sub-hash key (T18):
-        the chain element at ``boundary // hash_block_size - 1`` qualified by
-        the boundary position — the same derivation as the single-group
-        ``_prepare_layerwise_put_session`` and the bench's tail-key census —
-        NEVER the req-id ``{req_id}_lastblock`` key (intra-request only, the
-        false-gap trap). The positive signal is the same as the B38 mask
-        exemption: ``finished_tail_boundary == save_end_token`` (only
-        ``register_finished_partial_tail`` constructs such ReqMetas). Groups
-        1-3 get no tail artifact (the T18 law: the GDN tail state composes
-        with the boundary-state channel; only the FA partial block is new).
+        a finish-time tail request, and for the GROUPS 1-3 GDN state-tail
+        artifact (hybrid-gdn-tail-state T3) when its frozen snapshot is
+        available. The tail persists under the cross-request boundary sub-hash
+        key (T18): the chain element at ``boundary // hash_block_size - 1``
+        qualified by the boundary position — the same derivation as the
+        single-group ``_prepare_layerwise_put_session`` and the bench's
+        tail-key census — NEVER the req-id ``{req_id}_lastblock`` key
+        (intra-request only, the false-gap trap). The positive signal is the
+        same as the B38 mask exemption: ``finished_tail_boundary ==
+        save_end_token`` (only ``register_finished_partial_tail`` constructs
+        such ReqMetas). Group 0 reads the live FA page (the decode never
+        touches the attended window); groups 1-3 read the T2 frozen snapshot
+        (the decode advances the state slot in place — the contamination the
+        freeze exists to prevent), so their construction consumes the
+        snapshot and a missing one skips those keys loudly (design section
+        b.7) instead of persisting contaminated bytes.
         """
         boundary = request.finished_tail_boundary
-        if group_id != 0 or boundary is None or boundary != request.save_end_token:
+        if boundary is None or boundary != request.save_end_token:
             return None
         tail_hash_index = boundary // self.hash_block_size - 1
         if not 0 <= tail_hash_index < len(request.block_hashes):
             return None
+        if group_id != 0:
+            return self._make_layerwise_state_tail_key(request, group_id, boundary)
         key = self._make_layerwise_full_key(
             group_id,
             partial_tail_key_suffix(
@@ -1803,6 +1827,88 @@ class KVPoolWorker:
         # this registration (the send thread sees only the key + block id).
         self._holemiss_tail_key_boundaries[key] = (request.req_id, boundary)
         return key, tail_block_index
+
+    def _holemiss_state_tail_save_groups(self) -> tuple[int, ...]:
+        """The state groups eligible for a tail artifact, tolerant of stubs.
+
+        ``_holemiss_state_groups`` reads ``use_hybrid``/``kv_cache_config``
+        directly, which ``__new__``-stub fixtures may not set (the file's
+        getattr law); a non-Mamba hybrid group (SWA/compressor state is not
+        a portable snapshot) stays ineligible — silently, because no
+        artifact is owed to it.
+        """
+        if not getattr(self, "use_hybrid", False) or getattr(self, "kv_cache_config", None) is None:
+            return ()
+        return self._holemiss_state_groups()
+
+    def _make_layerwise_state_tail_key(self, request: ReqMeta, group_id: int, boundary: int) -> tuple[str, int] | None:
+        """hybrid-gdn-tail-state (T3): the GDN group's state-tail save key.
+
+        The B39 mirror for groups 1-3: the SAME raw-chain derivation (the
+        boundary sub-hash at ``boundary // hash_block_size - 1`` — NEVER the
+        grouped per-block hash list, which silently drops the partial row),
+        the group's own block index, riding the SAME per-group put session
+        with the group's own object size ``sum(group_block_len[g])``. The
+        construction CONSUMES the T2 snapshot: the first eligible group pops
+        the ``(req_id, boundary)`` entry and stashes it for the send
+        thread's ranged read (the put then reads the frozen tensors, never
+        the live slot); the later groups reuse the stash. A missing
+        snapshot skips the state-tail keys LOUDLY (the capture never fired
+        or degraded — design section b.7: never persist decode-contaminated
+        bytes); a group absent from a present entry is an aligned group in
+        a mixed layout (T2 captures exactly the unaligned groups — silent,
+        the aligned channel owns that artifact).
+        """
+        if group_id not in self._holemiss_state_tail_save_groups():
+            return None
+        block_size = get_group_block_size(self.grouped_block_size, group_id)
+        if boundary % block_size == 0:
+            return None
+        sources = getattr(self, "_holemiss_state_tail_sources", None)
+        if not isinstance(sources, dict):
+            return None
+        entry = sources.get((request.req_id, boundary))
+        if entry is None:
+            entry = self._holemiss_take_state_tail_snapshots(request.req_id, boundary)
+            if entry is not None:
+                sources[(request.req_id, boundary)] = entry
+        if entry is None:
+            self._holemiss_warn_state_tail_skip(request, boundary)
+            return None
+        if entry.get(group_id) is None:
+            return None
+        key = self._make_layerwise_full_key(
+            group_id,
+            partial_tail_key_suffix(
+                block_hash_to_str(request.block_hashes[boundary // self.hash_block_size - 1]),
+                boundary,
+            ),
+        )
+        tail_block_index = boundary // block_size
+        # The B43-style registration extends to the state keys (design
+        # section e): the send thread derives its (req_id, boundary) source
+        # lookup from it. The FA-page content probe itself skips these keys
+        # (see holemiss_tail_save_content_sha) — its group-0 page view
+        # cannot read a state slot.
+        self._holemiss_tail_key_boundaries[key] = (request.req_id, boundary)
+        state_keys = getattr(self, "_holemiss_state_tail_keys", None)
+        if isinstance(state_keys, set):
+            state_keys.add(key)
+        return key, tail_block_index
+
+    def _holemiss_warn_state_tail_skip(self, request: ReqMeta, boundary: int) -> None:
+        """The loud degrade: no frozen snapshot, no state-tail keys."""
+        marker = (request.req_id, boundary)
+        warned = getattr(self, "_holemiss_state_tail_skip_warned", None)
+        if not isinstance(warned, set) or marker in warned:
+            return
+        warned.add(marker)
+        logger.warning(
+            "HOLEMISS_STATE_TAIL_PUT_SKIPPED tp=%d req=%s boundary=%d reason=no_frozen_snapshot",
+            self.tp_rank,
+            request.req_id,
+            boundary,
+        )
 
     def _make_layerwise_tail_load_key(self, request: ReqMeta, group_id: int) -> tuple[str, int] | None:
         """The group-0 partial-tail GET key for an exact-end hit (B41).
@@ -3969,7 +4075,11 @@ class KVPoolWorker:
         compute-side mapping.
         """
         registered = self._holemiss_tail_key_boundaries.get(key)
-        if registered is None or key in self._holemiss_tail_save_probed:
+        if (
+            registered is None
+            or key in self._holemiss_tail_save_probed
+            or key in getattr(self, "_holemiss_state_tail_keys", ())
+        ):
             return
         req_id, boundary = registered
         self._holemiss_tail_save_probed.add(key)
@@ -4860,6 +4970,18 @@ class KVPoolWorker:
             if isinstance(snapshots, dict):
                 for snapshot_key in [key for key in snapshots if key[0] == req_id]:
                     snapshots.pop(snapshot_key, None)
+            # hybrid-gdn-tail-state (T3): the stashed frozen sources free
+            # here too when the send thread's put-complete free never ran
+            # (the session was rejected, the drain never fired, or the
+            # thread died) — whichever of the two frees fires first wins.
+            sources = getattr(self, "_holemiss_state_tail_sources", None)
+            if isinstance(sources, dict):
+                for source_key in [key for key in sources if key[0] == req_id]:
+                    sources.pop(source_key, None)
+            skip_warned = getattr(self, "_holemiss_state_tail_skip_warned", None)
+            if isinstance(skip_warned, set):
+                for warned_key in [key for key in skip_warned if key[0] == req_id]:
+                    skip_warned.discard(warned_key)
             if getattr(self, "_holemiss_scratch_owner", None) == req_id:
                 self._holemiss_scratch_owner = None
         armed = self._holemiss_armed_fault

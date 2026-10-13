@@ -1889,6 +1889,81 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         except Exception as exc:  # noqa: BLE001
             logger.error("HOLEMISS tail save probe failed error=%s", exc)
 
+    def _holemiss_state_tail_source_rows(self, req_meta: LayerRangeReqMeta, task: LayerTransferTask) -> list[str]:
+        """hybrid-gdn-tail-state (T3): point the state-tail put at the FROZEN bytes.
+
+        The GDN state-tail key's ranged read must read the T2 snapshot (the
+        D2D clone frozen at the last prefill step's final layer), never the
+        live slot — the request's own decode advanced the live slot past the
+        boundary state before this finish-time drain runs. The worker's
+        ``_holemiss_state_tail_sources`` registry carries the frozen
+        per-entry tensors; this rewrites each state-tail key's buffer row
+        with those tensors' device addresses. The per-entry correspondence
+        is the ``_infer_cache_group_metadata`` walk on both sides (the
+        builder's layer entry slice and the snapshot's entry list derive
+        from the same ordering), pinned by an exact per-entry byte-size
+        match. Returns the keys that could NOT be snapshot-backed: their rows
+        are dropped from this req_meta (never written from the live slot) and
+        the caller revokes their store sessions.
+        """
+        worker = self.worker
+        if worker is None:
+            return []
+        sources = getattr(worker, "_holemiss_state_tail_sources", None)
+        state_keys = getattr(worker, "_holemiss_state_tail_keys", None)
+        boundaries = getattr(worker, "_holemiss_tail_key_boundaries", None)
+        offsets = getattr(worker, "group_layer_cache_entry_offsets", {}).get(task.group_id)
+        if not isinstance(sources, dict) or not isinstance(state_keys, set):
+            return []
+        if not isinstance(boundaries, dict) or not offsets:
+            return []
+        bad: list[str] = []
+        for index, key in enumerate(req_meta.keys):
+            if key not in state_keys:
+                continue
+            registered = boundaries.get(key)
+            entry = sources.get(registered) if registered is not None else None
+            tensors = entry.get(task.group_id) if isinstance(entry, dict) else None
+            layer = task.layer_idx_in_group
+            if (
+                not isinstance(tensors, list)
+                or layer < 0
+                or layer + 1 >= len(offsets)
+                or offsets[layer] > len(tensors)
+                or offsets[layer + 1] > len(tensors)
+            ):
+                bad.append(key)
+                continue
+            layer_tensors = tensors[offsets[layer] : offsets[layer + 1]]
+            sizes = req_meta.all_sizes[index]
+            if len(layer_tensors) != len(sizes) or any(
+                tensor.numel() * tensor.element_size() != size
+                for tensor, size in zip(layer_tensors, sizes, strict=True)
+            ):
+                bad.append(key)
+                continue
+            req_meta.all_buffers[index] = [int(tensor.data_ptr()) for tensor in layer_tensors]
+        if bad:
+            logger.error(
+                "HOLEMISS state-tail frozen source missing keys=%s group=%d; dropping the rows",
+                bad,
+                task.group_id,
+            )
+            for index in range(len(req_meta.keys) - 1, -1, -1):
+                if req_meta.keys[index] in bad:
+                    for name in ("keys", "block_ids", "all_buffers", "all_sizes", "all_offsets"):
+                        getattr(req_meta, name).pop(index)
+        return bad
+
+    def _holemiss_free_state_tail_sources(self, req_id: str) -> None:
+        """Drop the request's frozen state-tail sources (the put completed)."""
+        worker = self.worker
+        sources = getattr(worker, "_holemiss_state_tail_sources", None) if worker is not None else None
+        if not isinstance(sources, dict):
+            return
+        for source_key in [key for key in sources if key[0] == req_id]:
+            sources.pop(source_key, None)
+
     def _handle_range_layer_tasks(self, transfer_tasks: list[LayerTransferTask]) -> None:
         layer_id = transfer_tasks[0].layer_id
         try:
@@ -1901,6 +1976,13 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 if not isinstance(req_meta, LayerRangeReqMeta):
                     raise TypeError(f"Expected layerwise range metadata, got {type(req_meta).__name__}")
                 req_meta.layer_id = layer_id
+                # hybrid-gdn-tail-state (T3): the state-tail rows read the
+                # frozen snapshot BEFORE anything else consumes the req_meta
+                # (the probe below must not fingerprint the live slot for a
+                # state key, and the ranged put must never fall back to it).
+                revoked_state_tails = self._holemiss_state_tail_source_rows(req_meta, task)
+                if revoked_state_tails:
+                    self._revoke_range_keys(revoked_state_tails)
                 self._probe_tail_save_content(req_meta)
                 self._active_put_keys = self._group_put_keys.get(task.group_id)
                 try:
@@ -1911,6 +1993,9 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     self.dec_stored_request(req_id)
                     if self.try_finish_and_delete_stored_request(req_id):
                         self.set_finished_request(req_id)
+                        # The request's puts all committed: the frozen
+                        # state-tail sources have served their ranged reads.
+                        self._holemiss_free_state_tail_sources(req_id)
         except Exception as exc:
             self._fatal_error = exc
             # All started objects belong to the failed forward step, including

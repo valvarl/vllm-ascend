@@ -419,11 +419,11 @@ class TestHybridFinishedTailKeyConstruction(unittest.TestCase):
         self.assertEqual(store.put_starts, [((tail[0],), (GROUP0_OBJECT_SIZE,))])
 
     def test_non_group0_views_stay_cleared(self):
-        """The T18 law: only the FA partial block is the new tail artifact —
-        the GDN views keep the cleared state and open no session. Scoped to
-        group 1 ONLY (the group-0 behavior is (a)'s pin) so this test is the
-        mutation's scoping guard: it must stay green when the construction
-        is removed."""
+        """The scoping guard (hybrid-gdn-tail-state T3 re-read): a group-1
+        view with NO frozen snapshot stays cleared and opens no session —
+        the missing-snapshot loud-skip degrade. Scoped to group 1 ONLY (the
+        group-0 behavior is (a)'s pin) so this test stays green when the
+        state-tail construction is removed or its snapshot gate closes."""
         store = _SessionStore()
         worker = self._make_session_worker(store)
         request = self._tail_request()

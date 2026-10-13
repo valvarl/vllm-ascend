@@ -402,12 +402,15 @@ def _prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> di
             if not request.can_save or not worker._is_layerwise_save_owner():
                 continue
             key_indices = [(key(index), index) for index in range(start, end) if selected(store_mask, index)]
-            # B39: the finish-time partial tail's GROUP-0 FA block persists
-            # under the cross-request boundary sub-hash key (T18) — the only
-            # new tail artifact (the GDN tail composes with the
-            # boundary-state channel, so groups 1-3 stay cleared). The tail
-            # key rides the SAME session machinery as the full blocks: the
-            # never-re-put law is load-bearing here because the key is
+            # B39 + hybrid-gdn-tail-state (T3): the finish-time partial tail
+            # persists under the cross-request boundary sub-hash key (T18) for
+            # EVERY group — group 0's FA partial block (read from the live
+            # page, which the decode never touches in the attended window)
+            # and the GDN groups' state-tail artifacts (whose construction
+            # consumed the T2 frozen snapshot, so the send thread's ranged
+            # read addresses the frozen tensors, never the live slot). The
+            # tail keys ride the SAME session machinery as the full blocks:
+            # the never-re-put law is load-bearing here because the keys are
             # cross-request-derivable — a second request sharing the boundary
             # must not re-put the committed object.
             finished_tail = worker._make_layerwise_finished_tail_key(request, group)
