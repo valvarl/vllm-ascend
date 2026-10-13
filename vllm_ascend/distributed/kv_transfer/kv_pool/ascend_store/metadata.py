@@ -978,6 +978,15 @@ class ReqMeta:
     skip_null_blocks_by_group: list[bool] | None = None
     num_prompt_tokens: int | None = None
 
+    # hybrid-gdn-tail-state T7 fix: True only on the keep-alive ReqMeta built
+    # at a pure-save unaligned prompt-end last chunk — the step whose ReqMeta
+    # the skip_save drop would otherwise remove from connector metadata,
+    # leaving the worker's state-tail snapshot capture an empty requests
+    # window (the T7 live root cause). Drives no save and no load; its sole
+    # consumers are the capture window and the pre-forward start_load_kv
+    # forcing (pool_scheduler.build_connector_meta).
+    state_tail_capture_keepalive: bool = False
+
     # D-MTX.7: the scheduler-allocated scratch block id for the GDN repair
     # anchor landing (one shared pool id; every state group's tensors hold a
     # distinct row with that id). Present ONLY on load-capable hybrid requests
@@ -1047,6 +1056,7 @@ class ReqMeta:
         load_keys: list[str] | None = None,
         repair_scratch_slot: int | None = None,
         repair_scratch_slots: list[int] | None = None,
+        state_tail_capture_keepalive: bool = False,
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -1091,6 +1101,7 @@ class ReqMeta:
         self.load_keys = [] if load_keys is None else list(load_keys)
         self.repair_scratch_slot = repair_scratch_slot
         self.repair_scratch_slots = repair_scratch_slots
+        self.state_tail_capture_keepalive = state_tail_capture_keepalive
 
     @property
     def block_ids(self) -> list[int]:
@@ -1138,6 +1149,7 @@ class ReqMeta:
         kv_cache_group_families: list[str] | None = None,
         save_partial_block: bool = False,
         hash_block_size: int | None = None,
+        state_tail_capture_keepalive: bool = False,
     ) -> ReqMeta | None:
         """Create the request metadata from a request tracker."""
         if block_hashes is None:
@@ -1195,7 +1207,7 @@ class ReqMeta:
         # normally.
         if load_spec is not None and load_spec.can_load and not save_partial_block:
             skip_save = True
-        if skip_save and load_spec is None:
+        if skip_save and load_spec is None and not state_tail_capture_keepalive:
             return None
 
         if not skip_save:
@@ -1230,6 +1242,7 @@ class ReqMeta:
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             num_prompt_tokens=tracker.num_prompt_tokens or target_token_len,
+            state_tail_capture_keepalive=state_tail_capture_keepalive,
             original_block_size=original_block_size,
             last_block_gva=tracker.last_block_gva,
             partial_block_index=partial_block_index,

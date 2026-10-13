@@ -939,6 +939,36 @@ class KVPoolScheduler:
             kv_cache_group_families=self.kv_cache_group_families,
             save_partial_block=self.layerwise_offload,
             hash_block_size=self.hash_block_size,
+            state_tail_capture_keepalive=self._state_tail_capture_keepalive(request_tracker, load_spec),
+        )
+
+    def _state_tail_capture_keepalive(self, request_tracker: RequestTracker, load_spec: LoadSpec | None) -> bool:
+        """hybrid-gdn-tail-state T7 fix: keep the ReqMeta alive at the step
+        the state-tail snapshot capture freezes at.
+
+        A pure-save request's unaligned prompt-end last chunk produces no new
+        full block and no load, so ``from_request_tracker`` drops its ReqMeta
+        (skip_save, load_spec None) — the step's connector metadata then
+        carries no request and the worker's final-layer capture finds an empty
+        window (the T7 live root cause: PUT_SKIPPED no_frozen_snapshot). The
+        keep-alive mirrors the load-bearing survival: the ReqMeta persists
+        with ``can_save=False`` (a verified save-side no-op) exactly when the
+        capture's own guard would qualify it — the step end == the prompt end
+        (``target_token_len == num_prompt_tokens``), the end unaligned vs a
+        GDN state group's block, and GDN state groups exist. Aligned ends,
+        mid-prompt chunks, decode steps, text layouts, and load-bearing steps
+        are byte-identical (the load path already survives the drop).
+        """
+        if load_spec is not None:
+            return False
+        num_prompt = request_tracker.num_prompt_tokens
+        if not num_prompt or request_tracker.token_len != num_prompt:
+            return False
+        if not self.num_speculative_blocks_by_group:
+            return False
+        return any(
+            num_prompt % get_group_block_size(self.grouped_block_size, group_id) != 0
+            for group_id in self.num_speculative_blocks_by_group
         )
 
     def _process_new_request(
@@ -1202,7 +1232,15 @@ class KVPoolScheduler:
                     self.touch_sending_mamba_blocks(req_meta)
                     meta.add_request(req_meta)
 
-        if self._step_carries_layerwise_save(meta):
+        if self._step_carries_layerwise_save(meta) or any(
+            # hybrid-gdn-tail-state T7 fix: the keep-alive ReqMeta drives no
+            # save tasks, but the state-tail snapshot capture at the final
+            # layer still needs the pre-forward start_load_kv cursor reset
+            # (B19's fire-into-empty-task-state class: a post-forward reset
+            # leaves current_layer stale and the capture never fires).
+            request.state_tail_capture_keepalive
+            for request in meta.requests
+        ):
             # The layerwise save drivers fire DURING the forward (attention_v1's
             # on_kv_cache_written notify and the hybrid attention-entry gate),
             # but every per-step save prerequisite — cursor reset, fresh layer

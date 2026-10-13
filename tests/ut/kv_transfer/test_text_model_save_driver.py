@@ -625,14 +625,19 @@ def test_start_load_kv_gives_each_step_fresh_task_lists(text_engine):
 def test_sync_loads_forcing_pinned_in_build_connector_meta():
     """Composition pin: the flag write stays inside build_connector_meta and
     stays guarded by the save-bearing predicate (no relocation/removal drift,
-    no unconditional forcing)."""
+    no unconditional forcing). hybrid-gdn-tail-state T7: the guard gained the
+    keep-alive OR-arm (the state-tail capture's pre-forward start_load_kv);
+    the pin tracks the extended guard shape."""
     source = Path(pool_scheduler.__file__).read_text()
     fn_start = source.index("    def build_connector_meta(self, scheduler_output: SchedulerOutput)")
     fn_end = source.index("    def get_sending_event_id(", fn_start)
     body = source[fn_start:fn_end]
-    guard = body.index("if self._step_carries_layerwise_save(meta):")
+    guard = body.index("if self._step_carries_layerwise_save(meta) or any(")
     forcing = body.index("scheduler_output.has_sync_kv_loads = True")
     assert 0 < guard < forcing < body.rindex("return meta")
+    assert "state_tail_capture_keepalive" in body[guard:forcing], (
+        "the keep-alive OR-arm must stay inside the same guarded forcing"
+    )
     helper_start = source.index("    def _step_carries_layerwise_save(")
     helper = source[helper_start : source.index("\n    def ", helper_start + len("    def _step"))]
     assert "self.use_layerwise" in helper, "the predicate must stay scoped to the layerwise path"
