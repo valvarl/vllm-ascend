@@ -1918,6 +1918,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         if not isinstance(boundaries, dict) or not offsets:
             return []
         bad: list[str] = []
+        bad_diagnostics: dict[str, str] = {}
         for index, key in enumerate(req_meta.keys):
             if key not in state_keys:
                 continue
@@ -1933,6 +1934,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 or offsets[layer + 1] > len(tensors)
             ):
                 bad.append(key)
+                bad_diagnostics[key] = (
+                    f"guards(layer={layer}, offsets_len={len(offsets)}, "
+                    f"tensors={len(tensors) if isinstance(tensors, list) else tensors}, "
+                    f"registered={registered})"
+                )
                 continue
             layer_tensors = tensors[offsets[layer] : offsets[layer + 1]]
             sizes = req_meta.all_sizes[index]
@@ -1941,13 +1947,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 for tensor, size in zip(layer_tensors, sizes, strict=True)
             ):
                 bad.append(key)
+                bad_diagnostics[key] = f"byte-match(layer={layer}, entries={len(layer_tensors)}, sizes={list(sizes)})"
                 continue
             req_meta.all_buffers[index] = [int(tensor.data_ptr()) for tensor in layer_tensors]
         if bad:
             logger.error(
-                "HOLEMISS state-tail frozen source missing keys=%s group=%d; dropping the rows",
+                "HOLEMISS state-tail frozen source missing keys=%s group=%d; dropping the rows; %s",
                 bad,
                 task.group_id,
+                bad_diagnostics,
             )
             for index in range(len(req_meta.keys) - 1, -1, -1):
                 if req_meta.keys[index] in bad:
