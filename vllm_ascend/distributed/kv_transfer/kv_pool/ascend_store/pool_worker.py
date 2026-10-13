@@ -148,6 +148,7 @@ def _holemiss_clear_eio_target_envs() -> None:
     os.environ.pop(HOLEMISS_EIO_TARGET_OFFSET_ENV, None)
     os.environ.pop(HOLEMISS_EIO_TARGET_SIZE_ENV, None)
 
+
 # B37: the write-back remove waits out the Mooncake MASTER-side read lease.
 # The consumer's own query sites (ExistKey / GetReplicaList via
 # GrantLeaseForGroup, master_service.cpp) grant a per-group read lease at
@@ -655,6 +656,23 @@ class KVPoolWorker:
         # region excludes the re-added slots the forward legitimately
         # rewrites, so an unchanged sha excludes any other in-window writer).
         self._holemiss_tail_stable_pre: dict[str, str] = {}
+        # hybrid-gdn-tail-state (T2): the GDN tail-state snapshot registry —
+        # (req_id, boundary) -> {group: [per-entry frozen clones]}. The
+        # last-prefill-step capture freezes the tail state before the
+        # request's own decode advances the slot in place (design section b:
+        # the populate decodes max_tokens=1 and the decode forward advances
+        # slot boundary//block_size past after-(boundary-1) BEFORE the
+        # finish-time drain reads it). The task-3 state-tail save drain
+        # consumes the entry (its put reads the FROZEN bytes, never the live
+        # slot); the per-request teardown purge frees whatever the drain
+        # never took.
+        self._holemiss_state_tail_snapshots: dict[tuple[str, int], dict[int, list[torch.Tensor]]] = {}
+        # The current step's connector requests: the consumer-side probe
+        # leg's only view of the step metadata (a load-only consumer never
+        # reaches save_kv_layer — the connector refuses to forward it for
+        # non-save roles — so its capture site is wait_for_layer_load's
+        # final layer).
+        self._holemiss_step_requests: list[ReqMeta] = []
 
     def _init_layerwise_config(self) -> None:
         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
@@ -1318,6 +1336,10 @@ class KVPoolWorker:
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
+        # hybrid-gdn-tail-state (T2): the consumer-side probe leg reads the
+        # step's requests from this stash (see _init_state_vars — a
+        # load-only consumer never receives them at save_kv_layer).
+        self._holemiss_step_requests = metadata.requests
         if self.use_layerwise:
             self.next_layer_to_submit = 0
             # Transfer threads receive these lists by reference. Give every
@@ -2960,6 +2982,18 @@ class KVPoolWorker:
                 self._finish_current_layerwise_load_sessions()
             raise
         self.layer_load_finished_events[self.current_layer].clear()
+        if (
+            hasattr(self, "kv_role")
+            and not is_kv_save_role(self.kv_role, getattr(self, "consumer_is_to_put", False))
+            and self.current_layer == self.num_layers - 1
+        ):
+            # hybrid-gdn-tail-state (T2), the consumer-side probe leg: a
+            # load-only consumer never reaches save_kv_layer (the connector
+            # refuses to forward it for non-save roles), so its per-step
+            # layer progression ends HERE — the final (FA) layer's entry,
+            # still inside the pre-decode window (every GDN layer <= 62 has
+            # completed; the sampler has not run).
+            self._holemiss_capture_state_tail_snapshots(getattr(self, "_holemiss_step_requests", ()) or ())
         if getattr(self, "block_key_hybrid", False) and self.current_layer == self.num_layers - 1:
             # The final model layer can have no reachable load rows. Completion
             # belongs to the whole request, not whichever group happens to end here.
@@ -4353,6 +4387,174 @@ class KVPoolWorker:
         """The request's state-ladder result (G14's dynamic boundary input)."""
         return self._holemiss_state_load_results.get(req_id)
 
+    def _holemiss_capture_state_tail_snapshots(self, requests: Iterable[ReqMeta]) -> None:
+        """hybrid-gdn-tail-state (T2): the GDN tail-state snapshot freeze.
+
+        The populate request's own 1-token decode advances the tail mamba
+        slot in place past the boundary state before the finish-time drain
+        reads it (the state after the GENERATED token, not after
+        boundary-1), so the state-tail artifact must be FROZEN at the last
+        prefill step's final layer: every GDN layer's forward completed
+        (the last GDN layer is 62; the final layer 63 is FA and never
+        touches the GDN state) and the sampler/decode step has not started.
+        The capture is a D2D clone of each state group's slot
+        ``boundary // group_block_size`` per cache entry, byte-equal to the
+        ranged read's build_addrs extent, registered under
+        ``(req_id, boundary)``.
+
+        NEVER raises into generation: any failure logs the loud
+        HOLEMISS_STATE_TAIL_SNAPSHOT_FAILED warning and leaves no snapshot
+        for that request (the state-tail save path then skips its keys
+        loudly instead of persisting decode-contaminated bytes).
+        """
+        if not (
+            is_kv_save_role(getattr(self, "kv_role", ""), getattr(self, "consumer_is_to_put", False))
+            or _hm_is_evidence()
+            or _hm_diag_enabled()
+        ):
+            # The plain non-evidence consumer path captures nothing (zero
+            # cost outside the battery); the probe leg runs under the
+            # evidence/debug profile.
+            return
+        state_groups = self._holemiss_state_groups()
+        if not state_groups:
+            return
+        snapshots = self._holemiss_state_tail_snapshots
+        for request in requests:
+            num_prompt = request.num_prompt_tokens
+            if num_prompt is None or request.target_token_len != num_prompt:
+                # Only the step whose end == the prompt end (the last
+                # prefill chunk) qualifies: decode steps carry target >
+                # num_prompt, and a mid-prompt chunk end captures nothing.
+                continue
+            boundary = num_prompt
+            if (request.req_id, boundary) in snapshots:
+                # The double-capture fence: a second qualifying step for
+                # the same (req_id, boundary) captures nothing.
+                continue
+            unaligned_groups = [
+                group_id
+                for group_id in state_groups
+                if boundary % get_group_block_size(self.grouped_block_size, group_id) != 0
+            ]
+            if not unaligned_groups:
+                # An aligned end needs no tail artifact: the aligned
+                # boundary channel already saved it (T13).
+                continue
+            captured: list[tuple[int, int, list[torch.Tensor]]] = []
+            failed_group: int | None = None
+            failure: Exception | None = None
+            for group_id in unaligned_groups:
+                try:
+                    pool_slot, tensors = self._holemiss_clone_state_tail_slot(request, group_id, boundary)
+                    captured.append((group_id, pool_slot, tensors))
+                except Exception as exc:  # noqa: BLE001
+                    failed_group, failure = group_id, exc
+                    break
+            if failure is not None:
+                logger.warning(
+                    "HOLEMISS_STATE_TAIL_SNAPSHOT_FAILED tp=%d req=%s group=%d boundary=%d reason=%s",
+                    self.tp_rank,
+                    request.req_id,
+                    failed_group,
+                    boundary,
+                    f"{type(failure).__name__}: {failure}"[:200],
+                )
+                # All-or-nothing per request: the partial clones are dropped
+                # with ``captured`` (a partial freeze would mix boundary and
+                # missing semantics across the GDN groups).
+                continue
+            snapshots[(request.req_id, boundary)] = {group_id: tensors for group_id, _, tensors in captured}
+            if _hm_is_evidence() or _hm_diag_enabled():
+                for group_id, pool_slot, tensors in captured:
+                    self._holemiss_emit_state_tail_snapshot_marker(request, boundary, group_id, pool_slot, tensors)
+
+    def _holemiss_state_tail_entries(self, group_id: int) -> list[tuple[str, torch.Tensor]]:
+        """The state group's cache entries in the object-layout order.
+
+        The same walk ``_infer_cache_group_metadata`` performs (physical
+        layer order, then name order, then the cache tuple): build_addrs
+        concatenates the entries in exactly this order, so the clones must
+        too or the artifact bytes would not match the ranged read.
+        """
+        layer_names_by_physical: dict[int, list[str]] = {}
+        for layer_name in self.kv_cache_config.kv_cache_groups[group_id].layer_names:
+            phys = self._extract_physical_layer_index(layer_name)
+            phys = self._global_to_local_layer.get(phys, phys)
+            layer_names_by_physical.setdefault(phys, []).append(layer_name)
+        entries: list[tuple[str, torch.Tensor]] = []
+        for phys in sorted(layer_names_by_physical):
+            for layer_name in sorted(layer_names_by_physical[phys]):
+                for cache in self._as_cache_tuple(self.kv_caches[layer_name]):
+                    entries.append((layer_name, cache))
+        return entries
+
+    def _holemiss_clone_state_tail_slot(
+        self, request: ReqMeta, group_id: int, boundary: int
+    ) -> tuple[int, list[torch.Tensor]]:
+        """The per-group D2D freeze of the tail state slot (design section b.3).
+
+        Returns the physical pool slot (the block-table row at
+        ``boundary // group_block_size``) and the per-entry clones in the
+        object-layout order — the same bytes the ranged read's build_addrs
+        would fetch for that block. Raises on any inconsistency; the caller
+        degrades loudly.
+        """
+        block_size = get_group_block_size(self.grouped_block_size, group_id)
+        slot_index = boundary // block_size
+        block_table = request.block_ids_by_group[group_id]
+        if slot_index >= len(block_table):
+            raise IndexError(
+                f"group {group_id} block table covers {len(block_table)} blocks; "
+                f"the tail boundary {boundary} needs block {slot_index}"
+            )
+        pool_slot = block_table[slot_index]
+        tensors: list[torch.Tensor] = []
+        for layer_name, cache in self._holemiss_state_tail_entries(group_id):
+            if pool_slot < 0 or pool_slot >= cache.shape[0]:
+                raise IndexError(
+                    f"cache {layer_name!r} holds {cache.shape[0]} slots; tail slot {pool_slot} is out of range"
+                )
+            # The LOGICAL block view's clone: byte-equal to the ranged
+            # read's (base + slot * stride, len) extent even under MRV2
+            # block-major page padding (the _tensor_view_from_data_ptr
+            # storage-flattening law) — the padding between slots must
+            # never leak into the artifact.
+            tensors.append(cache[pool_slot].detach().clone())
+        return pool_slot, tensors
+
+    def _holemiss_emit_state_tail_snapshot_marker(
+        self,
+        request: ReqMeta,
+        boundary: int,
+        group_id: int,
+        pool_slot: int,
+        tensors: list[torch.Tensor],
+    ) -> None:
+        """The frozen-content probe line (design section h, evidence/debug only)."""
+        digest = hashlib.sha256()
+        total_bytes = 0
+        for tensor in tensors:
+            digest.update(tensor.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+            total_bytes += tensor.numel() * tensor.element_size()
+        line = (
+            f"HOLEMISS_STATE_TAIL_SNAPSHOT tp={self.tp_rank} req={request.req_id} "
+            f"group={group_id} boundary={boundary} slot={pool_slot} "
+            f"bytes={total_bytes} sha={digest.hexdigest()}"
+        )
+        self._holemiss_state_markers.setdefault(request.req_id, []).append(line)
+        logger.info("%s", line)
+
+    def _holemiss_take_state_tail_snapshots(self, req_id: str, boundary: int) -> dict[int, list[torch.Tensor]] | None:
+        """The task-3 consume: pop the request's frozen state-tail snapshots.
+
+        The state-tail save drain calls this when it consumes the freeze:
+        the entry leaves the registry with the caller (the put reads THOSE
+        bytes — never the live slot), which is the free. None = no snapshot
+        (the capture never fired, or degraded loudly for that request).
+        """
+        return getattr(self, "_holemiss_state_tail_snapshots", {}).pop((req_id, boundary), None)
+
     def _holemiss_group_builder(self, group_id: int) -> LayerBatchBuilder | None:
         """The live per-group range builder (the writeback builder generalized)."""
         recv_thread = getattr(self, "kv_recv_thread", None)
@@ -4649,6 +4851,15 @@ class KVPoolWorker:
                 "_holemiss_req_meta_by_id",
             ):
                 getattr(self, record_name, {}).pop(req_id, None)
+            # hybrid-gdn-tail-state (T2): the snapshot registry is
+            # (req_id, boundary)-keyed, so the per-request purge walks the
+            # keys — the probe leg's snapshots always leave here, and the
+            # producer's leave via the save-drain consume first whenever
+            # the drain ran.
+            snapshots = getattr(self, "_holemiss_state_tail_snapshots", None)
+            if isinstance(snapshots, dict):
+                for snapshot_key in [key for key in snapshots if key[0] == req_id]:
+                    snapshots.pop(snapshot_key, None)
             if getattr(self, "_holemiss_scratch_owner", None) == req_id:
                 self._holemiss_scratch_owner = None
         armed = self._holemiss_armed_fault
@@ -4704,6 +4915,11 @@ class KVPoolWorker:
             # Recurrent and record-only paths do not exit an attention window.
             self._finish_attention_window()
         if self.current_layer == num_local - 1:
+            # hybrid-gdn-tail-state (T2): the snapshot-freeze window — the
+            # final layer's forward is done (the last GDN layer is 62 and
+            # never follows this FA layer) and the sampler/decode step has
+            # not started, so the GDN tail state is final.
+            self._holemiss_capture_state_tail_snapshots(connector_metadata.requests)
             self._wait_for_final_layer_save(num_local, send_thread)
         self.current_layer += 1
 
