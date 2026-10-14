@@ -1295,6 +1295,14 @@ class LayerRangeReqMeta:
     all_sizes: list[list[int]]
     all_offsets: list[list[int]]
     load_keys: list[str] = field(default_factory=list)
+    # hybrid-robustness-hunt W1-21: strong references backing any state-tail
+    # rows' raw ``all_buffers`` pointers (the frozen snapshot tensors the
+    # substitution addressed). ``all_buffers`` carries bare device addresses
+    # that do NOT own the storage; without this list the put's read window
+    # relies entirely on the worker-side sources registry outliving the send
+    # thread — an ordering assumption, not a structural pin (the freed-source
+    # read class). Empty on every non-state-tail req_meta.
+    state_tail_keepalive: list[list[torch.Tensor]] = field(default_factory=list)
 
 
 @dataclass

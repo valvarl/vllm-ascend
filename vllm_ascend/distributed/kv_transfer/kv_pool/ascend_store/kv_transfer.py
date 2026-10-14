@@ -1950,6 +1950,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 bad_diagnostics[key] = f"byte-match(layer={layer}, entries={len(layer_tensors)}, sizes={list(sizes)})"
                 continue
             req_meta.all_buffers[index] = [int(tensor.data_ptr()) for tensor in layer_tensors]
+            # W1-21: the raw pointers do not own the storage — pin the
+            # frozen tensors on the req_meta itself so no worker-side
+            # registry purge (the deferred teardown flush) can free them
+            # under this put's read window.
+            req_meta.state_tail_keepalive.append(list(layer_tensors))
         if bad:
             logger.error(
                 "HOLEMISS state-tail frozen source missing keys=%s group=%d; dropping the rows; %s",

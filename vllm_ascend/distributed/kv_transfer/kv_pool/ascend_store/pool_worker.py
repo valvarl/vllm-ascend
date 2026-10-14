@@ -729,8 +729,15 @@ class KVPoolWorker:
         # read: a state-tail key's buffers must address THOSE tensors,
         # never the live slot (the request's own decode advanced the live
         # slot past the boundary state before the finish-time drain runs).
-        # Freed when the put completes (the send thread drops the entry) or
-        # at the per-request teardown purge, whichever first.
+        # Freed ONLY by the per-request teardown flush (the drain-signal
+        # branch or the grace bound): T7 fix-3 removed the send-thread free
+        # (the stored-request count OSCILLATES per layer, so a free keyed on
+        # its zero-crossing fires at the first row and starves the later
+        # groups' puts). The send thread's put window is protected
+        # structurally instead (W1-21): every state-tail row's req_meta
+        # carries strong references to the frozen tensors
+        # (LayerRangeReqMeta.state_tail_keepalive), so the put reads live
+        # storage even if this registry is purged mid-put.
         self._holemiss_state_tail_sources: dict[tuple[str, int], dict[int, list[torch.Tensor]]] = {}
         # The state-tail keys this worker constructed: the B43 FA-page probe
         # skips them (its group-0 page view cannot read a state slot) and

@@ -802,6 +802,51 @@ class TestSnapshotConsumedPut(unittest.TestCase):
         self.assertEqual(req_meta.block_ids, [])
         self.assertTrue(any("state-tail frozen source missing" in line for line in logs.output))
 
+    def test_state_tail_rows_carry_their_tensors_on_the_req_meta(self):
+        """W1-21: the raw ``all_buffers`` device addresses do NOT own the
+        storage — the substitution pins the frozen tensors on the req_meta
+        (``state_tail_keepalive``), so the put's read window survives a
+        worker-side sources-registry purge (the deferred teardown flush)
+        structurally, not by ordering luck."""
+        store = _SessionStore()
+        worker, _ = _make_session_worker(store)
+        _capture(worker, _capture_request())
+        views = _prepare_group_sessions(worker, [_tail_save_request()])
+        sources = worker._holemiss_state_tail_sources[("req-tail", BOUNDARY)]
+        view = views[1][0]
+        worker.layer_save_tasks = [[] for _ in range(NUM_LAYERS)]
+        worker._process_save_for_layer_batch([view], 0, group_id=1, layer_idx_in_group=0)
+        task = worker.layer_save_tasks[0][0]
+        builder = _builder_for(worker, 1)
+        shared = builder.build_shared(task, is_save=True)
+        req_meta = builder.build_addrs(shared, task.layer_idx_in_group)
+        thread = _sending_thread(worker)
+        bad = thread._holemiss_state_tail_source_rows(req_meta, task)
+        self.assertEqual(bad, [])
+        offsets = worker.group_layer_cache_entry_offsets[1]
+        expected = sources[1][offsets[0] : offsets[1]]
+        self.assertEqual(req_meta.all_buffers[0], [int(tensor.data_ptr()) for tensor in expected])
+        # The keepalive holds EXACTLY the tensors the pointers address (the
+        # object-graph pin, per row).
+        self.assertEqual(len(req_meta.state_tail_keepalive), 1)
+        kept = req_meta.state_tail_keepalive[0]
+        self.assertEqual([tensor.data_ptr() for tensor in kept], req_meta.all_buffers[0])
+        for kept_tensor, source_tensor in zip(kept, expected, strict=True):
+            self.assertIs(kept_tensor, source_tensor)
+        # The lifetime proof: drop the worker's registry and every local
+        # reference, collect, and the req_meta ALONE still owns live storage
+        # at the recorded pointers.
+        original_bytes = _tensors_bytes(kept)
+        expected = None
+        sources = None
+        worker._holemiss_state_tail_sources.clear()
+        worker._holemiss_state_tail_snapshots.clear()
+        kept = None
+        gc.collect()
+        revived = req_meta.state_tail_keepalive[0]
+        self.assertEqual(_tensors_bytes(revived), original_bytes)
+        self.assertEqual([int(tensor.data_ptr()) for tensor in revived], req_meta.all_buffers[0])
+
     def test_fa_page_probe_skips_state_keys(self):
         """The N18 defense: the B43 FA-page content probe must not fingerprint
         a state key (its group-0 page view would read the wrong cache at the
