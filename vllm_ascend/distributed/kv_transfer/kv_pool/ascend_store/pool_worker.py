@@ -191,6 +191,15 @@ WRITEBACK_REMOVE_RETRY_INTERVAL_MS = 5_000
 # calibration law). UT-pinned: any change is a deliberate re-pin.
 STATE_TAIL_SNAPSHOT_PENDING_GRACE = 8
 
+# hybrid-robustness-hunt W1-26: the PROBE leg's retention bound — a
+# load-only consumer's snapshots never drain (the take runs on the save
+# path), so their free rides the grace bound ALONE. Equal to the drain
+# grace today (bounded HBM retention) but a SEPARATE pin: the drain grace
+# is a drain-latency calibration (>= 2x the observed finish->drain window)
+# while this one is a pure footprint bound — re-pinning one must never
+# silently move the other. UT-pinned: any change is a deliberate re-pin.
+STATE_TAIL_PROBE_SNAPSHOT_GRACE = 8
+
 # B42: REPLICA_IS_NOT_READY (-703) — the stale non-COMPLETE replica on the
 # armed key blocks the master's remove gate
 # (``AllReplicas(&Replica::fn_is_completed)``; force does NOT bypass; the
@@ -690,10 +699,15 @@ class KVPoolWorker:
         # D-MTX.7: the req_id currently owning the repair scratch (the
         # single-request race guard; reset every step in start_load_kv).
         self._holemiss_scratch_owner: str | None = None
-        # B43 content probes: the tail key -> its persisted boundary (the
-        # save-side probe derives the attended window from it) and the keys
-        # already probed (the per-layer save drain fires once per key).
-        self._holemiss_tail_key_boundaries: dict[str, int] = {}
+        # B43 content probes: the tail key -> its owning (req_id, boundary)
+        # registration (the save-side probe derives the attended window from
+        # it; the send thread's frozen-source lookup keys through it; the
+        # capture fence scans its values) and the keys already probed (the
+        # per-layer save drain fires once per key). W1-25: both purge with
+        # the request at the DEFERRED teardown flush (post-drain or
+        # grace-expired — the finish-time teardown is too early: the
+        # deferred drain still reads them), never growing keys-ever.
+        self._holemiss_tail_key_boundaries: dict[str, tuple[str, int]] = {}
         self._holemiss_tail_save_probed: set[str] = set()
         # B43 tail metadata dump: the tail-hit requests the load drain saw.
         # The runner-side probe pops these at the forward's last pre-kernel
@@ -3350,9 +3364,7 @@ class KVPoolWorker:
         )
         return len(get_block_hashes(request.block_hashes, block_size, self.hash_block_size))
 
-    def _holemiss_derive_block_key(
-        self, request: ReqMeta, logical_block: int, *, group_id: int = 0
-    ) -> str | None:
+    def _holemiss_derive_block_key(self, request: ReqMeta, logical_block: int, *, group_id: int = 0) -> str | None:
         """BLOCK-KEY arming target (D7), byte-identical to the getting rank's key.
 
         The mainline block-key store owns ONE object per (group, block); the
@@ -3379,9 +3391,7 @@ class KVPoolWorker:
         if group_id < 0 or group_id >= self.num_kv_cache_groups:
             return None
         block_size = (
-            self.grouped_block_size[0]
-            if group_id <= 0
-            else get_group_block_size(self.grouped_block_size, group_id)
+            self.grouped_block_size[0] if group_id <= 0 else get_group_block_size(self.grouped_block_size, group_id)
         )
         group_block_hashes = get_block_hashes(request.block_hashes, block_size, self.hash_block_size)
         if logical_block < 0 or logical_block >= len(group_block_hashes):
@@ -3474,9 +3484,7 @@ class KVPoolWorker:
         if os.getenv(HOLEMISS_GDN_EIO_ENABLED_ENV, "0") == "1":
             gdn_eio_group = _hm_env_int(HOLEMISS_EIO_GROUP_ENV, 0)
         if gdn_eio_group > 0:
-            self._holemiss_arm_gdn_state_eio(
-                request, gdn_eio_group, eio_layer, load_start_block, end_block
-            )
+            self._holemiss_arm_gdn_state_eio(request, gdn_eio_group, eio_layer, load_start_block, end_block)
             return
         # W1-10: the multi-target list (empty/unset = the single-target
         # legacy law, byte-identical). All targets share the logical block
@@ -3484,9 +3492,7 @@ class KVPoolWorker:
         eio_layers = _hm_env_int_list(HOLEMISS_EIO_LAYERS_ENV)
         if eio_layers:
             armable_layers = self._holemiss_armable_layer_count()
-            out_of_range = [
-                layer for layer in eio_layers if not (0 <= layer < armable_layers)
-            ]
+            out_of_range = [layer for layer in eio_layers if not (0 <= layer < armable_layers)]
             if out_of_range:
                 logger.info(
                     "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=layer_out_of_range layers=%s armable=%d",
@@ -3557,14 +3563,8 @@ class KVPoolWorker:
             return None
         return layer_offset, layer_size
 
-    def _holemiss_arm_disk_eio(
-        self, request: ReqMeta, eio_layer: int | list[int], eio_logical: int
-    ) -> None:
-        eio_layers = (
-            [int(layer) for layer in eio_layer]
-            if isinstance(eio_layer, (list, tuple))
-            else [int(eio_layer)]
-        )
+    def _holemiss_arm_disk_eio(self, request: ReqMeta, eio_layer: int | list[int], eio_logical: int) -> None:
+        eio_layers = [int(layer) for layer in eio_layer] if isinstance(eio_layer, (list, tuple)) else [int(eio_layer)]
         multi_target = len(eio_layers) > 1
         if multi_target and not callable(getattr(self.m_store, "batch_copy_get_ranges", None)):
             # Never guess: without the per-range API the isolated executor
@@ -3816,9 +3816,7 @@ class KVPoolWorker:
             return None
         armed_layer_ids = armed.get("layer_ids") or [armed["layer_id"]]
         if self.use_hybrid:
-            physical_layers = {
-                self._holemiss_hybrid_physical_layer(int(layer)) for layer in armed_layer_ids
-            }
+            physical_layers = {self._holemiss_hybrid_physical_layer(int(layer)) for layer in armed_layer_ids}
         else:
             physical_layers = {int(layer) for layer in armed_layer_ids}
         if physical_layer_id not in physical_layers:
@@ -5547,6 +5545,44 @@ class KVPoolWorker:
         except (IndexError, ValueError, RuntimeError, TypeError):
             return None
 
+    def _holemiss_purge_tail_registries(self, req_id: str) -> None:
+        """W1-25: drop a finished request's tail-key registrations.
+
+        The boundaries map's values carry the owning ``(req_id, boundary)``;
+        the probed set and the state-key set key on the same store keys (the
+        state keys are registered in the boundaries map at construction).
+        Called ONLY from the deferred teardown flush (post-drain or
+        grace-expired): the finish-time teardown is too early — the
+        deferred drain still reads the registrations (the save-side content
+        probe and the send thread's frozen-source lookup), and purging
+        there would starve the tail put exactly like the pre-T7 immediate
+        snapshot free. The state keys' in-flight puts are complete by the
+        drain-signal teardown (the ``_wait_for_final_layer_save`` fence
+        fires after every queued put of the step) and never ran at the
+        grace expiry, so removing them from the send thread's membership
+        filter is safe at both flush triggers.
+        """
+        boundaries = getattr(self, "_holemiss_tail_key_boundaries", None)
+        stale_keys: list[str] = []
+        if isinstance(boundaries, dict):
+            for key, registered in list(boundaries.items()):
+                if isinstance(registered, tuple) and registered[0] == req_id:
+                    stale_keys.append(key)
+                    del boundaries[key]
+        if stale_keys:
+            probed = getattr(self, "_holemiss_tail_save_probed", None)
+            if isinstance(probed, set):
+                for key in stale_keys:
+                    probed.discard(key)
+            state_keys = getattr(self, "_holemiss_state_tail_keys", None)
+            if isinstance(state_keys, set):
+                for key in stale_keys:
+                    state_keys.discard(key)
+        capture_failed = getattr(self, "_holemiss_state_tail_capture_failed", None)
+        if isinstance(capture_failed, dict):
+            for failed_key in [key for key in capture_failed if key[0] == req_id]:
+                del capture_failed[failed_key]
+
     def _holemiss_teardown_finished(self, finished_req_ids: set[str]) -> None:
         """B12b: purge HR regions for EVERY finished/failed request.
 
@@ -5577,6 +5613,15 @@ class KVPoolWorker:
                 if isinstance(deferred_sources, dict):
                     for source_key in [key for key in deferred_sources if key[0] == deferred_req_id]:
                         deferred_sources.pop(source_key, None)
+                # W1-25: the tail-key registries purge with the SAME
+                # deferral — the deferred drain (the save probe and the
+                # send thread's frozen-source lookup) still reads them
+                # between the finish and this flush, so the finish-time
+                # teardown is too early; after the drain signal (or the
+                # grace bound) the entries are dead, and without this
+                # purge the capture fence scans a keys-ever registry and a
+                # REUSED req_id silently suppresses new captures forever.
+                self._holemiss_purge_tail_registries(deferred_req_id)
                 del deferred_snapshots[deferred_req_id]
                 if isinstance(tail_seen, set):
                     tail_seen.discard(deferred_req_id)
@@ -5605,7 +5650,16 @@ class KVPoolWorker:
             pending_snapshots = getattr(self, "_holemiss_state_tail_snapshot_pending_free", None)
             if isinstance(snapshots, dict):
                 if isinstance(pending_snapshots, dict):
-                    pending_snapshots[req_id] = STATE_TAIL_SNAPSHOT_PENDING_GRACE
+                    # W1-26: pick the retention bound by the leg that
+                    # captured — a save-role worker's snapshots expect the
+                    # drain (the drain-signal branch frees them early); a
+                    # load-only consumer's probe-leg snapshots never drain,
+                    # so they ride the probe grace alone.
+                    pending_snapshots[req_id] = (
+                        STATE_TAIL_SNAPSHOT_PENDING_GRACE
+                        if is_kv_save_role(getattr(self, "kv_role", ""), getattr(self, "consumer_is_to_put", False))
+                        else STATE_TAIL_PROBE_SNAPSHOT_GRACE
+                    )
                 else:
                     for snapshot_key in [key for key in snapshots if key[0] == req_id]:
                         snapshots.pop(snapshot_key, None)

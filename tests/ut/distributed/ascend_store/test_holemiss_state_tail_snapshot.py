@@ -205,6 +205,8 @@ def _make_worker(kv_role="kv_producer", consumer_is_to_put=False, use_hybrid=Tru
     worker._holemiss_state_tail_seen_reqs = set()
     worker._holemiss_state_tail_sources = {}
     worker._holemiss_state_tail_capture_failed = {}
+    worker._holemiss_tail_save_probed = set()
+    worker._holemiss_state_tail_keys = set()
     worker._holemiss_tail_key_boundaries = {}
     worker._holemiss_state_markers = {}
     worker._holemiss_state_load_results = {}
@@ -528,6 +530,97 @@ class TestLifecycle(unittest.TestCase):
             worker._holemiss_tail_key_boundaries["<the-tail-key>"] = ("req-A", BOUNDARY)
             worker._holemiss_capture_state_tail_snapshots([request])
         self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
+
+    def _teardown_worker(self, kv_role="kv_producer", consumer_is_to_put=False):
+        worker, _ = _make_worker(kv_role=kv_role, consumer_is_to_put=consumer_is_to_put)
+        worker._hole_recovery_regions = []
+        worker._hole_recovery_lock = threading.Lock()
+        worker._holemiss_armed_fault = None
+        worker._holemiss_state_tail_keys = set()
+        return worker
+
+    def test_tail_registries_purge_at_the_deferred_flush_only(self):
+        """W1-25: the tail-key registrations (boundaries + probed + state
+        keys) survive the finish-time teardown (the deferred drain still
+        reads them) and purge at the DEFERRED flush — pre-fix they grew
+        keys-ever and a REUSED req_id silently suppressed new captures
+        forever."""
+        worker = self._teardown_worker()
+        request = _make_request()
+        worker._holemiss_capture_state_tail_snapshots([request])
+        taken = worker._holemiss_take_state_tail_snapshots("req-A", BOUNDARY)
+        worker._holemiss_state_tail_sources[("req-A", BOUNDARY)] = taken
+        state_key = "model@mooncake_hybrid_v1:group:1:block:1536@deadbeef@0"
+        worker._holemiss_tail_key_boundaries[state_key] = ("req-A", BOUNDARY)
+        worker._holemiss_tail_save_probed.add(state_key)
+        worker._holemiss_state_tail_keys.add(state_key)
+        # The finish teardown: everything survives (the drain is owed).
+        worker._holemiss_teardown_finished({"req-A"})
+        self.assertIn(state_key, worker._holemiss_tail_key_boundaries)
+        self.assertIn(state_key, worker._holemiss_tail_save_probed)
+        self.assertIn(state_key, worker._holemiss_state_tail_keys)
+        # The drain signal: the deferred flush purges all three registries.
+        tail_meta = _make_request(req_id="req-A")
+        tail_meta.finished_tail_boundary = BOUNDARY
+        worker._holemiss_record_state_tail_drain([tail_meta])
+        worker._holemiss_teardown_finished(set())
+        self.assertNotIn(state_key, worker._holemiss_tail_key_boundaries)
+        self.assertNotIn(state_key, worker._holemiss_tail_save_probed)
+        self.assertNotIn(state_key, worker._holemiss_state_tail_keys)
+
+    def test_purged_tail_registration_unblocks_a_reused_req_id(self):
+        """W1-25's req_id-reuse hazard pin: after the deferred flush, a
+        REUSED req_id at the same boundary captures again (pre-fix the
+        stale (req_id, boundary) value in the boundaries map fenced the
+        new capture forever)."""
+        with _profile("evidence"):
+            worker = self._teardown_worker()
+            request = _make_request()
+            worker._holemiss_capture_state_tail_snapshots([request])
+            worker._holemiss_take_state_tail_snapshots("req-A", BOUNDARY)
+            worker._holemiss_tail_key_boundaries["<the-tail-key>"] = ("req-A", BOUNDARY)
+            worker._holemiss_teardown_finished({"req-A"})
+            for _ in range(STATE_TAIL_SNAPSHOT_PENDING_GRACE + 1):
+                worker._holemiss_teardown_finished(set())
+            self.assertEqual(worker._holemiss_tail_key_boundaries, {})
+            # The reused request at the same boundary: NOT fenced.
+            worker._holemiss_capture_state_tail_snapshots([_make_request()])
+            self.assertIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
+
+    def test_capture_failed_record_purges_with_the_registries(self):
+        """W1-19/W1-25: the partial-capture record rides the same deferred
+        purge — it never outlives the request's flush window."""
+        worker = self._teardown_worker()
+        worker._holemiss_state_tail_capture_failed[("req-A", BOUNDARY)] = {2}
+        worker._holemiss_teardown_finished({"req-A"})
+        self.assertIn(("req-A", BOUNDARY), worker._holemiss_state_tail_capture_failed)
+        for _ in range(STATE_TAIL_SNAPSHOT_PENDING_GRACE + 1):
+            worker._holemiss_teardown_finished(set())
+        self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_capture_failed)
+
+    def test_probe_leg_grace_is_selected_by_role(self):
+        """W1-26: the pending-free grace picks the constant by the leg that
+        captured — the save-role worker's snapshots expect the drain (the
+        drain-latency calibration bound); a load-only consumer's probe-leg
+        snapshots never drain and ride the probe bound (a pure footprint
+        bound). The constants are made distinguishable here so the
+        SELECTION is pinned, not the shared value."""
+        module = pool_worker_module
+        saved_drain = module.STATE_TAIL_SNAPSHOT_PENDING_GRACE
+        saved_probe = module.STATE_TAIL_PROBE_SNAPSHOT_GRACE
+        module.STATE_TAIL_SNAPSHOT_PENDING_GRACE = 8
+        module.STATE_TAIL_PROBE_SNAPSHOT_GRACE = 3
+        try:
+            producer = self._teardown_worker(kv_role="kv_producer")
+            producer._holemiss_teardown_finished({"req-X"})
+            self.assertEqual(producer._holemiss_state_tail_snapshot_pending_free["req-X"], 8)
+            consumer = self._teardown_worker(kv_role="kv_consumer", consumer_is_to_put=False)
+            consumer._holemiss_teardown_finished({"req-X"})
+            self.assertEqual(consumer._holemiss_state_tail_snapshot_pending_free["req-X"], 3)
+        finally:
+            module.STATE_TAIL_SNAPSHOT_PENDING_GRACE = saved_drain
+            module.STATE_TAIL_PROBE_SNAPSHOT_GRACE = saved_probe
+
 
 class TestTriggerConditions(unittest.TestCase):
     def test_non_finishing_step_negative_control(self):
