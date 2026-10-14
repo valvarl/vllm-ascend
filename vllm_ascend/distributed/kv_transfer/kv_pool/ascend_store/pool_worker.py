@@ -3260,10 +3260,21 @@ class KVPoolWorker:
         armed key must be the same object key the phase-2 range GET reads, i.e.
         the backend-bound ``make_full_key`` for group 0. The 0.26 per-layer
         ``split_layers`` literal is deliberately NOT reused (I-MAIN.7).
+
+        Under ``prefix_match_unit < block_size`` (hybrid pmu 256) the request's
+        ``block_hashes`` are HASH-block-granular chained sub-hashes, so block
+        ``b``'s identity is the LAST sub-hash of its group block —
+        ``block_hashes[(b+1)*scale - 1]``, the ``_LazyGroupedBlockHashList``
+        law (metadata.py:800; the same ``get_block_hashes`` the load span and
+        the hit check use — no derivation drift). The flat
+        ``block_hashes[logical_block]`` read is only correct at
+        ``hash_block_size == block_size``, where ``get_block_hashes`` returns
+        the list unchanged (byte-identical legacy behavior).
         """
-        if logical_block < 0 or logical_block >= len(request.block_hashes):
+        group_block_hashes = get_block_hashes(request.block_hashes, self.grouped_block_size[0], self.hash_block_size)
+        if logical_block < 0 or logical_block >= len(group_block_hashes):
             return None
-        block_hash = request.block_hashes[logical_block]
+        block_hash = group_block_hashes[logical_block]
         block_hash_str = block_hash if isinstance(block_hash, str) else block_hash.hex()
         return self._make_mooncake_layerwise_key(block_hash_str)
 

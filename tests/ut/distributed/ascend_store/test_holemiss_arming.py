@@ -39,6 +39,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     LayerBatchedLoadTask,
     LoadSpec,
     ReqMeta,
+    get_block_hashes,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
     HOLEMISS_EIO_TARGET_ENV,
@@ -357,6 +358,139 @@ class TestArmedRangeGet(HolemissTestBase):
         self.assertEqual(regions[0]["key"], key)
         self.assertEqual(regions[0]["result"], HOLEMISS_SYNTHETIC_FAULT_RC)
         self.assertEqual(regions[0]["layer_id"], 3)
+
+
+class TestPmuBlockKeyDerivation(HolemissTestBase):
+    """The N18/N19 closure (hybrid-matrix-pmu-10lens T2): under
+    ``prefix_match_unit < block_size`` the arm target MUST be the LAST
+    sub-hash of the group block — ``block_hashes[(b+1)*scale - 1]`` — the
+    same ``_LazyGroupedBlockHashList`` law (metadata.py:800) the load span,
+    the hit check, and the GET session use.
+
+    The live conviction (2026-10-14, pmu10lens_hyb36_4608): the flat
+    ``block_hashes[logical_block]`` read armed the 256-gran sub-hash
+    ``d685ca6c...`` while the store held ``b72e19dc...`` (block 0) — a
+    phantom key the consumer never reads, so the C++ EIO window never
+    engaged (zero [EIO_INJECT], expected-fault-not-delivered). No green
+    path had ever driven pmu + a fault row (the cl_sweep ran pmu-less;
+    the gdn-tail batteries ran fault-less).
+    """
+
+    HYB_BLOCK_SIZE = 1536
+    PMU = 256
+    SCALE = HYB_BLOCK_SIZE // PMU  # 6
+    N_BLOCKS = 3  # the 4608 lens shape: 3 full blocks = 18 sub-hashes
+
+    def _make_hybrid_worker(self, hash_block_size: int, block_size: int = HYB_BLOCK_SIZE):
+        worker = _make_worker(
+            num_groups=4,
+            use_hybrid=True,
+            kv_cache_config=_qwen36_config(),
+            num_layers=8,
+        )
+        worker.block_size = block_size
+        worker.grouped_block_size = [block_size] * 4
+        worker.hash_block_size = hash_block_size
+        return worker
+
+    def _make_pmu_request(self, num_blocks: int = N_BLOCKS):
+        num_sub = num_blocks * self.SCALE
+        block_hashes = [bytes([(i + 1) % 256] * 32) for i in range(num_sub)]
+        block_ids = [[10 + i for i in range(num_blocks)] for _ in range(4)]
+        load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            kvpool_cached_tokens=num_blocks * self.HYB_BLOCK_SIZE,
+            can_load=True,
+            kvpool_store_skip_tokens=None,
+            token_len=0,
+        )
+        return ReqMeta(
+            req_id="req-pmu",
+            token_len_chunk=num_blocks * self.HYB_BLOCK_SIZE,
+            block_ids_by_group=block_ids,
+            block_hashes=block_hashes,
+            can_save=False,
+            load_spec=load_spec,
+        )
+
+    def test_pmu_derivation_is_last_sub_hash_of_group_block(self):
+        worker = self._make_hybrid_worker(self.PMU)
+        request = self._make_pmu_request()
+        sub = request.block_hashes
+        for b in range(self.N_BLOCKS):
+            key = worker._holemiss_derive_block_key(request, b)
+            expected_hash = sub[(b + 1) * self.SCALE - 1]
+            self.assertEqual(key, worker._make_mooncake_layerwise_key(expected_hash.hex()))
+            # The REAL law the GET session uses — no derivation drift.
+            self.assertEqual(
+                sub[(b + 1) * self.SCALE - 1],
+                get_block_hashes(sub, self.HYB_BLOCK_SIZE, self.PMU)[b],
+            )
+            # The discrimination that convicted the defect: the flat read
+            # (the old behavior) arms the sub-hash at logical_block*256
+            # tokens — a phantom key absent from the store.
+            self.assertNotEqual(key, worker._make_mooncake_layerwise_key(sub[b].hex()))
+
+    def test_pmu_arming_via_configure_fault_targets_store_key(self):
+        worker = self._make_hybrid_worker(self.PMU)
+        request = self._make_pmu_request()
+        _set_disk_eio(0, 1)
+        worker._holemiss_configure_fault(request)
+        expected = worker._make_mooncake_layerwise_key(request.block_hashes[(1 + 1) * self.SCALE - 1].hex())
+        self.assertEqual(os.environ[HOLEMISS_EIO_TARGET_ENV], expected)
+        worker.m_store.put_end_disk.assert_called_once_with(expected)
+        self.assertEqual(worker._holemiss_armed_fault["logical_block_index"], 1)
+
+    def test_pmu_synthetic_twin_shares_the_scale_aware_derivation(self):
+        worker = self._make_hybrid_worker(self.PMU)
+        request = self._make_pmu_request()
+        os.environ.update(
+            {
+                "HOLEMISS_FAIL_LAYER": "0",
+                "HOLEMISS_FAIL_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        self.assertEqual(worker._holemiss_armed_fault["kind"], "synthetic")
+        self.assertEqual(
+            worker._holemiss_armed_fault["key"],
+            worker._make_mooncake_layerwise_key(request.block_hashes[(2 + 1) * self.SCALE - 1].hex()),
+        )
+
+    def test_pmu_bounds_guard_is_group_block_granular(self):
+        worker = self._make_hybrid_worker(self.PMU)
+        request = self._make_pmu_request()
+        # 3 group blocks: logical 3 is out of range even though the flat
+        # sub-hash list has 18 entries (the old guard never tripped here).
+        self.assertIsNone(worker._holemiss_derive_block_key(request, 3))
+        self.assertIsNone(worker._holemiss_derive_block_key(request, -1))
+        self.assertIsNone(worker._holemiss_derive_block_key(request, 17))
+
+    def test_non_pmu_hybrid_derivation_byte_identical_flat(self):
+        # The cl_sweep's green shape (no pmu): hash_block_size == block_size
+        # -> get_block_hashes returns the list unchanged -> the flat read.
+        worker = self._make_hybrid_worker(self.HYB_BLOCK_SIZE)
+        block_hashes = [bytes([(i + 1) % 256] * 32) for i in range(self.N_BLOCKS)]
+        request = ReqMeta(
+            req_id="req-nopmu",
+            token_len_chunk=self.N_BLOCKS * self.HYB_BLOCK_SIZE,
+            block_ids_by_group=[[10 + i for i in range(self.N_BLOCKS)] for _ in range(4)],
+            block_hashes=block_hashes,
+            can_save=False,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                kvpool_cached_tokens=self.N_BLOCKS * self.HYB_BLOCK_SIZE,
+                can_load=True,
+                kvpool_store_skip_tokens=None,
+                token_len=0,
+            ),
+        )
+        for b in range(self.N_BLOCKS):
+            self.assertEqual(
+                worker._holemiss_derive_block_key(request, b),
+                worker._make_mooncake_layerwise_key(block_hashes[b].hex()),
+            )
+        self.assertIsNone(worker._holemiss_derive_block_key(request, self.N_BLOCKS))
 
 
 class TestSyncDrain(HolemissTestBase):
