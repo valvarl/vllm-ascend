@@ -6171,9 +6171,49 @@ class KVPoolWorker:
         finally:
             send_thread.dec_stored_request(req_id)  # type: ignore[attr-defined]
 
+    def _holemiss_check_step_put_lifecycle(self) -> None:
+        """W1-15 / R1 Mode 2: the step-end put-lifecycle loud-check.
+
+        Every key the step put-started must be committed or explicitly
+        revoked by the step's drain: the save fence
+        (``_wait_for_final_layer_save``) fires only after every queued put
+        of the step, and the fatal path revokes the whole open set, so a
+        STILL-OPEN put-start at this boundary means the submission chain
+        broke silently (the depth-defect race: the FA-tail chain's commit
+        lost to the step lifecycle and the master expired the session 60 s
+        later with no in-engine signal). Fail here instead of at the
+        master's expiry.
+
+        Scoped to the block-key layerwise plane — the only plane that
+        put-starts; the open set is worker-owned and cleared by the send
+        thread at every commit/revoke.
+        """
+        with self._put_started_keys_lock:
+            open_keys = sorted(self._put_started_keys)
+        if not open_keys:
+            return
+        logger.error(
+            "HOLEMISS_PUT_LIFECYCLE_BROKEN tp=%d open_put_starts=%d keys=%s: "
+            "a put-started key survived the step boundary (no commit, no revoke); "
+            "the master would expire this session silently 60s later",
+            self.tp_rank,
+            len(open_keys),
+            open_keys[:4],
+        )
+        raise RuntimeError(
+            "HOLEMISS_PUT_LIFECYCLE_BROKEN: "
+            f"{len(open_keys)} put-started key(s) neither committed nor revoked "
+            f"at the step boundary (first keys: {open_keys[:4]}); "
+            "the layerwise save chain broke silently"
+        )
+
     def get_finished(self, finished_req_ids: set[str], meta: AscendConnectorMetadata) -> tuple[set[str], set[str]]:
         self._holemiss_teardown_finished(finished_req_ids | meta.preempted_req_ids)
         if self.use_block_key_layerwise:
+            # W1-15 / R1 Mode 2: the step's put-starts must have closed by
+            # this boundary (the save fence precedes it) — an open one is
+            # the silent-loss signature.
+            self._holemiss_check_step_put_lifecycle()
             self._release_layerwise_requests_terminal(finished_req_ids | meta.preempted_req_ids)
         if self.kv_send_thread is not None:
             send_thread = self.kv_send_thread
