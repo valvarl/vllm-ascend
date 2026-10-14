@@ -133,6 +133,25 @@ HOLEMISS_EIO_TARGET_ENV = "EIO_TARGET_KEY"  # empty/unset == injector off
 # window to this extent so the armed key's sibling ranges survive.
 HOLEMISS_EIO_TARGET_OFFSET_ENV = "HOLEMISS_EIO_TARGET_OFFSET"
 HOLEMISS_EIO_TARGET_SIZE_ENV = "HOLEMISS_EIO_TARGET_SIZE"
+# W1-10 (hybrid-robustness-hunt): the multi-target EIO slice. CSV of
+# STORE-LOCAL FA layer indices armed SIMULTANEOUSLY on the SAME logical
+# block's group-0 object (empty/unset == the single-target legacy law,
+# byte-identical). The executor narrows the window PER TARGET: one isolated
+# per-range call per armed layer extent, so sibling layers of the same key
+# (including the OTHER armed layers' ranges) never land through a later
+# call - a union extent cannot express the far-apart {3,63} shape (the
+# union spans the whole object), hence the per-target calls.
+HOLEMISS_EIO_LAYERS_ENV = "HOLEMISS_EIO_LAYERS"
+# W1-11: the GDN-state EIO injectability gate. DEFAULT "0"/unset = the
+# D-T12.5 group-0-only arming law INTACT (HOLEMISS_EIO_GROUP is ignored and
+# group-N keys stay non-armable). "1" + HOLEMISS_EIO_GROUP in 1..N-1 arms a
+# WHOLE-OBJECT disk EIO on the group-N GDN STATE object at the armed
+# logical block - the ladder's boundary GET then fails (EIO -> -1102/-800
+# -> _holemiss_record_failed_load_keys -> the loud STATE_ABSENT demotion).
+# Mutually exclusive with the FA family: the GDN arm requires
+# HOLEMISS_EIO_LAYER < 0 (one fault family per request, never both).
+HOLEMISS_GDN_EIO_ENABLED_ENV = "HOLEMISS_GDN_EIO_ENABLED"
+HOLEMISS_EIO_GROUP_ENV = "HOLEMISS_EIO_GROUP"
 
 
 def _holemiss_clear_eio_target_envs() -> None:
@@ -232,6 +251,28 @@ def _hm_env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _hm_env_int_list(name: str) -> list[int]:
+    """Parse a CSV int-list env (W1-10); empty/unset/garbage -> [].
+
+    A malformed entry degrades to the EMPTY list (the caller then arms
+    nothing and logs the ARM_SKIP) - never a partial list, which would arm
+    a different fault than the one requested.
+    """
+    raw = os.getenv(name)
+    if not raw:
+        return []
+    values: list[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            return []
+        try:
+            values.append(int(token))
+        except ValueError:
+            return []
+    return values
 
 
 def _holemiss_device_synchronize() -> None:
@@ -3253,12 +3294,14 @@ class KVPoolWorker:
         end_block = min(cached_tokens // block_size, len(group_block_hashes))
         return load_start_block, end_block
 
-    def _holemiss_derive_block_key(self, request: ReqMeta, logical_block: int) -> str | None:
+    def _holemiss_derive_block_key(
+        self, request: ReqMeta, logical_block: int, *, group_id: int = 0
+    ) -> str | None:
         """BLOCK-KEY arming target (D7), byte-identical to the getting rank's key.
 
         The mainline block-key store owns ONE object per (group, block); the
         armed key must be the same object key the phase-2 range GET reads, i.e.
-        the backend-bound ``make_full_key`` for group 0. The 0.26 per-layer
+        the backend-bound ``make_full_key`` for the group. The 0.26 per-layer
         ``split_layers`` literal is deliberately NOT reused (I-MAIN.7).
 
         Under ``prefix_match_unit < block_size`` (hybrid pmu 256) the request's
@@ -3270,13 +3313,26 @@ class KVPoolWorker:
         ``block_hashes[logical_block]`` read is only correct at
         ``hash_block_size == block_size``, where ``get_block_hashes`` returns
         the list unchanged (byte-identical legacy behavior).
+
+        ``group_id`` (W1-11): the GDN-state arm derives the group-N object
+        key with the SAME law the ladder plan builder uses
+        (``_make_layerwise_full_key(group_id, ...)`` + the group's block
+        size). DEFAULT 0 = the FA-group key, byte-identical to the legacy
+        derivation.
         """
-        group_block_hashes = get_block_hashes(request.block_hashes, self.grouped_block_size[0], self.hash_block_size)
+        if group_id < 0 or group_id >= self.num_kv_cache_groups:
+            return None
+        block_size = (
+            self.grouped_block_size[0]
+            if group_id <= 0
+            else get_group_block_size(self.grouped_block_size, group_id)
+        )
+        group_block_hashes = get_block_hashes(request.block_hashes, block_size, self.hash_block_size)
         if logical_block < 0 or logical_block >= len(group_block_hashes):
             return None
         block_hash = group_block_hashes[logical_block]
         block_hash_str = block_hash if isinstance(block_hash, str) else block_hash.hex()
-        return self._make_mooncake_layerwise_key(block_hash_str)
+        return self._make_layerwise_full_key(group_id, block_hash_str)
 
     def _holemiss_hybrid_fa_layers(self) -> list[int] | None:
         if not self.use_hybrid:
@@ -3355,6 +3411,47 @@ class KVPoolWorker:
             return
         eio_layer = _hm_env_int("HOLEMISS_EIO_LAYER", -1)
         eio_logical = _hm_env_int("HOLEMISS_EIO_LOGICAL_BLOCK", 2)
+        # W1-11: the GDN-state EIO gate (opt-in; DEFAULT off = the D-T12.5
+        # group-0-only law intact - without the enabled flag the group env
+        # is IGNORED and the FA family below is the only arm).
+        gdn_eio_group = -1
+        if os.getenv(HOLEMISS_GDN_EIO_ENABLED_ENV, "0") == "1":
+            gdn_eio_group = _hm_env_int(HOLEMISS_EIO_GROUP_ENV, 0)
+        if gdn_eio_group > 0:
+            self._holemiss_arm_gdn_state_eio(
+                request, gdn_eio_group, eio_layer, load_start_block, end_block
+            )
+            return
+        # W1-10: the multi-target list (empty/unset = the single-target
+        # legacy law, byte-identical). All targets share the logical block
+        # (the minimal slice: N FA layers of ONE group-0 object).
+        eio_layers = _hm_env_int_list(HOLEMISS_EIO_LAYERS_ENV)
+        if eio_layers:
+            armable_layers = self._holemiss_armable_layer_count()
+            out_of_range = [
+                layer for layer in eio_layers if not (0 <= layer < armable_layers)
+            ]
+            if out_of_range:
+                logger.info(
+                    "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=layer_out_of_range layers=%s armable=%d",
+                    self.tp_rank,
+                    request.req_id,
+                    out_of_range,
+                    armable_layers,
+                )
+                return
+            if not (load_start_block <= eio_logical < end_block) or eio_logical >= len(request.block_hashes):
+                logger.info(
+                    "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=logical_out_of_span logical=%d span=[%d,%d)",
+                    self.tp_rank,
+                    request.req_id,
+                    eio_logical,
+                    load_start_block,
+                    end_block,
+                )
+                return
+            self._holemiss_arm_disk_eio(request, eio_layers, eio_logical)
+            return
         armable_layers = self._holemiss_armable_layer_count()
         if not (0 <= eio_layer < armable_layers):
             logger.info(
@@ -3400,7 +3497,27 @@ class KVPoolWorker:
             return None
         return layer_offset, layer_size
 
-    def _holemiss_arm_disk_eio(self, request: ReqMeta, eio_layer: int, eio_logical: int) -> None:
+    def _holemiss_arm_disk_eio(
+        self, request: ReqMeta, eio_layer: int | list[int], eio_logical: int
+    ) -> None:
+        eio_layers = (
+            [int(layer) for layer in eio_layer]
+            if isinstance(eio_layer, (list, tuple))
+            else [int(eio_layer)]
+        )
+        multi_target = len(eio_layers) > 1
+        if multi_target and not callable(getattr(self.m_store, "batch_copy_get_ranges", None)):
+            # Never guess: without the per-range API the isolated executor
+            # cannot narrow the window per target (a whole-key call would
+            # fire ALL ranges of the armed key = the all-16-layer fault, not
+            # the requested set), so the multi arm refuses LOUD.
+            logger.warning(
+                "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=store_lacks_per_range_api layers=%s",
+                self.tp_rank,
+                request.req_id,
+                eio_layers,
+            )
+            return
         target_key = self._holemiss_derive_block_key(request, eio_logical)
         if target_key is None:
             return
@@ -3417,24 +3534,132 @@ class KVPoolWorker:
                 type(self.m_store).__name__,
             )
         os.environ[HOLEMISS_EIO_TARGET_ENV] = target_key
+        target_extents = [self._holemiss_armable_layer_extent(layer) for layer in eio_layers]
+        if multi_target:
+            if any(extent is None for extent in target_extents):
+                # Never guess: the multi-target semantics REQUIRE per-target
+                # extents (a whole-object window is the all-16-layer fault,
+                # not the requested set) - the single-target whole-object
+                # degrade does not generalize.
+                logger.warning(
+                    "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=extent_unavailable layers=%s",
+                    self.tp_rank,
+                    request.req_id,
+                    eio_layers,
+                )
+                _holemiss_clear_eio_target_envs()
+                return
         # V3a: narrow the C++ EIO window to the armed layer's extent so the
         # armed key's healthy ranges survive the per-range reads. A missing
         # geometry degrades LOUDLY to the whole-object window (the pre-V3a
-        # semantics) — never a guessed extent.
-        target_extent = self._holemiss_armable_layer_extent(eio_layer)
-        if target_extent is not None:
-            os.environ[HOLEMISS_EIO_TARGET_OFFSET_ENV] = str(target_extent[0])
-            os.environ[HOLEMISS_EIO_TARGET_SIZE_ENV] = str(target_extent[1])
+        # semantics) — never a guessed extent. The multi-target executor
+        # re-narrows per target at GET time; the arm-time envs carry the
+        # PRIMARY target (the single-target post-state shape).
+        primary_extent = target_extents[0]
+        if primary_extent is not None:
+            os.environ[HOLEMISS_EIO_TARGET_OFFSET_ENV] = str(primary_extent[0])
+            os.environ[HOLEMISS_EIO_TARGET_SIZE_ENV] = str(primary_extent[1])
         else:
             logger.warning(
                 "HOLEMISS_EIO_ARM tp=%d layer=%d extent_unavailable=whole_object_window",
                 self.tp_rank,
-                eio_layer,
+                eio_layers[0],
             )
         self._holemiss_armed_fault = self._holemiss_make_armed_record(
-            "disk_eio", request, target_key, eio_layer, eio_logical
+            "disk_eio", request, target_key, eio_layers[0], eio_logical
         )
-        logger.info("HOLEMISS_EIO_TARGET_SET tp=%d layer=%d target=%s", self.tp_rank, eio_layer, target_key)
+        if multi_target:
+            self._holemiss_armed_fault["layer_ids"] = eio_layers
+            self._holemiss_armed_fault["target_extents"] = [
+                (int(extent[0]), int(extent[1])) for extent in target_extents
+            ]
+            logger.info(
+                "HOLEMISS_EIO_TARGET_SET tp=%d layers=%s target=%s",
+                self.tp_rank,
+                eio_layers,
+                target_key,
+            )
+        else:
+            logger.info("HOLEMISS_EIO_TARGET_SET tp=%d layer=%d target=%s", self.tp_rank, eio_layers[0], target_key)
+
+    def _holemiss_arm_gdn_state_eio(
+        self,
+        request: ReqMeta,
+        gdn_group: int,
+        fa_layer: int,
+        load_start_block: int,
+        end_block: int,
+    ) -> None:
+        """W1-11: the GDN state-object disk-EIO arm (whole-object window).
+
+        The armed key is the group-N boundary-state object at the logical
+        block — the SAME key the ladder plan builder derives
+        (``_make_layerwise_full_key(group_id, ...)``), so the ladder's
+        boundary GET fails with the real disk-EIO rc and
+        ``attempt_boundary`` demotes through the EXISTING
+        ``_holemiss_failed_load_keys`` channel (no executor/region
+        involvement: the FA range-GET isolation never sees a group-N key).
+        """
+        if fa_layer >= 0:
+            logger.warning(
+                "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=gdn_and_fa_both_armed "
+                "fa_layer=%d gdn_group=%d (one fault family per request)",
+                self.tp_rank,
+                request.req_id,
+                fa_layer,
+                gdn_group,
+            )
+            return
+        if gdn_group >= self.num_kv_cache_groups:
+            logger.info(
+                "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=gdn_group_out_of_range group=%d groups=%d",
+                self.tp_rank,
+                request.req_id,
+                gdn_group,
+                self.num_kv_cache_groups,
+            )
+            return
+        eio_logical = _hm_env_int("HOLEMISS_EIO_LOGICAL_BLOCK", 2)
+        if not (load_start_block <= eio_logical < end_block) or eio_logical >= len(request.block_hashes):
+            logger.info(
+                "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=logical_out_of_span logical=%d span=[%d,%d)",
+                self.tp_rank,
+                request.req_id,
+                eio_logical,
+                load_start_block,
+                end_block,
+            )
+            return
+        target_key = self._holemiss_derive_block_key(request, eio_logical, group_id=gdn_group)
+        if target_key is None:
+            logger.info(
+                "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=gdn_key_derivation_none group=%d logical=%d",
+                self.tp_rank,
+                request.req_id,
+                gdn_group,
+                eio_logical,
+            )
+            return
+        if hasattr(self.m_store, "put_end_disk"):
+            try:
+                disk_ret = self.m_store.put_end_disk(target_key)
+            except Exception as exc:  # noqa: BLE001
+                disk_ret = f"error:{exc}"
+            logger.info("HOLEMISS_EIO_ARM tp=%d ret=%s", self.tp_rank, disk_ret)
+        # Whole-object window: NO extent envs (the ladder's boundary GET is
+        # a whole-object read; the layer axis inside a group-N state object
+        # is a future narrowing, never guessed here).
+        os.environ[HOLEMISS_EIO_TARGET_ENV] = target_key
+        self._holemiss_armed_fault = self._holemiss_make_armed_record(
+            "gdn_state_eio", request, target_key, -1, eio_logical
+        )
+        self._holemiss_armed_fault["group_id"] = gdn_group
+        logger.info(
+            "HOLEMISS_EIO_TARGET_SET tp=%d gdn_group=%d target=%s",
+            self.tp_rank,
+            gdn_group,
+            target_key,
+        )
 
     def _holemiss_arm_synthetic(self, request: ReqMeta, load_start_block: int, end_block: int) -> None:
         fail_layer = _hm_env_int("HOLEMISS_FAIL_LAYER", -1)
@@ -3514,16 +3739,112 @@ class KVPoolWorker:
         The armed key is a globally unique block object; the store-layer
         selector is mapped to its physical layer so exactly ONE physical
         layer's range GET is isolated (the object spans the group's layers).
+        W1-10: a multi-target armed record matches at EVERY armed layer's
+        physical id (the per-layer path isolates each target's own call; the
+        batched path's tautology gate finds the key once and the executor
+        partitions by extent). W1-11: the GDN state arm never isolates an
+        FA range GET (kind gate) — the ladder's own GET carries the fault.
         """
         armed = self._holemiss_armed_fault
-        if armed is None or armed.get("key") not in keys:
+        if armed is None or armed.get("kind") == "gdn_state_eio":
             return None
+        if armed.get("key") not in keys:
+            return None
+        armed_layer_ids = armed.get("layer_ids") or [armed["layer_id"]]
         if self.use_hybrid:
-            if self._holemiss_hybrid_physical_layer(int(armed["layer_id"])) != physical_layer_id:
-                return None
-        elif int(armed["layer_id"]) != physical_layer_id:
+            physical_layers = {
+                self._holemiss_hybrid_physical_layer(int(layer)) for layer in armed_layer_ids
+            }
+        else:
+            physical_layers = {int(layer) for layer in armed_layer_ids}
+        if physical_layer_id not in physical_layers:
             return None
         return keys.index(armed["key"])
+
+    def _holemiss_execute_multi_target_ranges(
+        self,
+        armed: dict,
+        keys: list[str],
+        buffers: list[list[int]],
+        sizes: list[list[int]],
+        offsets: list[list[int]],
+        target_pos: int,
+    ) -> list[int]:
+        """W1-10: per-target isolated range GETs for ONE multi-armed key.
+
+        The key's carried ranges are partitioned by extent overlap: each
+        armed layer's ranges ride their OWN ``batch_copy_get_ranges`` call
+        with the window narrowed to that target's extent, and the healthy
+        remainder (no target extent) rides one gate-cleared call. A range is
+        read EXACTLY ONCE — a union-extent call cannot express the
+        far-apart {3,63} shape (the union spans the whole object), and a
+        full-list call per target would LAND the earlier target's failed
+        ranges through the later call's window (erasing the fault). The env
+        restore leaves the PRIMARY target's arm state (the single-target
+        post-state shape).
+        """
+        target_key = keys[target_pos]
+        key_buffers = buffers[target_pos]
+        key_sizes = sizes[target_pos]
+        key_offsets = offsets[target_pos]
+        extents = [(int(off), int(size)) for off, size in armed["target_extents"]]
+        buckets: list[list[int]] = [[] for _ in extents]
+        healthy_indices: list[int] = []
+        for index, (offset, size) in enumerate(zip(key_offsets, key_sizes, strict=True)):
+            offset = int(offset)
+            size = int(size)
+            placed = False
+            for bucket_id, (target_offset, target_size) in enumerate(extents):
+                if offset < target_offset + target_size and target_offset < offset + size:
+                    buckets[bucket_id].append(index)
+                    placed = True
+                    break
+            if not placed:
+                healthy_indices.append(index)
+        per_range_call = self.m_store.batch_copy_get_ranges
+        merged_rcs: list[int] = [0] * len(key_offsets)
+        for (target_offset, target_size), bucket in zip(extents, buckets, strict=True):
+            if not bucket:
+                continue
+            os.environ[HOLEMISS_EIO_TARGET_ENV] = target_key
+            os.environ[HOLEMISS_EIO_TARGET_OFFSET_ENV] = str(target_offset)
+            os.environ[HOLEMISS_EIO_TARGET_SIZE_ENV] = str(target_size)
+            range_rcs = require_aligned_range_results(
+                "batch_copy_get_ranges",
+                [target_key],
+                [len(bucket)],
+                per_range_call(
+                    [target_key],
+                    [[key_buffers[index] for index in bucket]],
+                    [[key_sizes[index] for index in bucket]],
+                    [[key_offsets[index] for index in bucket]],
+                ),
+            )[0]
+            for index, rc in zip(bucket, range_rcs, strict=True):
+                merged_rcs[index] = int(rc)
+        if healthy_indices:
+            # Gate cleared for the healthy remainder: the C++ key gate is
+            # re-read live per call, so an empty EIO_TARGET_KEY disarms the
+            # window and every healthy range of the armed key lands.
+            os.environ[HOLEMISS_EIO_TARGET_ENV] = ""
+            healthy_rcs = require_aligned_range_results(
+                "batch_copy_get_ranges",
+                [target_key],
+                [len(healthy_indices)],
+                per_range_call(
+                    [target_key],
+                    [[key_buffers[index] for index in healthy_indices]],
+                    [[key_sizes[index] for index in healthy_indices]],
+                    [[key_offsets[index] for index in healthy_indices]],
+                ),
+            )[0]
+            for index, rc in zip(healthy_indices, healthy_rcs, strict=True):
+                merged_rcs[index] = int(rc)
+        primary_offset, primary_size = extents[0]
+        os.environ[HOLEMISS_EIO_TARGET_ENV] = target_key
+        os.environ[HOLEMISS_EIO_TARGET_OFFSET_ENV] = str(primary_offset)
+        os.environ[HOLEMISS_EIO_TARGET_SIZE_ENV] = str(primary_size)
+        return merged_rcs
 
     def holemiss_range_failed_layers(
         self,
@@ -3609,6 +3930,18 @@ class KVPoolWorker:
                 armed["logical_block_index"],
                 keys[target_pos],
                 HOLEMISS_SYNTHETIC_FAULT_RC,
+            )
+        elif len(armed.get("target_extents") or ()) > 1:
+            # W1-10 multi-target: per-target isolated calls; the merged
+            # per-range rcs feed the same failed-layer mapping as the
+            # single-target V3a path (both armed layers appear in the
+            # region's failed_layers / layer_start..layer_end).
+            target_range_rcs = self._holemiss_execute_multi_target_ranges(
+                armed, keys, buffers, sizes, offsets, target_pos
+            )
+            target_rc = next(
+                (int(rc) for rc in target_range_rcs if rc < 0),
+                sum(int(rc) for rc in target_range_rcs),
             )
         else:
             # V3a: the isolated armed-key call rides the per-range API when

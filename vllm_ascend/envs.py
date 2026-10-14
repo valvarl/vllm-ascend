@@ -132,6 +132,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     "HOLEMISS_EIO_LAYER": lambda: int(os.getenv("HOLEMISS_EIO_LAYER", "-1")),
     # Disk-EIO target logical block id. Default: 2.
     "HOLEMISS_EIO_LOGICAL_BLOCK": lambda: int(os.getenv("HOLEMISS_EIO_LOGICAL_BLOCK", "2")),
+    # W1-10 (hybrid-robustness-hunt): CSV of store-local FA layer ids armed
+    # SIMULTANEOUSLY on one logical block's group-0 object (the minimal
+    # multi-target EIO slice). Empty/unset = the single-target legacy law.
+    # Raw string: the worker parses the CSV (a malformed value degrades to
+    # the EMPTY list and the arm refuses loud, never a partial list).
+    # Default: "".
+    "HOLEMISS_EIO_LAYERS": lambda: os.getenv("HOLEMISS_EIO_LAYERS", ""),
+    # W1-11: the GDN-state EIO injectability gate. "1" relaxes the D-T12.5
+    # group-0-only arming law so HOLEMISS_EIO_GROUP selects a GDN state
+    # group (1..num_kv_groups-1) whose boundary object gets a whole-object
+    # disk EIO; the FA family must be neutral (HOLEMISS_EIO_LAYER < 0).
+    # Default: "0" (the group-0-only law INTACT).
+    "HOLEMISS_GDN_EIO_ENABLED": lambda: os.getenv("HOLEMISS_GDN_EIO_ENABLED", "0") == "1",
+    # W1-11: the GDN state group targeted by the opt-in arm. Default: 0.
+    "HOLEMISS_EIO_GROUP": lambda: int(os.getenv("HOLEMISS_EIO_GROUP", "0")),
     # V3a: the armed FA layer's byte extent inside the layerless D7 block
     # object (object-relative). Set by the worker's EIO arm from the SAME
     # layer_cache_entry_offsets arithmetic the load plan builder uses; the

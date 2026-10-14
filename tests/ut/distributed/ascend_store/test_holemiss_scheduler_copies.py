@@ -155,6 +155,11 @@ EXPECTED_REGISTRY = {
     "HOLEMISS_FAIL_LOGICAL_BLOCK",
     "HOLEMISS_EIO_LAYER",
     "HOLEMISS_EIO_LOGICAL_BLOCK",
+    # W1-10/W1-11 (hybrid-robustness-hunt): the multi-target list and the
+    # GDN-state opt-in gate joined the fault-family registry.
+    "HOLEMISS_EIO_LAYERS",
+    "HOLEMISS_GDN_EIO_ENABLED",
+    "HOLEMISS_EIO_GROUP",
     "HOLEMISS_RECOVERY_MODE",
     "HOLEMISS_BENCH_ROOT",
     "HOLEMISS_ALLOW_HYBRID_RECOMPUTE_POLICY",
@@ -187,9 +192,21 @@ def _env_read_names(tree: ast.AST) -> set[str]:
                 names.add(arg.value)
             elif isinstance(arg, ast.Name) and arg.id in consts:
                 names.add(consts[arg.id])
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_hm_env_int":
-            if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
-                names.add(node.args[0].value)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in (
+            "_hm_env_int",
+            "_hm_env_int_list",
+        ):
+            if not node.args:
+                continue
+            arg = node.args[0]
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                names.add(arg.value)
+            elif isinstance(arg, ast.Name) and arg.id in consts:
+                # W1-10/W1-11 hardening: a module-level CONSTANT env name
+                # (e.g. HOLEMISS_EIO_LAYERS_ENV) must resolve through the
+                # same registry law as a literal - the constant indirection
+                # is not an exemption.
+                names.add(consts[arg.id])
         if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and node.value.attr == "environ":
             index = node.slice
             if isinstance(index, ast.Constant) and isinstance(index.value, str):

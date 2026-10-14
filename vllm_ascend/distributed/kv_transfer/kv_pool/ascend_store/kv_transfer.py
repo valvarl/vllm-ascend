@@ -2295,7 +2295,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             aborted = self._load_abort_event.is_set()
             worker = self.worker
             armed = getattr(worker, "_holemiss_armed_fault", None) if worker is not None else None
-            if armed is not None:
+            if armed is not None and armed.get("kind") != "gdn_state_eio":
+                # W1-11: a GDN state-object arm carries layer_id=-1 (no FA
+                # target) and never isolates an FA range GET — the ladder's
+                # own boundary GET carries that fault; mapping -1 through
+                # the hybrid FA translator would refuse (correctly) on a
+                # record that must not reach this gate at all.
                 armed_layer_id = int(armed["layer_id"])
                 if getattr(worker, "use_hybrid", False):
                     # The arming bound speaks the FA-STORE-LOCAL k (0..15)

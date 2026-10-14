@@ -45,6 +45,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import
     HOLEMISS_EIO_TARGET_ENV,
     HOLEMISS_SYNTHETIC_FAULT_RC,
     KVPoolWorker,
+    _hm_env_int_list,
     hybrid_group0_fa_physical_layers,
 )
 
@@ -525,6 +526,358 @@ class TestSyncDrain(HolemissTestBase):
         worker._holemiss_sync_layerwise_drain([_make_request()])
         worker.kv_recv_thread.add_request.assert_not_called()
         self.assertEqual(len(worker.layer_load_tasks[0]), 1)
+
+
+def _mock_group_layerwise_keys() -> LayerwiseKeyBuilder:
+    """A group-AWARE mock builder: group 0 keeps the text make_block_key
+    shape, group N emits the D7 hybrid group literal (so a GDN-state arm is
+    distinguishable from the FA arm by the key itself)."""
+    return LayerwiseKeyBuilder(
+        make_full_key=lambda group_id, block_hash, rank, stage: (
+            make_block_key(MODEL_NAME, block_hash, rank, pp_rank=stage)
+            if group_id == 0
+            else (
+                f"{MODEL_NAME}@mooncake_hybrid_v1:layout@group:{group_id}"
+                f"@block:1536@{block_hash}@{rank}"
+            )
+        ),
+        pp_size=1,
+    )
+
+
+# 4 store-local FA layers x 2 cache entries (K, V) x 100B: layer k's object
+# extent is [k*200, (k+1)*200).
+_LAYER_ENTRY_COUNT = 2
+_ENTRY_BYTES = 100
+_LAYER_BYTES = _LAYER_ENTRY_COUNT * _ENTRY_BYTES
+
+
+def _give_extent_geometry(worker: "KVPoolWorker", num_layers: int = 4) -> None:
+    worker.group_layer_cache_entry_offsets = {
+        0: [i * _LAYER_ENTRY_COUNT for i in range(num_layers + 1)]
+    }
+    worker.group_block_len = {0: [_ENTRY_BYTES] * (num_layers * _LAYER_ENTRY_COUNT)}
+
+
+def _fake_batch_copy_get_ranges(captured: list):
+    """A C++-faithful fake: reads the EIO envs LIVE per call and fails every
+    range overlapping the armed extent with FILE_READ_FAIL (-1102); every
+    other range lands its byte count."""
+
+    def call(keys, buffers, sizes, offsets):
+        eio_key = os.environ.get("EIO_TARGET_KEY", "")
+        eio_offset = os.environ.get("HOLEMISS_EIO_TARGET_OFFSET", "")
+        eio_size = os.environ.get("HOLEMISS_EIO_TARGET_SIZE", "")
+        captured.append(
+            {
+                "keys": list(keys),
+                "offsets": [list(o) for o in offsets],
+                "sizes": [list(s) for s in sizes],
+                "eio_key": eio_key,
+                "eio_offset": eio_offset,
+                "eio_size": eio_size,
+            }
+        )
+        results = []
+        for key_index in range(len(keys)):
+            key_rcs = []
+            for range_index, size in enumerate(sizes[key_index]):
+                offset = int(offsets[key_index][range_index])
+                if eio_key and eio_offset and eio_size:
+                    target_offset = int(eio_offset)
+                    target_size = int(eio_size)
+                    if offset < target_offset + target_size and target_offset < offset + size:
+                        key_rcs.append(-1102)
+                        continue
+                key_rcs.append(int(size))
+            results.append(key_rcs)
+        return results
+
+    return call
+
+
+class TestMultiTargetEioLayers(HolemissTestBase):
+    """W1-10 (hybrid-robustness-hunt): the minimal multi-target EIO slice -
+    N store-local FA layers of ONE group-0 object armed simultaneously."""
+
+    def _hybrid_worker(self):
+        worker = _make_worker(
+            num_groups=4,
+            use_hybrid=True,
+            kv_cache_config=_qwen36_config(),
+            num_layers=8,
+        )
+        _give_extent_geometry(worker)
+        return worker
+
+    def test_env_int_list_parser_never_returns_partial(self):
+        os.environ["HOLEMISS_TEST_LIST"] = "1,2"
+        self.assertEqual(_hm_env_int_list("HOLEMISS_TEST_LIST"), [1, 2])
+        os.environ["HOLEMISS_TEST_LIST"] = "1,,2"
+        self.assertEqual(_hm_env_int_list("HOLEMISS_TEST_LIST"), [])
+        os.environ["HOLEMISS_TEST_LIST"] = "1,x,2"
+        self.assertEqual(_hm_env_int_list("HOLEMISS_TEST_LIST"), [])
+        os.environ["HOLEMISS_TEST_LIST"] = ""
+        self.assertEqual(_hm_env_int_list("HOLEMISS_TEST_LIST"), [])
+        del os.environ["HOLEMISS_TEST_LIST"]
+        self.assertEqual(_hm_env_int_list("HOLEMISS_TEST_LIST"), [])
+
+    def test_multi_layers_arm_with_per_target_extents(self):
+        worker = self._hybrid_worker()
+        request = _make_request()
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_LAYERS": "0,1",
+                "HOLEMISS_EIO_LAYER": "0",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        armed = worker._holemiss_armed_fault
+        self.assertIsNotNone(armed)
+        self.assertEqual(armed["kind"], "disk_eio")
+        self.assertEqual(armed["layer_id"], 0)
+        self.assertEqual(armed["layer_ids"], [0, 1])
+        self.assertEqual(armed["target_extents"], [(0, 200), (200, 200)])
+        # The arm-time envs carry the PRIMARY target (single-target shape).
+        self.assertEqual(os.environ[HOLEMISS_EIO_TARGET_ENV], armed["key"])
+        self.assertEqual(os.environ["HOLEMISS_EIO_TARGET_OFFSET"], "0")
+        self.assertEqual(os.environ["HOLEMISS_EIO_TARGET_SIZE"], "200")
+        worker.m_store.put_end_disk.assert_called_once_with(armed["key"])
+
+    def test_multi_layers_without_extents_refuse_loud(self):
+        worker = self._hybrid_worker()
+        # No group_layer_cache_entry_offsets geometry: every extent is None.
+        worker.group_layer_cache_entry_offsets = {}
+        worker.group_block_len = {}
+        request = _make_request()
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_LAYERS": "0,1",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        self.assertIsNone(worker._holemiss_armed_fault)
+        self.assertEqual(os.environ[HOLEMISS_EIO_TARGET_ENV], "")
+
+    def test_multi_layers_out_of_range_refuses_whole_arm(self):
+        worker = self._hybrid_worker()
+        request = _make_request()
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_LAYERS": "0,9",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        self.assertIsNone(worker._holemiss_armed_fault)
+
+    def test_multi_layers_without_per_range_api_refuse_loud(self):
+        worker = self._hybrid_worker()
+        del worker.m_store.batch_copy_get_ranges
+        request = _make_request()
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_LAYERS": "0,1",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        self.assertIsNone(worker._holemiss_armed_fault)
+        self.assertEqual(os.environ[HOLEMISS_EIO_TARGET_ENV], "")
+
+    def test_single_element_list_degrades_to_the_single_target_shape(self):
+        worker = self._hybrid_worker()
+        request = _make_request()
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_LAYERS": "1",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        armed = worker._holemiss_armed_fault
+        self.assertIsNotNone(armed)
+        self.assertEqual(armed["layer_id"], 1)
+        self.assertNotIn("layer_ids", armed)
+        self.assertNotIn("target_extents", armed)
+
+    def test_position_gate_matches_every_armed_layer(self):
+        worker = self._hybrid_worker()
+        request = _make_request()
+        key = worker._holemiss_derive_block_key(request, 2)
+        worker._holemiss_armed_fault = worker._holemiss_make_armed_record(
+            "disk_eio", request, key, 0, 2
+        )
+        worker._holemiss_armed_fault["layer_ids"] = [0, 1]
+        worker._holemiss_armed_fault["target_extents"] = [(0, 200), (200, 200)]
+        self.assertEqual(worker.holemiss_range_target_position([key, "other"], 3), 0)
+        self.assertEqual(worker.holemiss_range_target_position([key, "other"], 7), 0)
+        self.assertIsNone(worker.holemiss_range_target_position([key, "other"], 2))
+        self.assertIsNone(worker.holemiss_range_target_position(["other"], 3))
+
+    def test_execute_partitions_by_extent_and_fails_both_layers(self):
+        worker = self._hybrid_worker()
+        request = _make_request()
+        key = worker._holemiss_derive_block_key(request, 2)
+        worker._holemiss_armed_fault = worker._holemiss_make_armed_record(
+            "disk_eio", request, key, 0, 2
+        )
+        worker._holemiss_armed_fault["layer_ids"] = [0, 1]
+        worker._holemiss_armed_fault["target_extents"] = [(0, 200), (200, 200)]
+        captured: list = []
+        worker.m_store.batch_copy_get_ranges.side_effect = _fake_batch_copy_get_ranges(captured)
+        # 4 layers x 2 entries x 100B: the merged per-key range list.
+        key_offsets = [i * _ENTRY_BYTES for i in range(8)]
+        key_sizes = [_ENTRY_BYTES] * 8
+        results = worker.execute_holemiss_range_target(
+            [key, "other"],
+            [[1000 + i for i in range(8)], [2000]],
+            [key_sizes, [50]],
+            [key_offsets, [0]],
+            0,
+        )
+        # Per-KEY results: the armed key fails (-1102), the sibling key
+        # rides the plain healthy call (0). The per-range proof lives in
+        # the region's failed_layers and the captured per-target calls.
+        self.assertEqual(results, [-1102, 0])
+        regions = worker.get_hole_recovery_regions()
+        self.assertEqual(len(regions), 1)
+        region = regions[0]
+        self.assertEqual(region["result"], -1102)
+        self.assertEqual(region["layer_id"], 3)  # the PRIMARY (physical 3+4k)
+        self.assertEqual(region["failed_layers"], [3, 7])
+        self.assertEqual(region["layer_start"], 3)
+        self.assertEqual(region["layer_end"], 7)
+        # Per-target isolated calls: extent (0,200), extent (200,200), then
+        # the healthy remainder with the key gate CLEARED.
+        self.assertEqual(len(captured), 3)
+        self.assertEqual(
+            [(c["eio_key"], c["eio_offset"], c["eio_size"]) for c in captured],
+            [(key, "0", "200"), (key, "200", "200"), ("", "200", "200")],
+        )
+        self.assertEqual([c["offsets"][0] for c in captured], [[0, 100], [200, 300], [400, 500, 600, 700]])
+        # The env restore leaves the PRIMARY target's arm state.
+        self.assertEqual(os.environ[HOLEMISS_EIO_TARGET_ENV], key)
+        self.assertEqual(os.environ["HOLEMISS_EIO_TARGET_OFFSET"], "0")
+        self.assertEqual(os.environ["HOLEMISS_EIO_TARGET_SIZE"], "200")
+
+
+class TestGdnStateEioGate(HolemissTestBase):
+    """W1-11: the GDN-state EIO injectability gate - DEFAULT OFF = the
+    D-T12.5 group-0-only arming law INTACT; the opt-in arms a whole-object
+    disk EIO on the group-N boundary-state object."""
+
+    def _hybrid_worker(self):
+        worker = _make_worker(
+            num_groups=4,
+            use_hybrid=True,
+            kv_cache_config=_qwen36_config(),
+            num_layers=8,
+        )
+        worker.layerwise_keys = _mock_group_layerwise_keys()
+        _give_extent_geometry(worker)
+        return worker
+
+    def test_default_off_ignores_the_group_env(self):
+        # THE LAW PIN: without HOLEMISS_GDN_EIO_ENABLED=1 the group env is
+        # ignored and the arm stays the group-0 FA arm.
+        worker = self._hybrid_worker()
+        request = _make_request()
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_GROUP": "2",
+                "HOLEMISS_EIO_LAYER": "0",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        armed = worker._holemiss_armed_fault
+        self.assertIsNotNone(armed)
+        self.assertEqual(armed["kind"], "disk_eio")
+        self.assertNotIn("group_id", armed)
+        self.assertEqual(
+            armed["key"], worker._make_layerwise_full_key(0, request.block_hashes[2].hex())
+        )
+
+    def test_opt_in_arms_the_group_n_state_object(self):
+        worker = self._hybrid_worker()
+        request = _make_request()
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_GDN_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_GROUP": "1",
+                "HOLEMISS_EIO_LAYER": "-1",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        armed = worker._holemiss_armed_fault
+        self.assertIsNotNone(armed)
+        self.assertEqual(armed["kind"], "gdn_state_eio")
+        self.assertEqual(armed["group_id"], 1)
+        self.assertEqual(armed["layer_id"], -1)
+        expected = worker._make_layerwise_full_key(1, request.block_hashes[2].hex())
+        self.assertEqual(armed["key"], expected)
+        self.assertIn("@group:1@", expected)
+        self.assertEqual(os.environ[HOLEMISS_EIO_TARGET_ENV], expected)
+        # Whole-object window: NO extent envs (the ladder's whole-object GET).
+        self.assertNotIn("HOLEMISS_EIO_TARGET_OFFSET", os.environ)
+        self.assertNotIn("HOLEMISS_EIO_TARGET_SIZE", os.environ)
+        # The FA range-GET isolation never engages for a GDN arm.
+        self.assertIsNone(worker.holemiss_range_target_position([expected], 3))
+        worker.m_store.put_end_disk.assert_called_once_with(expected)
+
+    def test_opt_in_refuses_when_both_families_armed(self):
+        worker = self._hybrid_worker()
+        request = _make_request()
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_GDN_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_GROUP": "1",
+                "HOLEMISS_EIO_LAYER": "2",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        self.assertIsNone(worker._holemiss_armed_fault)
+        self.assertEqual(os.environ[HOLEMISS_EIO_TARGET_ENV], "")
+
+    def test_opt_in_group_out_of_range_refuses(self):
+        worker = self._hybrid_worker()
+        request = _make_request()
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_GDN_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_GROUP": "9",
+                "HOLEMISS_EIO_LAYER": "-1",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        self.assertIsNone(worker._holemiss_armed_fault)
+
+    def test_group_parametrized_derivation_bounds(self):
+        worker = self._hybrid_worker()
+        request = _make_request()
+        self.assertIsNone(worker._holemiss_derive_block_key(request, 2, group_id=4))
+        self.assertIsNone(worker._holemiss_derive_block_key(request, -1, group_id=1))
+        self.assertIsNone(worker._holemiss_derive_block_key(request, 99, group_id=1))
+        # Group 0 stays byte-identical to the legacy single-group read.
+        self.assertEqual(
+            worker._holemiss_derive_block_key(request, 2),
+            worker._make_layerwise_full_key(0, request.block_hashes[2].hex()),
+        )
 
 
 if __name__ == "__main__":
