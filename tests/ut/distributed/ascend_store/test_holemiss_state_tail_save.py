@@ -39,6 +39,7 @@ derived by the REAL ``_infer_cache_group_metadata``.
 """
 
 import ctypes
+import gc
 import inspect
 import threading
 import unittest
@@ -269,6 +270,7 @@ def _make_session_worker(store, kv_role="kv_producer", use_hybrid=True):
     worker._holemiss_state_tail_sources = {}
     worker._holemiss_state_tail_keys = set()
     worker._holemiss_state_tail_skip_warned = set()
+    worker._holemiss_state_tail_capture_failed = {}
     worker._hole_recovery_regions = []
     worker._hole_recovery_lock = threading.Lock()
     worker._holemiss_armed_fault = None
@@ -552,9 +554,11 @@ class TestStateTailKeyConstruction(unittest.TestCase):
             worker._make_layerwise_finished_tail_key(request, 1)
 
     def test_degraded_capture_skips_loudly_too(self):
-        """The T2 loud-degrade end of the contract: a capture that FAILED
-        leaves no snapshot, so the skip fires (the FAILED line was already
-        emitted by the capture side)."""
+        """The T2 loud-degrade end of the contract, W1-19 shape: a PARTIAL
+        capture (group 2's clone failed) keeps groups 1/3's frozen bytes —
+        the drain derives THEIR keys, skips group 2's with the distinct
+        reason=capture_failed (never the ambiguous no_frozen_snapshot),
+        and the group-0 FA key is unaffected."""
         store = _SessionStore()
         worker, _ = _make_session_worker(store)
         request = _capture_request()
@@ -562,12 +566,46 @@ class TestStateTailKeyConstruction(unittest.TestCase):
         with self.assertLogs(vllm_logger, level="WARNING") as logs:
             _capture(worker, request)
         self.assertTrue(any("HOLEMISS_STATE_TAIL_SNAPSHOT_FAILED" in line for line in logs.output))
+        self.assertEqual(set(worker._holemiss_state_tail_snapshots[("req-tail", BOUNDARY)]), {1, 3})
         tail_request = _tail_save_request()
         with self.assertLogs(vllm_logger, level="WARNING") as logs:
             views = _prepare_group_sessions(worker, [tail_request])
-        self.assertTrue(any("HOLEMISS_STATE_TAIL_PUT_SKIPPED" in line for line in logs.output))
-        for group in STATE_GROUPS:
-            self.assertIsNone(views[group][0].save_last_block_key)
+        skip_lines = [line for line in logs.output if "HOLEMISS_STATE_TAIL_PUT_SKIPPED" in line]
+        self.assertEqual(len(skip_lines), 1)
+        self.assertIn("reason=capture_failed", skip_lines[0])
+        self.assertIn("groups=[2]", skip_lines[0])
+        self.assertIsNone(views[2][0].save_last_block_key)
+        for group in (1, 3):
+            self.assertIsNotNone(views[group][0].save_last_block_key)
+
+    def test_partial_capture_persists_the_sibling_artifacts(self):
+        """W1-19's core value pin: the partial freeze's succeeded groups'
+        keys ride the REAL state-tail put path (the frozen-source
+        substitution reads THEIR clones), so the artifact set is partial —
+        the consumer's all-or-nothing tail rung demotes on the missing
+        group at load time (GT-safe through the recompute span)."""
+        store = _SessionStore()
+        worker, _ = _make_session_worker(store)
+        request = _capture_request()
+        request.block_ids_by_group[2] = [1, 2, 3, 4, 5, 6, NUM_SLOTS + 5]
+        _capture(worker, request)
+        frozen = {
+            group: _tensors_bytes(tensors)
+            for group, tensors in worker._holemiss_state_tail_snapshots[("req-tail", BOUNDARY)].items()
+        }
+        self.assertEqual(set(frozen), {1, 3})
+        view1 = _drive_state_group_put(worker, store, group_id=1, physical_layer=0)
+        view3 = _drive_state_group_put(worker, store, group_id=3, physical_layer=6)
+        self.assertIsNotNone(view1.save_last_block_key)
+        self.assertIsNotNone(view3.save_last_block_key)
+        self.assertEqual(
+            [keys for keys, _, _, _ in store.copy_puts],
+            [(view1.save_last_block_key,), (view3.save_last_block_key,)],
+        )
+        payload1 = store.copy_puts[0][3][0]
+        self.assertEqual(payload1, frozen[1][: sum(store.copy_puts[0][2][0])])
+        payload3 = store.copy_puts[1][3][0]
+        self.assertEqual(payload3, frozen[3][: sum(store.copy_puts[1][2][0])])
 
 
 class TestStateTailNegativeControls(unittest.TestCase):

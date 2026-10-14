@@ -736,6 +736,14 @@ class KVPoolWorker:
         # skips them (its group-0 page view cannot read a state slot) and
         # the send thread identifies its substitution rows through it.
         self._holemiss_state_tail_keys: set[str] = set()
+        # hybrid-robustness-hunt W1-19: the partial-capture record —
+        # (req_id, boundary) -> the state groups whose freeze clone FAILED
+        # while the sibling groups' clones were KEPT. The drain skips
+        # exactly these groups loudly (reason=capture_failed — never the
+        # ambiguous no_frozen_snapshot, never the silent aligned-group
+        # return) and never persists their bytes. Purged with the snapshots
+        # at the deferred teardown flush.
+        self._holemiss_state_tail_capture_failed: dict[tuple[str, int], set[int]] = {}
         # The loud-skip dedup: one missing-snapshot warning per
         # (req_id, boundary).
         self._holemiss_state_tail_skip_warned: set[tuple[str, int]] = set()
@@ -1940,6 +1948,17 @@ class KVPoolWorker:
             self._holemiss_warn_state_tail_skip(request, boundary)
             return None
         if entry.get(group_id) is None:
+            failed_registry = getattr(self, "_holemiss_state_tail_capture_failed", None)
+            if isinstance(failed_registry, dict) and group_id in failed_registry.get((request.req_id, boundary), ()):
+                # W1-19: this group's freeze FAILED while the sibling groups'
+                # clones were kept — a distinct loud skip (never the
+                # ambiguous no_frozen_snapshot, never the silent
+                # aligned-group return): the artifact set is partial and the
+                # consumer's all-or-nothing tail rung will demote on it.
+                failed_groups = sorted(failed_registry[(request.req_id, boundary)])
+                self._holemiss_warn_state_tail_skip(
+                    request, boundary, reason="capture_failed", detail=f"groups={failed_groups}"
+                )
             return None
         key = self._make_layerwise_full_key(
             group_id,
@@ -1960,18 +1979,30 @@ class KVPoolWorker:
             state_keys.add(key)
         return key, tail_block_index
 
-    def _holemiss_warn_state_tail_skip(self, request: ReqMeta, boundary: int) -> None:
-        """The loud degrade: no frozen snapshot, no state-tail keys."""
+    def _holemiss_warn_state_tail_skip(
+        self, request: ReqMeta, boundary: int, reason: str = "no_frozen_snapshot", detail: str = ""
+    ) -> None:
+        """The loud degrade: no frozen snapshot, no state-tail keys.
+
+        W1-19: ``reason`` distinguishes the total capture failure
+        (``no_frozen_snapshot`` — the frozen registry holds no entry) from
+        the partial one (``capture_failed`` — THIS group's clone failed
+        while sibling groups' artifacts persist); ``detail`` carries the
+        failed-group set. One line per (req_id, boundary) either way.
+        """
         marker = (request.req_id, boundary)
         warned = getattr(self, "_holemiss_state_tail_skip_warned", None)
         if not isinstance(warned, set) or marker in warned:
             return
         warned.add(marker)
+        suffix = f" {detail}" if detail else ""
         logger.warning(
-            "HOLEMISS_STATE_TAIL_PUT_SKIPPED tp=%d req=%s boundary=%d reason=no_frozen_snapshot",
+            "HOLEMISS_STATE_TAIL_PUT_SKIPPED tp=%d req=%s boundary=%d reason=%s%s",
             self.tp_rank,
             request.req_id,
             boundary,
+            reason,
+            suffix,
         )
 
     def _make_layerwise_tail_load_key(self, request: ReqMeta, group_id: int) -> tuple[str, int] | None:
@@ -5078,29 +5109,38 @@ class KVPoolWorker:
                 # boundary channel already saved it (T13).
                 continue
             captured: list[tuple[int, int, list[torch.Tensor]]] = []
-            failed_group: int | None = None
-            failure: Exception | None = None
+            failed_groups: list[int] = []
+            first_failure: Exception | None = None
             for group_id in unaligned_groups:
                 try:
                     pool_slot, tensors = self._holemiss_clone_state_tail_slot(request, group_id, boundary)
                     captured.append((group_id, pool_slot, tensors))
                 except Exception as exc:  # noqa: BLE001
-                    failed_group, failure = group_id, exc
-                    break
-            if failure is not None:
+                    # W1-19: one group's transient clone failure must not
+                    # destroy the sibling groups' already-frozen clones —
+                    # keep what succeeded; the drain skips exactly the
+                    # failed groups loudly and never persists their bytes.
+                    failed_groups.append(group_id)
+                    if first_failure is None:
+                        first_failure = exc
+            if first_failure is not None:
                 logger.warning(
                     "HOLEMISS_STATE_TAIL_SNAPSHOT_FAILED tp=%d req=%s group=%d boundary=%d reason=%s",
                     self.tp_rank,
                     request.req_id,
-                    failed_group,
+                    failed_groups[0],
                     boundary,
-                    f"{type(failure).__name__}: {failure}"[:200],
+                    f"{type(first_failure).__name__}: {first_failure}"[:200],
                 )
-                # All-or-nothing per request: the partial clones are dropped
-                # with ``captured`` (a partial freeze would mix boundary and
-                # missing semantics across the GDN groups).
+            if not captured:
+                # Total failure: no entry at all — the drain's loud
+                # no_frozen_snapshot skip (the pre-W1-19 semantics).
                 continue
             snapshots[(request.req_id, boundary)] = {group_id: tensors for group_id, _, tensors in captured}
+            if failed_groups:
+                failed_registry = getattr(self, "_holemiss_state_tail_capture_failed", None)
+                if isinstance(failed_registry, dict):
+                    failed_registry[(request.req_id, boundary)] = set(failed_groups)
             if _hm_is_evidence() or _hm_diag_enabled():
                 for group_id, pool_slot, tensors in captured:
                     self._holemiss_emit_state_tail_snapshot_marker(request, boundary, group_id, pool_slot, tensors)

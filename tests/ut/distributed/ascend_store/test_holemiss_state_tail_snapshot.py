@@ -49,6 +49,7 @@ import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import pool_worker as pool_worker_module
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
 )
@@ -203,6 +204,7 @@ def _make_worker(kv_role="kv_producer", consumer_is_to_put=False, use_hybrid=Tru
     worker._holemiss_state_tail_snapshot_pending_free = {}
     worker._holemiss_state_tail_seen_reqs = set()
     worker._holemiss_state_tail_sources = {}
+    worker._holemiss_state_tail_capture_failed = {}
     worker._holemiss_tail_key_boundaries = {}
     worker._holemiss_state_markers = {}
     worker._holemiss_state_load_results = {}
@@ -527,7 +529,6 @@ class TestLifecycle(unittest.TestCase):
             worker._holemiss_capture_state_tail_snapshots([request])
         self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
 
-
 class TestTriggerConditions(unittest.TestCase):
     def test_non_finishing_step_negative_control(self):
         worker, _ = _make_worker()
@@ -616,7 +617,12 @@ class TestLoudDegrade(unittest.TestCase):
 
         with self.assertLogs(vllm_logger, level="WARNING") as logs:
             worker._holemiss_capture_state_tail_snapshots([request])
-        self.assertEqual(worker._holemiss_state_tail_snapshots, {})
+        # W1-19: the failed group's clones are gone, the sibling groups'
+        # clones are KEPT (a partial freeze), and the failed set is
+        # recorded for the drain's distinct capture_failed skip.
+        self.assertEqual(set(worker._holemiss_state_tail_snapshots), {("req-A", BOUNDARY)})
+        self.assertEqual(set(worker._holemiss_state_tail_snapshots[("req-A", BOUNDARY)]), {1, 3})
+        self.assertEqual(worker._holemiss_state_tail_capture_failed, {("req-A", BOUNDARY): {2}})
         failed = [line for line in logs.output if "HOLEMISS_STATE_TAIL_SNAPSHOT_FAILED" in line]
         self.assertEqual(len(failed), 1)
         self.assertIn("tp=0 req=req-A group=2", failed[0])
@@ -631,7 +637,8 @@ class TestLoudDegrade(unittest.TestCase):
 
         with self.assertLogs(vllm_logger, level="WARNING") as logs:
             worker._holemiss_capture_state_tail_snapshots([request])
-        self.assertEqual(worker._holemiss_state_tail_snapshots, {})
+        self.assertEqual(set(worker._holemiss_state_tail_snapshots[("req-A", BOUNDARY)]), {2, 3})
+        self.assertEqual(worker._holemiss_state_tail_capture_failed, {("req-A", BOUNDARY): {1}})
         self.assertTrue(any("HOLEMISS_STATE_TAIL_SNAPSHOT_FAILED" in line for line in logs.output))
 
     def test_out_of_range_slot_fails_loudly(self):
@@ -642,7 +649,24 @@ class TestLoudDegrade(unittest.TestCase):
 
         with self.assertLogs(vllm_logger, level="WARNING") as logs:
             worker._holemiss_capture_state_tail_snapshots([request])
+        self.assertEqual(set(worker._holemiss_state_tail_snapshots[("req-A", BOUNDARY)]), {1, 2})
+        self.assertEqual(worker._holemiss_state_tail_capture_failed, {("req-A", BOUNDARY): {3}})
+        self.assertTrue(any("HOLEMISS_STATE_TAIL_SNAPSHOT_FAILED" in line for line in logs.output))
+
+    def test_total_capture_failure_leaves_no_entry(self):
+        """W1-19's all-or-nothing floor: when EVERY unaligned group's clone
+        fails, no partial entry exists — the drain's skip stays the
+        unambiguous no_frozen_snapshot (an empty {} entry would silently
+        pass the drain's entry-is-None check)."""
+        worker, _ = _make_worker()
+        tables = {0: [9] * 7, 1: [1] * 6, 2: [8] * 6, 3: [16] * 6}
+        request = _make_request(block_tables=tables)
+        from vllm.logger import logger as vllm_logger
+
+        with self.assertLogs(vllm_logger, level="WARNING") as logs:
+            worker._holemiss_capture_state_tail_snapshots([request])
         self.assertEqual(worker._holemiss_state_tail_snapshots, {})
+        self.assertEqual(worker._holemiss_state_tail_capture_failed, {})
         self.assertTrue(any("HOLEMISS_STATE_TAIL_SNAPSHOT_FAILED" in line for line in logs.output))
 
 
