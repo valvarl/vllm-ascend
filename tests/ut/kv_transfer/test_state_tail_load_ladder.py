@@ -592,6 +592,66 @@ class TestLadderTailRung(unittest.TestCase):
         self.assertEqual([b.boundary_tokens for b in plan.boundaries], [(index + 1) * BLOCK for index in range(6)])
         self.assertIsNone(plan.tail_boundary_tokens)
 
+    def test_suppressed_tail_rung_demotes_loudly_per_state_group(self):
+        """W1-18 (the loud-demotion law): a suppressed tail rung emits the
+        frozen-v2 STATE_ABSENT grammar with the additive
+        reason=tail_rung_suppressed value for EVERY state group (the rung
+        drops for all of them) at plan time, plus a warning naming the
+        group whose key derivation failed — pre-fix this demotion was
+        fully SILENT (indistinguishable from "no tail signal")."""
+        store = _SessionStore()
+        worker, _ = _make_load_worker(store)
+        tables = [list(ids) for ids in BLOCK_TABLES]
+        tables[2] = tables[2][:TAIL_SLOT_INDEX]
+        request = _load_request(block_tables=tables)
+        with self.assertLogs(vllm_logger, level="WARNING") as logs:
+            plan = worker._holemiss_build_state_ladder_plan(request)
+        self.assertIsNone(plan.tail_boundary_tokens)
+        absent = [line for line in _markers(worker) if line.startswith("HOLEMISS_STATE_ABSENT")]
+        self.assertEqual(len(absent), len(STATE_GROUPS))
+        for line in absent:
+            match = STATE_ABSENT_RE.fullmatch(line)
+            self.assertIsNotNone(match, line)
+            self.assertIn(int(match.group(2)), STATE_GROUPS)
+            self.assertEqual(int(match.group(3)), BOUNDARY)
+            self.assertEqual(match.group(4), "tail_rung_suppressed")
+            self.assertEqual(int(match.group(5)), RUNG_LAST_SAVED)
+        self.assertTrue(
+            any("tail rung suppressed" in line and "offending_group=2" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_suppressed_tail_rung_marker_fires_under_the_ladder_run(self):
+        """The end-to-end shape: the full `_holemiss_run_gdn_state_ladder`
+        drive (the sync-drain call site) carries the suppression markers
+        into the same per-request registry the bench census reads, and the
+        ladder then loads the floor rung (rung 0 of the reduced plan)."""
+        store = _SessionStore()
+        worker, _ = _make_load_worker(store)
+        tables = [list(ids) for ids in BLOCK_TABLES]
+        tables[2] = tables[2][:TAIL_SLOT_INDEX]
+        request = _load_request(block_tables=tables)
+        result = worker._holemiss_run_gdn_state_ladder(request)
+        self.assertEqual(result.rung, RUNG_LAST_SAVED)
+        self.assertEqual(result.loaded_boundary_tokens, FLOOR)
+        absent = [line for line in _markers(worker) if "tail_rung_suppressed" in line]
+        self.assertEqual(len(absent), len(STATE_GROUPS))
+        loads = [line for line in _markers(worker) if line.startswith("HOLEMISS_STATE_LOAD")]
+        self.assertTrue(loads)
+        for line in loads:
+            match = STATE_LOAD_RE.fullmatch(line)
+            self.assertEqual(int(match.group(3)), FLOOR)
+
+    def test_healthy_tail_rung_emits_no_suppression_marker(self):
+        """The negative control: a fully-derivable tail rung (the healthy
+        battery shape) emits ZERO tail_rung_suppressed markers — the
+        existing census counts are unchanged."""
+        store = _SessionStore()
+        worker, _ = _make_load_worker(store)
+        request = _load_request()
+        worker._holemiss_run_gdn_state_ladder(request)
+        self.assertFalse([line for line in _markers(worker) if "tail_rung_suppressed" in line])
+
     def test_tail_rung_hit_loads_at_rung0_with_source_tail(self):
         store = _SessionStore()
         worker, geometry = _make_load_worker(store)

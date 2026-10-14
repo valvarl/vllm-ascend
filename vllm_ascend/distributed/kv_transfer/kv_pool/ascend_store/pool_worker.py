@@ -4815,14 +4815,27 @@ class KVPoolWorker:
         if tail_boundary_tokens is not None:
             tail_keys: dict[int, tuple[str, ...]] = {}
             tail_blocks: dict[int, tuple[int, ...]] = {}
+            suppressed_group: int | None = None
             for group_id in state_groups:
                 tail_load = self._make_layerwise_tail_load_key(request, group_id)
                 if tail_load is None:
+                    # W1-18 (the loud-demotion law, gdn_state_ladder.py:12):
+                    # the tail rung drops for EVERY state group when ANY
+                    # group's key derivation fails. The demote itself is
+                    # correct (the floor rung's recompute span regenerates
+                    # every group's tail state), but it must never be
+                    # SILENT — a suppressed rung is indistinguishable from
+                    # "no tail signal" without the marker.
+                    suppressed_group = group_id
                     tail_keys = {}
                     break
                 tail_key, tail_index = tail_load
                 tail_keys[group_id] = (tail_key,)
                 tail_blocks[group_id] = (request.block_ids_by_group[group_id][tail_index],)
+            if suppressed_group is not None:
+                self._holemiss_warn_tail_rung_suppressed(
+                    request, tail_boundary_tokens, state_groups, suppressed_group, first_layer_by_group
+                )
             if tail_keys:
                 boundaries.append(
                     gdn_state_ladder.StateBoundary(
@@ -4854,6 +4867,42 @@ class KVPoolWorker:
             fa_hit_tokens=cached_tokens,
             save_enabled=_hm_state_save_enabled(),
             tail_boundary_tokens=tail_boundary_tokens if tail_appended else None,
+        )
+
+    def _holemiss_warn_tail_rung_suppressed(
+        self,
+        request: ReqMeta,
+        boundary: int,
+        state_groups: tuple[int, ...],
+        offending_group: int,
+        first_layer_by_group: dict[int, int],
+    ) -> None:
+        """W1-18: the tail rung's plan-time suppression, made LOUD.
+
+        Emits the frozen-v2 HOLEMISS_STATE_ABSENT grammar with the additive
+        ``reason=tail_rung_suppressed`` value (the ``source=tail`` additive
+        precedent) for every state group — the rung drops for ALL of them
+        (the ladder's boundary granularity) — plus one warning naming the
+        group whose key derivation failed. ``rung=0``: with the tail rung
+        absent from the plan, the walk starts at the newest FULL boundary,
+        which is rung 0 of the reduced plan.
+        """
+        markers = getattr(self, "_holemiss_state_markers", None)
+        for group in state_groups:
+            line = (
+                f"HOLEMISS_STATE_ABSENT layer={first_layer_by_group[group]} group={group} "
+                f"boundary={boundary} reason=tail_rung_suppressed rung={gdn_state_ladder.RUNG_LAST_SAVED}"
+            )
+            if isinstance(markers, dict):
+                markers.setdefault(request.req_id, []).append(line)
+            if _hm_is_evidence() or _hm_diag_enabled():
+                logger.info("%s", line)
+        logger.warning(
+            "HOLEMISS state ladder req=%s tail rung suppressed boundary=%d offending_group=%d; "
+            "falling to the newest full boundary",
+            request.req_id,
+            boundary,
+            offending_group,
         )
 
     def _holemiss_record_failed_load_keys(self, req_id: str, keys: Iterable[str]) -> None:
