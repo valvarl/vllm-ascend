@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import pool_worker as pool_worker_module
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.layerwise_keys import (
     LayerwiseKeyBuilder,
 )
@@ -56,7 +57,10 @@ MODEL_NAME = "testmodel"
 HOLEMISS_ENVS = [
     "HOLEMISS_DISK_EIO_ENABLED",
     "HOLEMISS_EIO_LAYER",
+    "HOLEMISS_EIO_LAYERS",
     "HOLEMISS_EIO_LOGICAL_BLOCK",
+    "HOLEMISS_GDN_EIO_ENABLED",
+    "HOLEMISS_EIO_GROUP",
     "HOLEMISS_FAIL_LAYER",
     "HOLEMISS_FAIL_LOGICAL_BLOCK",
     "HOLEMISS_SYNC_LAYERWISE_LOAD",
@@ -65,6 +69,8 @@ HOLEMISS_ENVS = [
     "HOLEMISS_KV_LOAD_TIMING",
     "HOLEMISS_RECOVERY_MODE",
     "EIO_TARGET_KEY",
+    "HOLEMISS_EIO_TARGET_OFFSET",
+    "HOLEMISS_EIO_TARGET_SIZE",
 ]
 
 FA_PHYSICAL = [3 + 4 * k for k in range(2)]
@@ -536,10 +542,7 @@ def _mock_group_layerwise_keys() -> LayerwiseKeyBuilder:
         make_full_key=lambda group_id, block_hash, rank, stage: (
             make_block_key(MODEL_NAME, block_hash, rank, pp_rank=stage)
             if group_id == 0
-            else (
-                f"{MODEL_NAME}@mooncake_hybrid_v1:layout@group:{group_id}"
-                f"@block:1536@{block_hash}@{rank}"
-            )
+            else (f"{MODEL_NAME}@mooncake_hybrid_v1:layout@group:{group_id}@block:1536@{block_hash}@{rank}")
         ),
         pp_size=1,
     )
@@ -553,9 +556,7 @@ _LAYER_BYTES = _LAYER_ENTRY_COUNT * _ENTRY_BYTES
 
 
 def _give_extent_geometry(worker: "KVPoolWorker", num_layers: int = 4) -> None:
-    worker.group_layer_cache_entry_offsets = {
-        0: [i * _LAYER_ENTRY_COUNT for i in range(num_layers + 1)]
-    }
+    worker.group_layer_cache_entry_offsets = {0: [i * _LAYER_ENTRY_COUNT for i in range(num_layers + 1)]}
     worker.group_block_len = {0: [_ENTRY_BYTES] * (num_layers * _LAYER_ENTRY_COUNT)}
 
 
@@ -712,9 +713,7 @@ class TestMultiTargetEioLayers(HolemissTestBase):
         worker = self._hybrid_worker()
         request = _make_request()
         key = worker._holemiss_derive_block_key(request, 2)
-        worker._holemiss_armed_fault = worker._holemiss_make_armed_record(
-            "disk_eio", request, key, 0, 2
-        )
+        worker._holemiss_armed_fault = worker._holemiss_make_armed_record("disk_eio", request, key, 0, 2)
         worker._holemiss_armed_fault["layer_ids"] = [0, 1]
         worker._holemiss_armed_fault["target_extents"] = [(0, 200), (200, 200)]
         self.assertEqual(worker.holemiss_range_target_position([key, "other"], 3), 0)
@@ -726,9 +725,7 @@ class TestMultiTargetEioLayers(HolemissTestBase):
         worker = self._hybrid_worker()
         request = _make_request()
         key = worker._holemiss_derive_block_key(request, 2)
-        worker._holemiss_armed_fault = worker._holemiss_make_armed_record(
-            "disk_eio", request, key, 0, 2
-        )
+        worker._holemiss_armed_fault = worker._holemiss_make_armed_record("disk_eio", request, key, 0, 2)
         worker._holemiss_armed_fault["layer_ids"] = [0, 1]
         worker._holemiss_armed_fault["target_extents"] = [(0, 200), (200, 200)]
         captured: list = []
@@ -803,9 +800,7 @@ class TestGdnStateEioGate(HolemissTestBase):
         self.assertIsNotNone(armed)
         self.assertEqual(armed["kind"], "disk_eio")
         self.assertNotIn("group_id", armed)
-        self.assertEqual(
-            armed["key"], worker._make_layerwise_full_key(0, request.block_hashes[2].hex())
-        )
+        self.assertEqual(armed["key"], worker._make_layerwise_full_key(0, request.block_hashes[2].hex()))
 
     def test_opt_in_arms_the_group_n_state_object(self):
         worker = self._hybrid_worker()
@@ -878,6 +873,121 @@ class TestGdnStateEioGate(HolemissTestBase):
             worker._holemiss_derive_block_key(request, 2),
             worker._make_layerwise_full_key(0, request.block_hashes[2].hex()),
         )
+
+
+class TestOutOfGroupedLogicalGuard(HolemissTestBase):
+    """W1-23 (hybrid-robustness-hunt): the arming logical-block index is
+    bounds-checked against the GROUPED block count, never the raw
+    hash-block-granular sub-hash count (at pmu 256 under a 1536-token group
+    block the raw chain carries 6 sub-hashes per block)."""
+
+    # 3 group blocks x scale 6 = 18 raw sub-hashes; the grouped count is 3.
+    RAW_SUB_HASHES = 18
+    GROUPED_BLOCKS = 3
+
+    def _pmu_worker(self):
+        worker = _make_worker(
+            num_groups=4,
+            use_hybrid=True,
+            kv_cache_config=_qwen36_config(),
+            num_layers=8,
+        )
+        worker.grouped_block_size = [1536, 1536, 1536, 1536]
+        worker.hash_block_size = 256
+        return worker
+
+    def _pmu_request(self):
+        request = _make_request(num_blocks=self.RAW_SUB_HASHES, kvpool_cached=2 * 1536)
+        request.block_hashes = [bytes([(i + 1) % 256] * 32) for i in range(self.RAW_SUB_HASHES)]
+        return request
+
+    def test_out_of_grouped_fa_logical_skips_loudly_under_a_wide_span(self):
+        """The finding's hazard shape (a span derivation that admits the
+        value — 'if the span check is ever edited'): an
+        out-of-blocks-but-in-sub-hashes logical must NEVER arm, and the
+        skip must be LOUD with logical_out_of_span — pre-fix the
+        wrong-cardinality guard passed the value and the derive's None
+        return skipped SILENTLY (no marker, no arm: the false-green
+        evidence hazard)."""
+        worker = self._pmu_worker()
+        request = self._pmu_request()
+        worker._holemiss_load_span = lambda req: (0, self.RAW_SUB_HASHES)
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_LAYER": "0",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "5",
+            }
+        )
+        with self.assertLogs(pool_worker_module.logger, level="INFO") as logs:
+            worker._holemiss_configure_fault(request)
+        self.assertIsNone(worker._holemiss_armed_fault)
+        self.assertTrue(
+            any("logical_out_of_span" in line and "logical=5" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_out_of_grouped_synthetic_logical_skips_loudly(self):
+        """The synthetic family's mirror of the same guard."""
+        worker = self._pmu_worker()
+        request = self._pmu_request()
+        worker._holemiss_load_span = lambda req: (0, self.RAW_SUB_HASHES)
+        os.environ.update(
+            {
+                "HOLEMISS_FAIL_LAYER": "0",
+                "HOLEMISS_FAIL_LOGICAL_BLOCK": "5",
+            }
+        )
+        with self.assertLogs(pool_worker_module.logger, level="INFO") as logs:
+            worker._holemiss_configure_fault(request)
+        self.assertIsNone(worker._holemiss_armed_fault)
+        self.assertTrue(
+            any("SYNTHETIC_ARM_SKIP" in line and "logical=5" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_out_of_grouped_gdn_logical_skips_with_the_span_reason(self):
+        """The GDN arm's copy of the guard (the W1-11 site): the skip must
+        carry logical_out_of_span (the true cause), never the misattributed
+        gdn_key_derivation_none the raw-count guard let through."""
+        worker = self._pmu_worker()
+        request = self._pmu_request()
+        worker._holemiss_load_span = lambda req: (0, self.RAW_SUB_HASHES)
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_GDN_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_GROUP": "1",
+                "HOLEMISS_EIO_LAYER": "-1",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "5",
+            }
+        )
+        with self.assertLogs(pool_worker_module.logger, level="INFO") as logs:
+            worker._holemiss_configure_fault(request)
+        self.assertIsNone(worker._holemiss_armed_fault)
+        self.assertTrue(
+            any("logical_out_of_span" in line and "logical=5" in line for line in logs.output),
+            logs.output,
+        )
+        self.assertFalse(any("gdn_key_derivation_none" in line for line in logs.output), logs.output)
+
+    def test_in_grouped_logical_arms_unchanged_under_the_wide_span(self):
+        """The negative control: an in-grouped logical (0 <= logical < 3)
+        arms exactly as before — the guard's tightened cardinality changes
+        no healthy arming."""
+        worker = self._pmu_worker()
+        request = self._pmu_request()
+        worker._holemiss_load_span = lambda req: (0, self.RAW_SUB_HASHES)
+        os.environ.update(
+            {
+                "HOLEMISS_DISK_EIO_ENABLED": "1",
+                "HOLEMISS_EIO_LAYER": "0",
+                "HOLEMISS_EIO_LOGICAL_BLOCK": "2",
+            }
+        )
+        worker._holemiss_configure_fault(request)
+        self.assertIsNotNone(worker._holemiss_armed_fault)
+        self.assertEqual(worker._holemiss_armed_fault["logical_block_index"], 2)
 
 
 if __name__ == "__main__":

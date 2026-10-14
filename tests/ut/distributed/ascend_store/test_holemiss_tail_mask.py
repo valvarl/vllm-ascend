@@ -795,6 +795,31 @@ class TestHybridTailContentProbe(unittest.TestCase):
         self.assertEqual(page.shape[0], self.BPKB)
         self.assertEqual(page.data_ptr(), cache[self.SAVE_BLOCK * self.BPKB].data_ptr())
 
+    def test_page_view_refuses_a_stale_num_blocks(self):
+        """W1-30: a num_blocks that does not divide the cache's kernel rows
+        is a stale/mismatched geometry — pre-fix it silently produced a
+        truncated scale (6120 // 511 = 11) and read WRONG rows; the page
+        view must refuse loudly (the _get_cache_block_metadata
+        assert-law), never guess."""
+        worker = self._probe_worker(self._fa_caches())
+        cache = worker._holemiss_group0_cache_entries()[0]
+        worker.num_blocks = self.NUM_BLOCKS + 1
+        with self.assertRaises(AssertionError):
+            worker._holemiss_group0_page_view(cache, self.SAVE_BLOCK)
+
+    def test_page_view_healthy_and_text_geometries_unchanged(self):
+        """The negative control: the divisibility assert changes nothing for
+        the healthy hybrid geometry (12 rows/page) and the text degenerate
+        (cache rows == num_blocks — the early return)."""
+        worker = self._probe_worker(self._fa_caches())
+        cache = worker._holemiss_group0_cache_entries()[0]
+        page = worker._holemiss_group0_page_view(cache, 0)
+        self.assertEqual(page.shape[0], self.BPKB)
+        text_cache = torch.zeros(self.NUM_BLOCKS, self.KERNEL_BLOCK, self.KV_HEADS, self.HEAD_DIM)
+        text_view = worker._holemiss_group0_page_view(text_cache, 3)
+        self.assertEqual(text_view.data_ptr(), text_cache[3].data_ptr())
+        self.assertEqual(text_view.shape, text_cache[3].shape)
+
     def test_save_probe_emits_the_attended_window_fingerprint(self):
         """The save-side probe at the drain: pool page 6 carries real KV in
         the attended window (kernel rows [72, 74) — the first 256 tokens) and

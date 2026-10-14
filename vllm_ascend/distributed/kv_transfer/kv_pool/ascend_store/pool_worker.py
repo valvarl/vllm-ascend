@@ -3332,6 +3332,24 @@ class KVPoolWorker:
         end_block = min(cached_tokens // block_size, len(group_block_hashes))
         return load_start_block, end_block
 
+    def _holemiss_armable_block_count(self, request: ReqMeta, group_id: int = 0) -> int:
+        """W1-23: the GROUPED block count that an arming logical block indexes.
+
+        ``request.block_hashes`` is HASH-block-granular (at pmu 256 under a
+        1536-token group block the raw chain carries scale=6 sub-hashes per
+        block), so a logical-block index must be bounds-checked against the
+        GROUPED count — the raw ``len(request.block_hashes)`` is the wrong
+        cardinality. It is masked today by the load-span bound (end_block is
+        itself <= the grouped count) and by ``_holemiss_derive_block_key``'s
+        own grouped guard; this check is the earliest loud skip carrying the
+        right cardinality, so no future span-derivation edit can arm an
+        out-of-blocks logical against a NON-boundary sub-hash key.
+        """
+        block_size = (
+            self.grouped_block_size[0] if group_id <= 0 else get_group_block_size(self.grouped_block_size, group_id)
+        )
+        return len(get_block_hashes(request.block_hashes, block_size, self.hash_block_size))
+
     def _holemiss_derive_block_key(
         self, request: ReqMeta, logical_block: int, *, group_id: int = 0
     ) -> str | None:
@@ -3478,7 +3496,9 @@ class KVPoolWorker:
                     armable_layers,
                 )
                 return
-            if not (load_start_block <= eio_logical < end_block) or eio_logical >= len(request.block_hashes):
+            if not (load_start_block <= eio_logical < end_block) or eio_logical >= self._holemiss_armable_block_count(
+                request
+            ):
                 logger.info(
                     "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=logical_out_of_span logical=%d span=[%d,%d)",
                     self.tp_rank,
@@ -3500,7 +3520,9 @@ class KVPoolWorker:
                 armable_layers,
             )
             return
-        if not (load_start_block <= eio_logical < end_block) or eio_logical >= len(request.block_hashes):
+        if not (load_start_block <= eio_logical < end_block) or eio_logical >= self._holemiss_armable_block_count(
+            request
+        ):
             logger.info(
                 "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=logical_out_of_span logical=%d span=[%d,%d)",
                 self.tp_rank,
@@ -3658,7 +3680,9 @@ class KVPoolWorker:
             )
             return
         eio_logical = _hm_env_int("HOLEMISS_EIO_LOGICAL_BLOCK", 2)
-        if not (load_start_block <= eio_logical < end_block) or eio_logical >= len(request.block_hashes):
+        if not (load_start_block <= eio_logical < end_block) or eio_logical >= self._holemiss_armable_block_count(
+            request, group_id=gdn_group
+        ):
             logger.info(
                 "HOLEMISS_EIO_ARM_SKIP tp=%d req=%s reason=logical_out_of_span logical=%d span=[%d,%d)",
                 self.tp_rank,
@@ -3704,7 +3728,9 @@ class KVPoolWorker:
         fail_logical = _hm_env_int("HOLEMISS_FAIL_LOGICAL_BLOCK", -1)
         if fail_logical < 0 or not (0 <= fail_layer < self._holemiss_armable_layer_count()):
             return
-        if not (load_start_block <= fail_logical < end_block) or fail_logical >= len(request.block_hashes):
+        if not (load_start_block <= fail_logical < end_block) or fail_logical >= self._holemiss_armable_block_count(
+            request
+        ):
             logger.info(
                 "HOLEMISS_SYNTHETIC_ARM_SKIP tp=%d req=%s reason=logical_out_of_span logical=%d span=[%d,%d)",
                 self.tp_rank,
@@ -4435,6 +4461,14 @@ class KVPoolWorker:
         num_blocks = getattr(self, "num_blocks", 0) or 0
         if num_blocks <= 0 or cache.shape[0] <= num_blocks:
             return cache[block_id]
+        # W1-30 (B13): a num_blocks that does not divide the cache's kernel
+        # rows is a stale/mismatched geometry that would silently produce a
+        # truncated scale and read wrong rows — refuse (the same
+        # assert-law as _get_cache_block_metadata).
+        assert cache.shape[0] % num_blocks == 0, (
+            f"group-0 cache holds {cache.shape[0]} kernel rows for num_blocks={num_blocks}; a non-divisible "
+            "geometry is stale (the B13 dual-block-space law) — refusing to guess the page view"
+        )
         scale = cache.shape[0] // num_blocks
         if scale <= 1:
             return cache[block_id]
