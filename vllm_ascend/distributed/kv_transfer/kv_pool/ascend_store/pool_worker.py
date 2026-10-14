@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import suppress
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -183,22 +183,42 @@ def _holemiss_clear_eio_target_envs() -> None:
 WRITEBACK_REMOVE_LEASE_WAIT_BUDGET_MS = 120_000
 WRITEBACK_REMOVE_RETRY_INTERVAL_MS = 5_000
 
-# hybrid-gdn-tail-state T7 fix-2: the deferred state-tail snapshot frees wait
-# for the drain signal (the step carrying the request's finish-time tail
-# ReqMeta). The grace bound covers the never-drained leftovers (no upstream
-# tail offer, the consumer probe leg): the observed finish->drain latency is
-# 1-3 engine steps, so 8 teardown calls carries > 2x headroom (the
-# calibration law). UT-pinned: any change is a deliberate re-pin.
+# hybrid-gdn-tail-state T7 fix-2 + R1 Mode 1 (W3): the deferred state-tail
+# snapshot frees wait for the drain signal (the step carrying the request's
+# finish-time tail ReqMeta). The grace bound covers the never-drained
+# leftovers (no upstream tail offer): the drain needs a FORWARD-BEARING
+# step (the D-T18.3 gate) and a request-finish teardown implies a forward
+# ran, so the bound counts REQUEST FINISHES — never idle steps. At depth
+# (the 32768 live repro: 12 EMPTY post-finish step teardowns before the
+# filler's drain) the per-call countdown freed the artifact before the
+# take could consume it (the no_frozen_snapshot RED). 8 subsequent
+# finishes carries > 2x headroom over the observed 1-3-step finish->drain
+# window (the calibration law). UT-pinned: any change is a deliberate
+# re-pin.
 STATE_TAIL_SNAPSHOT_PENDING_GRACE = 8
 
 # hybrid-robustness-hunt W1-26: the PROBE leg's retention bound — a
 # load-only consumer's snapshots never drain (the take runs on the save
-# path), so their free rides the grace bound ALONE. Equal to the drain
-# grace today (bounded HBM retention) but a SEPARATE pin: the drain grace
-# is a drain-latency calibration (>= 2x the observed finish->drain window)
-# while this one is a pure footprint bound — re-pinning one must never
-# silently move the other. UT-pinned: any change is a deliberate re-pin.
+# path), so their free rides the grace bound ALONE and ages on EVERY
+# teardown call (no drain consumer exists to wait for — a pure footprint
+# bound). Equal to the drain grace today but a SEPARATE pin: re-pinning
+# one must never silently move the other. UT-pinned: any change is a
+# deliberate re-pin.
 STATE_TAIL_PROBE_SNAPSHOT_GRACE = 8
+
+
+class _StateTailPendingFree(NamedTuple):
+    """A deferred snapshot free's grace + its aging law (R1 Mode 1 / W1-26).
+
+    ``drain_leg`` entries (a save-role worker's captures) await the
+    finish-time tail drain and age ONLY on request-finish-carrying
+    teardowns; probe-leg entries (a load-only consumer's captures) have no
+    drain consumer by design and age on every teardown call.
+    """
+
+    grace: int
+    drain_leg: bool
+
 
 # B42: REPLICA_IS_NOT_READY (-703) — the stale non-COMPLETE replica on the
 # armed key blocks the master's remove gate
@@ -5601,11 +5621,24 @@ class KVPoolWorker:
             # finish-time tail drained (the step that carried the tail
             # ReqMeta — its take ran before this teardown by construction)
             # or its grace bound ran out (the never-drained leftovers).
+            # R1 Mode 1: the drain-leg grace ages ONLY on teardown calls
+            # that carry request finishes — the drain rides a
+            # forward-bearing step (the D-T18.3 gate) and a finish implies
+            # a forward ran, so idle steps can never deliver it and must
+            # not age the bound (the 32768/65536 depth defect: 12 empty
+            # post-finish steps burned grace 8 before the filler's drain
+            # could take). The probe leg (W1-26) has no drain consumer by
+            # design, so it keeps aging on every call — a pure footprint
+            # bound.
+            step_bears_finishes = bool(finished_req_ids)
             stale_snapshots = getattr(self, "_holemiss_state_tail_snapshots", None)
-            for deferred_req_id, grace in list(deferred_snapshots.items()):
+            for deferred_req_id, pending in list(deferred_snapshots.items()):
                 drained = isinstance(tail_seen, set) and deferred_req_id in tail_seen
-                if not drained and grace > 0:
-                    deferred_snapshots[deferred_req_id] = grace - 1
+                if not drained and pending.grace > 0:
+                    if step_bears_finishes or not pending.drain_leg:
+                        deferred_snapshots[deferred_req_id] = _StateTailPendingFree(
+                            pending.grace - 1, pending.drain_leg
+                        )
                     continue
                 if isinstance(stale_snapshots, dict):
                     for snapshot_key in [key for key in stale_snapshots if key[0] == deferred_req_id]:
@@ -5650,15 +5683,19 @@ class KVPoolWorker:
             pending_snapshots = getattr(self, "_holemiss_state_tail_snapshot_pending_free", None)
             if isinstance(snapshots, dict):
                 if isinstance(pending_snapshots, dict):
-                    # W1-26: pick the retention bound by the leg that
-                    # captured — a save-role worker's snapshots expect the
-                    # drain (the drain-signal branch frees them early); a
-                    # load-only consumer's probe-leg snapshots never drain,
-                    # so they ride the probe grace alone.
-                    pending_snapshots[req_id] = (
-                        STATE_TAIL_SNAPSHOT_PENDING_GRACE
-                        if is_kv_save_role(getattr(self, "kv_role", ""), getattr(self, "consumer_is_to_put", False))
-                        else STATE_TAIL_PROBE_SNAPSHOT_GRACE
+                    # W1-26 + R1 Mode 1: pick the retention bound AND the
+                    # aging law by the leg that captured — a save-role
+                    # worker's snapshots expect the drain (the drain-signal
+                    # branch frees them early; the grace ages only on
+                    # finish-bearing teardowns); a load-only consumer's
+                    # probe-leg snapshots never drain, so they ride the
+                    # probe grace alone and age on every teardown call.
+                    drain_leg = is_kv_save_role(
+                        getattr(self, "kv_role", ""), getattr(self, "consumer_is_to_put", False)
+                    )
+                    pending_snapshots[req_id] = _StateTailPendingFree(
+                        STATE_TAIL_SNAPSHOT_PENDING_GRACE if drain_leg else STATE_TAIL_PROBE_SNAPSHOT_GRACE,
+                        drain_leg,
                     )
                 else:
                     for snapshot_key in [key for key in snapshots if key[0] == req_id]:

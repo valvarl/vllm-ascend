@@ -437,12 +437,19 @@ class TestLifecycle(unittest.TestCase):
         other = _make_request(req_id="req-B", num_prompt=BOUNDARY + 256)
         worker._holemiss_capture_state_tail_snapshots([other])
         worker._holemiss_teardown_finished({"req-A"})
-        # The snapshot free defers until the drain signal (the finish->drain
-        # window): the registry must SURVIVE the finish step's purge and any
-        # number of intermediate teardowns.
-        for _ in range(STATE_TAIL_SNAPSHOT_PENDING_GRACE + 1):
-            self.assertIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
+        # R1 Mode 1: idle post-finish steps never age the drain-leg grace —
+        # an unbounded idle cadence must not free the deferred artifact ...
+        for _ in range(4 * STATE_TAIL_SNAPSHOT_PENDING_GRACE):
             worker._holemiss_teardown_finished(set())
+            self.assertIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
+        # ... the never-drained leftover frees after the bound in REQUEST
+        # FINISHES (the engine's progress proxy: a finish-bearing teardown
+        # implies a forward ran, and only a forward-bearing step could have
+        # drained the tail).
+        for index in range(STATE_TAIL_SNAPSHOT_PENDING_GRACE):
+            worker._holemiss_teardown_finished({f"later-req-{index}"})
+            self.assertIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
+        worker._holemiss_teardown_finished({"the-last-req"})
         self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_snapshots)
         self.assertNotIn(("req-A", ALIGNED_BOUNDARY), worker._holemiss_state_tail_snapshots)
         self.assertIn(("req-B", BOUNDARY + 256), worker._holemiss_state_tail_snapshots)
@@ -581,7 +588,7 @@ class TestLifecycle(unittest.TestCase):
             worker._holemiss_tail_key_boundaries["<the-tail-key>"] = ("req-A", BOUNDARY)
             worker._holemiss_teardown_finished({"req-A"})
             for _ in range(STATE_TAIL_SNAPSHOT_PENDING_GRACE + 1):
-                worker._holemiss_teardown_finished(set())
+                worker._holemiss_teardown_finished({"a-later-request"})
             self.assertEqual(worker._holemiss_tail_key_boundaries, {})
             # The reused request at the same boundary: NOT fenced.
             worker._holemiss_capture_state_tail_snapshots([_make_request()])
@@ -595,16 +602,18 @@ class TestLifecycle(unittest.TestCase):
         worker._holemiss_teardown_finished({"req-A"})
         self.assertIn(("req-A", BOUNDARY), worker._holemiss_state_tail_capture_failed)
         for _ in range(STATE_TAIL_SNAPSHOT_PENDING_GRACE + 1):
-            worker._holemiss_teardown_finished(set())
+            worker._holemiss_teardown_finished({"a-later-request"})
         self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_capture_failed)
 
     def test_probe_leg_grace_is_selected_by_role(self):
-        """W1-26: the pending-free grace picks the constant by the leg that
-        captured — the save-role worker's snapshots expect the drain (the
-        drain-latency calibration bound); a load-only consumer's probe-leg
+        """W1-26 + R1 Mode 1: the pending-free entry picks the bound AND the
+        aging law by the leg that captured — the save-role worker's
+        snapshots expect the drain (the drain-latency calibration bound,
+        aged only by request finishes); a load-only consumer's probe-leg
         snapshots never drain and ride the probe bound (a pure footprint
-        bound). The constants are made distinguishable here so the
-        SELECTION is pinned, not the shared value."""
+        bound, aged by every teardown call). The constants are made
+        distinguishable here so the SELECTION is pinned, not the shared
+        value."""
         module = pool_worker_module
         saved_drain = module.STATE_TAIL_SNAPSHOT_PENDING_GRACE
         saved_probe = module.STATE_TAIL_PROBE_SNAPSHOT_GRACE
@@ -613,13 +622,77 @@ class TestLifecycle(unittest.TestCase):
         try:
             producer = self._teardown_worker(kv_role="kv_producer")
             producer._holemiss_teardown_finished({"req-X"})
-            self.assertEqual(producer._holemiss_state_tail_snapshot_pending_free["req-X"], 8)
+            self.assertEqual(
+                producer._holemiss_state_tail_snapshot_pending_free["req-X"],
+                (8, True),
+            )
             consumer = self._teardown_worker(kv_role="kv_consumer", consumer_is_to_put=False)
             consumer._holemiss_teardown_finished({"req-X"})
-            self.assertEqual(consumer._holemiss_state_tail_snapshot_pending_free["req-X"], 3)
+            self.assertEqual(
+                consumer._holemiss_state_tail_snapshot_pending_free["req-X"],
+                (3, False),
+            )
         finally:
             module.STATE_TAIL_SNAPSHOT_PENDING_GRACE = saved_drain
             module.STATE_TAIL_PROBE_SNAPSHOT_GRACE = saved_probe
+
+    def test_probe_leg_grace_ages_on_idle_steps(self):
+        """The W1-26 coordination half of the R1 Mode 1 fix: the probe leg
+        has NO drain consumer by design, so its footprint bound keeps aging
+        on EVERY teardown call — the finish-gate applies to the drain leg
+        only (a finish-gated probe leg would stretch a lone consumer
+        request's snapshots across its whole decode horizon)."""
+        worker = self._teardown_worker(kv_role="kv_consumer", consumer_is_to_put=False)
+        worker._holemiss_state_tail_snapshots[("req-P", BOUNDARY)] = {}
+        worker._holemiss_teardown_finished({"req-P"})
+        entry = worker._holemiss_state_tail_snapshot_pending_free["req-P"]
+        self.assertFalse(entry.drain_leg)
+        for _ in range(pool_worker_module.STATE_TAIL_PROBE_SNAPSHOT_GRACE):
+            worker._holemiss_teardown_finished(set())
+            self.assertIn(("req-P", BOUNDARY), worker._holemiss_state_tail_snapshots)
+        worker._holemiss_teardown_finished(set())
+        self.assertNotIn(("req-P", BOUNDARY), worker._holemiss_state_tail_snapshots)
+
+    def test_the_drain_take_survives_the_post_finish_idle_step_cadence(self):
+        """R1 Mode 1, THE 32768 depth shape (the live repro): the
+        block-count-scaled post-finish IDLE step cadence (12 measured
+        empty teardown calls between the offer and the filler's drain)
+        must not burn the deferred-flush grace — the take at the drain
+        step still finds the frozen bytes (the live
+        HOLEMISS_STATE_TAIL_PUT_SKIPPED reason=no_frozen_snapshot RED)."""
+        worker, _ = _make_worker()
+        worker._hole_recovery_regions = []
+        worker._hole_recovery_lock = threading.Lock()
+        worker._holemiss_armed_fault = None
+        request = _make_request()
+        worker._holemiss_capture_state_tail_snapshots([request])
+        frozen = {
+            group: _tensors_bytes(tensors)
+            for group, tensors in worker._holemiss_state_tail_snapshots[("req-A", BOUNDARY)].items()
+        }
+        # The offer (the request finishes at its capture step; the teardown
+        # arms the deferred free).
+        worker._holemiss_teardown_finished({"req-A"})
+        # The measured post-finish cadence at 32768: TWELVE empty
+        # step-boundary teardowns before the filler's forward-bearing step
+        # (the D-T18.3 gate refuses the idle steps).
+        for _ in range(12):
+            worker._holemiss_teardown_finished(set())
+        # The filler's drain: the take at the drain step's prep must still
+        # find the frozen artifact.
+        taken = worker._holemiss_take_state_tail_snapshots("req-A", BOUNDARY)
+        self.assertIsNotNone(taken)
+        self.assertEqual(set(taken), set(STATE_GROUPS))
+        for group, tensors in taken.items():
+            self.assertEqual(_tensors_bytes(tensors), frozen[group])
+        # The drain-signal teardown frees the consumed sources.
+        worker._holemiss_state_tail_sources[("req-A", BOUNDARY)] = taken
+        tail_meta = _make_request(req_id="req-A")
+        tail_meta.finished_tail_boundary = BOUNDARY
+        worker._holemiss_record_state_tail_drain([tail_meta])
+        worker._holemiss_teardown_finished(set())
+        self.assertNotIn(("req-A", BOUNDARY), worker._holemiss_state_tail_sources)
+        self.assertNotIn("req-A", worker._holemiss_state_tail_snapshot_pending_free)
 
 
 class TestTriggerConditions(unittest.TestCase):
