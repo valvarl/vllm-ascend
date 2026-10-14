@@ -130,6 +130,14 @@ class KVPoolScheduler:
         requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
         if not isinstance(requested_hash_block_size, int):
             requested_hash_block_size = None
+        # W1-27 (hybrid-robustness-hunt W2): keep the raw prefix-match unit
+        # (pre-dcp scaling). The tail-probe walk steps by the finest
+        # configured boundary granularity: hash_block_size = pmu * dcp_size,
+        # so any dcp > 1 layout would otherwise never probe
+        # pmu-aligned-but-not-hbs-aligned boundaries (the save side accepts
+        # any unaligned partial boundary; the probe walk is the only
+        # reader-side discovery path for those artifacts).
+        self.prefix_match_unit = requested_hash_block_size
         self.hash_block_size = (
             requested_hash_block_size if requested_hash_block_size is not None else min(cacheable_block_sizes)
         ) * self.dcp_size
@@ -579,13 +587,30 @@ class KVPoolScheduler:
                 num_speculative_blocks_by_group[group_id] = kv_cache_spec.num_speculative_blocks
         return num_speculative_blocks_by_group
 
-    def _probe_partial_tail_hit(self, request: "Request", boundary_tokens: int) -> int | None:
+    def _probe_partial_tail_hit(
+        self,
+        request: "Request",
+        boundary_tokens: int,
+        validated_tokens: int,
+    ) -> int | None:
         """Probe the FA partial-tail key at a candidate boundary (T18 + §c).
 
         Returns the exact-end boundary on a hit, None otherwise. The key is
         the boundary sub-hash (the last complete hash block at the boundary)
         qualified by the boundary position — the same derivation the worker
         persists under, never the req-id last-block key.
+
+        W1-20 (hybrid-robustness-hunt W2): a tail-key hit alone certifies
+        only the boundary artifact. The claim extends the load into every
+        full block in [validated_tokens, boundary_tokens) — blocks the
+        floor-anchored full-block hit never verified. The chained-hash law
+        says they exist (the producer that saved the tail saved the whole
+        prefix under the same chain), but eviction breaks that implication
+        silently, so the intermediate full-block keys' readability is
+        verified (metadata-only) before the claim is exposed to the
+        scheduler; a candidate with a missing intermediate block is
+        declined and the walk continues to older boundaries instead of
+        building a claim whose load fails in the engine.
         """
         hash_block_size = self.hash_block_size
         hash_index = boundary_tokens // hash_block_size - 1
@@ -599,9 +624,72 @@ class KVPoolScheduler:
         if not keys:
             return None
         hits = self._query_layerwise_block_hits([keys])
-        if hits and all(hits):
-            return boundary_tokens
-        return None
+        if not (hits and all(hits)):
+            return None
+        missing = self._unreadable_intermediate_blocks(request, boundary_tokens, validated_tokens)
+        if missing:
+            logger.info(
+                "KV pool partial tail declined req=%s boundary=%d reason=intermediate_block_missing missing=%s",
+                request.request_id,
+                boundary_tokens,
+                missing,
+            )
+            return None
+        return boundary_tokens
+
+    def _unreadable_intermediate_blocks(
+        self,
+        request: "Request",
+        boundary_tokens: int,
+        validated_tokens: int,
+    ) -> list[tuple[int, int]]:
+        """W1-20: the (group, block) pairs in the tail claim's unverified
+        span whose full-block keys are not readable.
+
+        The span is [validated_tokens, boundary_tokens) — full blocks the
+        floor-anchored hit already verified are skipped, matching the
+        worker's fetch start (``vllm_cached_tokens // block_size``). The
+        per-group iteration mirrors the worker's layerwise load exactly:
+        hybrid groups consult the same reachability load mask the worker
+        will apply at the claimed boundary (only masked-in blocks are
+        fetched, so only masked-in blocks are verified); single-group text
+        layouts check the FA group densely (the text fetch is unmasked).
+        """
+        missing: list[tuple[int, int]] = []
+        spans: list[tuple[int, int, int, int]] = []
+        for group_id in self.cacheable_group_ids:
+            group_block_size = get_group_block_size(self.grouped_block_size, group_id)
+            start_block = validated_tokens // group_block_size
+            end_block = boundary_tokens // group_block_size
+            if end_block > start_block:
+                spans.append((group_id, group_block_size, start_block, end_block))
+        if not spans:
+            # The dominant live shape: the boundary within one block of the
+            # validated floor — the claim adds only the tail artifact, so
+            # there is nothing intermediate to verify.
+            return missing
+        load_masks: Sequence[Sequence[bool] | None] | None = None
+        if self.block_key_hybrid:
+            coordinator = self.cache_coordinator
+            assert coordinator is not None, "Block-key hybrid tail probe requires a reachability coordinator"
+            load_masks = coordinator.load_mask(request.block_hashes, boundary_tokens)
+        for group_id, group_block_size, start_block, end_block in spans:
+            group_block_hashes = get_block_hashes(request.block_hashes, group_block_size, self.hash_block_size)
+            group_mask = load_masks[group_id] if load_masks is not None else None
+            keys_by_block: list[list[str]] = []
+            block_indices: list[int] = []
+            for block_index in range(start_block, min(end_block, len(group_block_hashes))):
+                if group_mask is not None and not (block_index < len(group_mask) and group_mask[block_index]):
+                    continue
+                keys_by_block.append(
+                    self._make_layerwise_hit_check_keys(group_id, block_hash_to_str(group_block_hashes[block_index]))
+                )
+                block_indices.append(block_index)
+            if not keys_by_block:
+                continue
+            hits = self._query_layerwise_block_hits(keys_by_block)
+            missing.extend((group_id, block_index) for block_index, hit in zip(block_indices, hits) if not hit)
+        return missing
 
     def _partial_tail_probe_boundaries(self, prompt_token_len: int, token_len: int) -> list[int]:
         """Tail-probe candidate boundaries, NEWEST-first (design §c).
@@ -609,17 +697,25 @@ class KVPoolScheduler:
         The prompt's exact end is always the newest candidate (the T18
         single-probe call site — text prompt ends are not pmu-aligned in
         general, and the text extension must keep working byte-identically);
-        the older candidates are the pmu-aligned boundaries in
-        (token_len, prompt_token_len], so the walk costs at most
-        (prompt_token_len - token_len) // hash_block_size + 1 cheap metadata
-        probes — the pmu quantization bounds it, never O(prompt).
+        the older candidates are the step-aligned boundaries in
+        (token_len, prompt_token_len]. The step is the finest configured
+        boundary granularity — prefix_match_unit when it is finer than
+        hash_block_size (W1-27: hash_block_size = pmu * dcp_size, so a
+        dcp > 1 layout would otherwise leave pmu-aligned-but-not-hbs-aligned
+        tail artifacts stranded), hash_block_size itself otherwise — so the
+        walk costs at most (prompt_token_len - token_len) // step + 1 cheap
+        metadata probes; the quantization bounds it, never O(prompt).
         """
         hash_block_size = self.hash_block_size
+        step = hash_block_size
+        prefix_match_unit = getattr(self, "prefix_match_unit", None)
+        if isinstance(prefix_match_unit, int) and 0 < prefix_match_unit < hash_block_size:
+            step = prefix_match_unit
         candidates: list[int] = []
-        if prompt_token_len % hash_block_size != 0:
+        if prompt_token_len % step != 0:
             candidates.append(prompt_token_len)
-        newest_aligned = prompt_token_len // hash_block_size * hash_block_size
-        candidates.extend(range(newest_aligned, token_len, -hash_block_size))
+        newest_step_aligned = prompt_token_len // step * step
+        candidates.extend(range(newest_step_aligned, token_len, -step))
         return candidates
 
     def register_finished_partial_tail(
@@ -746,20 +842,40 @@ class KVPoolScheduler:
         # T18/§c interior tail probe: when the floor truncated a partial tail
         # and the full-block hit is COMPLETE at the floor (the FA-prefix
         # anchor — the full-block check already validated every group's full
-        # blocks), walk the tail candidates NEWEST-first (the pmu-aligned
+        # blocks), walk the tail candidates NEWEST-first (the step-aligned
         # interior boundaries plus the prompt's exact end), probing the FA
         # tail key at each — the FIRST hit wins (the longest claim). The GDN
         # tail state is the last full boundary's state (already covered by
         # the full-block hit): nothing is checked at the tail boundary
         # except this one FA key — never an all-groups-complete-chunks
-        # anchor (the #57216 defect class).
+        # anchor (the #57216 defect class). W1-20: a winning candidate also
+        # verifies the intermediate full blocks the claim extends the load
+        # into (see _probe_partial_tail_hit); the verification span starts
+        # at the local-computed boundary when it exceeds the floor,
+        # mirroring the worker's fetch start.
         tail_boundary_tokens = None
         if self.use_block_key_layerwise and prompt_token_len > token_len and num_external_hit_tokens == token_len:
+            validated_tokens = max(token_len, num_computed_tokens)
             for boundary in self._partial_tail_probe_boundaries(prompt_token_len, token_len):
-                probed = self._probe_partial_tail_hit(request, boundary)
+                probed = self._probe_partial_tail_hit(request, boundary, validated_tokens)
                 if probed is None:
                     continue
                 if probed == request.num_tokens and self.num_speculative_blocks_by_group:
+                    # W1-24 (hybrid-robustness-hunt W2): the refusal compares
+                    # a prompt-derived candidate (always <= prompt_token_len)
+                    # against request.num_tokens. Those diverge legitimately
+                    # on a resumed preempted request (num_tokens = prompt +
+                    # generated tokens): there the refusal is structurally
+                    # dead and equally unneeded — the hit can never reach
+                    # num_tokens, so the -= 1 below never fires. The
+                    # meeting-point pin: when the refusal DOES fire, the hit
+                    # must be the prompt's exact end; anything else means the
+                    # candidate grid or the comparison drifted.
+                    assert probed == prompt_token_len, (
+                        "hybrid full-end refusal fired off the prompt end: "
+                        f"probed={probed} prompt_token_len={prompt_token_len} "
+                        f"num_tokens={request.num_tokens} req={request.request_id}"
+                    )
                     # The honest -1 refusal (§c, GDN layouts only): a hit at
                     # the prompt's exact end would trigger the -= 1 below, and
                     # the boundary-state tail artifact cannot serve the
